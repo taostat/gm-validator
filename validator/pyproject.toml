@@ -1,0 +1,22 @@
+[project]
+name = "gm-validator"
+version = "0.1.0"
+description = "gm validator software. Phase 0 scaffold; Phase 1 W6 implements weight submission, signature sampling, and the verification loop."
+requires-python = ">=3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "gm contributors" }]
+dependencies = []
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gm_validator"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
