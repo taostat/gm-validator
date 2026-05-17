@@ -112,6 +112,18 @@ jobs:
         working-directory: validator
         run: uv tool run --from "ty==0.0.37" ty check src
 
+      - name: Install Rust toolchain (for gm-verifier subprocess)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+
+      - name: Build gm-verifier
+        run: cargo build --bin gm-verifier
+
+      - name: pytest
+        working-directory: validator
+        run: uv run pytest
+
       - name: pip-audit
         working-directory: validator
         run: uv tool run --from "pip-audit==2.10.0" pip-audit

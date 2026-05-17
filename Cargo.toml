@@ -12,12 +12,18 @@ publish = false
 [workspace.dependencies]
 tokio = { version = "1.42", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", features = ["pkcs8", "rand_core"] }
+zstd = "0.13"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
