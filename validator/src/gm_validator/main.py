@@ -34,10 +34,18 @@ def _build_submitter(config: ValidatorConfig) -> Submitter:
 
 
 def _run(config: ValidatorConfig) -> None:
-    boto_kwargs = {"region_name": config.aws_region}
+    # boto3-stubs types boto3.client() as an overload set keyed on the
+    # Literal service_name. Passing the remaining args via **kwargs
+    # erases their types and falls outside every overload, so build the
+    # client with explicit named args instead.
     if config.s3_endpoint_url:
-        boto_kwargs["endpoint_url"] = config.s3_endpoint_url
-    s3 = boto3.client("s3", **boto_kwargs)
+        s3 = boto3.client(
+            "s3",
+            region_name=config.aws_region,
+            endpoint_url=config.s3_endpoint_url,
+        )
+    else:
+        s3 = boto3.client("s3", region_name=config.aws_region)
     mirror = S3Mirror(s3, config.s3_bucket, config.s3_prefix, config.local_mirror_dir)
     submitter = _build_submitter(config)
 

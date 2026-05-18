@@ -34,7 +34,7 @@ pub fn raw_hash(records: &[ValidatorLogRecord]) -> Result<String, VerifierError>
         .iter()
         .map(|r| Ok::<_, VerifierError>((r.request_id()?, r)))
         .collect::<Result<_, _>>()?;
-    indexed.sort_by(|(a, _), (b, _)| a.cmp(b));
+    indexed.sort_by_key(|(rid, _)| *rid);
 
     let mut hasher = Sha256::new();
     for (idx, (_rid, record)) in indexed.iter().enumerate() {
