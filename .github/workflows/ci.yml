@@ -74,7 +74,7 @@ jobs:
           persist-credentials: false
 
       - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@523d46c8b4755bc8344db2e6893442fed3a0e030  # v2.0.6
+        uses: EmbarkStudios/cargo-deny-action@0105f7c440bc8084c17cad47fe92e63049519458  # v2.0.18
         with:
           command: check
           arguments: --all-features
@@ -113,9 +113,8 @@ jobs:
         run: uv tool run --from "ty==0.0.37" ty check src
 
       - name: pip-audit
-        uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266  # v1.1.0
-        with:
-          virtual-environment: validator/.venv
+        working-directory: validator
+        run: uv tool run --from "pip-audit==2.10.0" pip-audit
 
   shell:
     name: Shell (shellcheck + shfmt)
@@ -162,6 +161,6 @@ jobs:
           ./actionlint -color
 
       - name: zizmor
-        uses: zizmorcore/zizmor-action@f52a838cfabf134edcbaa7c8b3677dde20045018  # v0.1.1
+        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d  # v0.5.6
         with:
           config: .github/zizmor.yml
