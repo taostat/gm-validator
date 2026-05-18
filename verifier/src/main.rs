@@ -156,58 +156,7 @@ fn run_verify(epoch: u64, dir: &Path, sample: usize) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
 
     for entry in &aggregated {
-        let miner_id = entry
-            .get("miner_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("aggregated row missing miner_id"))?
-            .to_string();
-        let product = entry
-            .get("product")
-            .ok_or_else(|| anyhow!("aggregated row missing product"))?;
-        let provider = product
-            .get("provider")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("aggregated row missing product.provider"))?
-            .to_string();
-        let model = product
-            .get("model")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("aggregated row missing product.model"))?
-            .to_string();
-        let expected_hash = entry
-            .get("raw_hash")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("aggregated row missing raw_hash"))?
-            .to_string();
-
-        let tuple_key = (miner_id.clone(), provider.clone(), model.clone());
-        let records = by_tuple.get(&tuple_key).map_or(&[][..], Vec::as_slice);
-        let computed = hash::raw_hash(records)?;
-        if computed != expected_hash {
-            errors.push(format!(
-                "raw_hash mismatch for ({miner_id}, {provider}, {model}): \
-                 expected={expected_hash} computed={computed}"
-            ));
-            continue;
-        }
-
-        if sample > 0 {
-            for (idx, record) in records.iter().take(sample).enumerate() {
-                match signature::verify_record_signature(record, &keys_by_gateway) {
-                    Ok(()) => {}
-                    Err(VerificationError::UnknownGateway(g)) => {
-                        errors.push(format!(
-                            "signature verify: unknown gateway {g} (miner={miner_id}, idx={idx})"
-                        ));
-                    }
-                    Err(e) => {
-                        errors.push(format!(
-                            "signature verify failed for ({miner_id}, {provider}, {model}) idx={idx}: {e}"
-                        ));
-                    }
-                }
-            }
-        }
+        verify_row(entry, &by_tuple, &keys_by_gateway, sample, &mut errors)?;
     }
 
     tracing::info!(
@@ -230,6 +179,136 @@ fn run_verify(epoch: u64, dir: &Path, sample: usize) -> Result<()> {
             errors.len()
         )
     }
+}
+
+fn verify_row(
+    entry: &Value,
+    by_tuple: &BTreeMap<(String, String, String), Vec<ValidatorLogRecord>>,
+    keys_by_gateway: &BTreeMap<String, Vec<String>>,
+    sample: usize,
+    errors: &mut Vec<String>,
+) -> Result<()> {
+    let miner_id = entry
+        .get("miner_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("aggregated row missing miner_id"))?
+        .to_string();
+    let product = entry
+        .get("product")
+        .ok_or_else(|| anyhow!("aggregated row missing product"))?;
+    let provider = product
+        .get("provider")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("aggregated row missing product.provider"))?
+        .to_string();
+    let model = product
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("aggregated row missing product.model"))?
+        .to_string();
+    let expected_hash = entry
+        .get("raw_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("aggregated row missing raw_hash"))?
+        .to_string();
+
+    let tuple_key = (miner_id.clone(), provider.clone(), model.clone());
+    let Some(records) = by_tuple.get(&tuple_key) else {
+        // A row in aggregated.jsonl with no backing records in
+        // raw.jsonl.zst is a forged or corrupt tuple. Without this
+        // check, hashing the empty slice produces the well-known
+        // SHA-256 of "", letting any phantom row pass with that
+        // hash. Fail loud instead.
+        errors.push(format!(
+            "aggregated row ({miner_id}, {provider}, {model}) has no \
+             backing raw records — phantom tuple, refusing to verify"
+        ));
+        return Ok(());
+    };
+    let computed = hash::raw_hash(records)?;
+    if computed != expected_hash {
+        errors.push(format!(
+            "raw_hash mismatch for ({miner_id}, {provider}, {model}): \
+             expected={expected_hash} computed={computed}"
+        ));
+        return Ok(());
+    }
+    if let Err(why) = check_aggregated_totals(entry, records) {
+        errors.push(format!(
+            "aggregated totals mismatch for ({miner_id}, {provider}, {model}): {why}"
+        ));
+        return Ok(());
+    }
+    if sample > 0 {
+        for (idx, record) in records.iter().take(sample).enumerate() {
+            match signature::verify_record_signature(record, keys_by_gateway) {
+                Ok(()) => {}
+                Err(VerificationError::UnknownGateway(g)) => {
+                    errors.push(format!(
+                        "signature verify: unknown gateway {g} (miner={miner_id}, idx={idx})"
+                    ));
+                }
+                Err(e) => {
+                    errors.push(format!(
+                        "signature verify failed for ({miner_id}, {provider}, {model}) idx={idx}: {e}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Re-derive the aggregated row's request-count fields from the raw
+/// records and compare against what `aggregated.jsonl` published.
+///
+/// Cost fields (`earnings_pdollars`, `surcharge_pdollars`) are left as
+/// a follow-up: re-deriving them requires porting the finalizer's
+/// pricing-and-modifier logic into Rust, which is meaningful work and
+/// is filed separately. Verifying counts here closes the phantom-row
+/// class of attack and catches off-by-one bugs in the aggregator.
+fn check_aggregated_totals(entry: &Value, records: &[ValidatorLogRecord]) -> Result<()> {
+    let claimed = |key: &str| -> Result<u64> {
+        let v = entry
+            .get(key)
+            .ok_or_else(|| anyhow!("aggregated row missing {key}"))?;
+        v.as_u64()
+            .ok_or_else(|| anyhow!("aggregated row field {key} is not a non-negative integer"))
+    };
+
+    let claimed_total = claimed("raw_record_count")?;
+    let actual_total = u64::try_from(records.len()).context("record count overflows u64")?;
+    if claimed_total != actual_total {
+        return Err(anyhow!(
+            "raw_record_count claimed={claimed_total} actual={actual_total}"
+        ));
+    }
+
+    let mut actual_ok: u64 = 0;
+    let mut actual_failed: u64 = 0;
+    for record in records {
+        if record.success()? {
+            actual_ok += 1;
+        } else {
+            actual_failed += 1;
+        }
+    }
+
+    let claimed_ok = claimed("successful_requests")?;
+    if claimed_ok != actual_ok {
+        return Err(anyhow!(
+            "successful_requests claimed={claimed_ok} actual={actual_ok}"
+        ));
+    }
+
+    let claimed_failed = claimed("failed_requests")?;
+    if claimed_failed != actual_failed {
+        return Err(anyhow!(
+            "failed_requests claimed={claimed_failed} actual={actual_failed}"
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_jsonl<R: BufRead>(reader: R) -> Result<Vec<ValidatorLogRecord>> {

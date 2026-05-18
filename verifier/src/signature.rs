@@ -52,18 +52,18 @@ pub fn verify_signature_with_keys(
     let canon = canonical::canonicalize(&without_sig)?;
     let digest = Sha256::digest(&canon);
 
+    // Gateways rotate keys, so the list can carry several pubkeys for
+    // the same gateway_id. A structurally bad entry (bad base64, wrong
+    // length, off-curve) must not short-circuit the loop — a later
+    // entry may still be the one that signed this record.
     for pubkey_b64 in pubkeys_b64 {
-        let pubkey_bytes = STANDARD.decode(pubkey_b64).map_err(VerifierError::from)?;
-        if pubkey_bytes.len() != 32 {
-            return Err(VerificationError::InvalidPubkeyLength(pubkey_bytes.len()));
-        }
-        let pubkey_arr: [u8; 32] = pubkey_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| VerificationError::InvalidPubkeyLength(pubkey_bytes.len()))?;
+        let Ok(pubkey_bytes) = STANDARD.decode(pubkey_b64) else {
+            continue;
+        };
+        let Ok(pubkey_arr): Result<[u8; 32], _> = pubkey_bytes.as_slice().try_into() else {
+            continue;
+        };
         let Ok(verifying) = VerifyingKey::from_bytes(&pubkey_arr) else {
-            // Skip an invalid pubkey rather than failing the whole record;
-            // the next key in the list may still be valid.
             continue;
         };
         if verifying.verify(&digest, &signature).is_ok() {
