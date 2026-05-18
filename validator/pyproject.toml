@@ -1,11 +1,28 @@
 [project]
 name = "gm-validator"
 version = "0.1.0"
-description = "gm validator software. Phase 0 scaffold; Phase 1 W6 implements weight submission, signature sampling, and the verification loop."
+description = "gm validator software. Watches S3 for _FINALIZED markers, re-verifies aggregation raw_hash, samples signatures, computes weights, submits to bittensor."
 requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "gm contributors" }]
-dependencies = []
+dependencies = [
+    "boto3>=1.35,<2",
+    "httpx>=0.28,<0.29",
+    "zstandard>=0.23,<0.24",
+    "pydantic>=2.10,<3",
+    "prometheus-client>=0.21,<0.23",
+    "cryptography>=43,<46",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6.115",
+    "ruff>=0.15",
+    "boto3-stubs[s3]>=1.35",
+    "moto[s3]>=5.0",
+]
 
 [build-system]
 requires = ["hatchling>=1.27"]
@@ -19,4 +36,16 @@ target-version = "py313"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+select = ["E", "F", "W", "I", "B", "UP", "RUF", "S", "BLE", "C4", "PIE", "PT", "RET", "SIM"]
+ignore = ["S101", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.ty]
+
+[tool.ty.rules]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
