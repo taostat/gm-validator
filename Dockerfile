@@ -8,7 +8,7 @@
 # ── Rust builder stage ────────────────────────────────────────────────────────
 # Compile the gm-verifier release binary. Pinned by digest so the build is
 # reproducible against the same toolchain.
-FROM rust:1.83-slim-bookworm@sha256:6eba72c73e8e1f3e76de6d3ea46c8f8a6b5ceda9e58a2a6c62b0d7c0c2b9ebd6 AS rust-build
+FROM rust:1.83-slim-bookworm@sha256:540c902e99c384163b688bbd8b5b8520e94e7731b27f7bd0eaa56ae1960627ab AS rust-build
 
 ENV SOURCE_DATE_EPOCH=1700000000 \
     RUSTFLAGS="-C codegen-units=1 -C debuginfo=0" \
