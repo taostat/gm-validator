@@ -1,0 +1,17 @@
+# Keep the docker build context lean: don't ship local build/cache
+# artifacts into the image layer hash.
+.git
+.github
+docs
+target
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.ty_cache
+**/.hypothesis
+.DS_Store
+*.log
+.env
+.env.local
