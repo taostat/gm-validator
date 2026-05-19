@@ -29,6 +29,10 @@ class ValidatorConfig:
     s3_prefix: str
     s3_endpoint_url: str | None
     aws_region: str
+    # When True, skip request signing and read S3 as an anonymous principal —
+    # required for OVH public-read buckets or any AWS bucket without IAM creds
+    # available. Env: GM_VALIDATOR_S3_ANONYMOUS (default false).
+    s3_anonymous: bool
 
     # Local mirror for the gm-verifier subprocess.
     local_mirror_dir: str
@@ -62,6 +66,7 @@ class ValidatorConfig:
             s3_prefix=os.environ.get("S3_PREFIX", "v1").strip("/"),
             s3_endpoint_url=os.environ.get("S3_ENDPOINT_URL"),
             aws_region=os.environ.get("AWS_REGION", "us-east-1"),
+            s3_anonymous=os.environ.get("GM_VALIDATOR_S3_ANONYMOUS", "0") in {"1", "true", "True"},
             local_mirror_dir=os.environ.get("LOCAL_MIRROR_DIR", "/var/cache/gm-validator"),
             bittensor_netuid=_int_env("BITTENSOR_NETUID", 0),
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
