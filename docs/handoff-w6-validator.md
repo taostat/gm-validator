@@ -56,8 +56,16 @@ Under `validator/`. Watches S3 for `_FINALIZED` markers and consumes:
   surcharge_pdollars` across products. `normalise_weights` produces a
   weight vector summing to 1.0 (or all zeros when total earnings = 0).
 - **`bittensor_adapter.py`** — `Submitter` protocol with a
-  `MockSubmitter` for tests. Real `bittensor-py` adapter (lazy import
-  in `main.py`) lands in Phase 2 alongside the testnet deploy.
+  `MockSubmitter` for tests.
+- **`bittensor_real.py`** — `RealSubmitter`: opens a `bittensor` wallet,
+  connects to subtensor, and calls `set_weights` per epoch. Lazy-imported
+  in `main.py`; the test suite uses `MockSubmitter` and never loads the
+  SDK.
+- **`metagraph.py`** — `load_miner_uid_lookup`: queries the subnet
+  metagraph for the hotkey -> uid mapping `_uids_and_weights` needs.
+- **`processed_state.py`** — `ProcessedState`: persists processed epoch
+  ids to a JSON file so a restart does not re-submit weights for epochs
+  still present in S3.
 - **`validator.py`** — `process_once()` runs the discover →
   mirror → verify → score → submit loop and returns `EpochOutcome`
   records suitable for metrics and tests.
@@ -107,18 +115,28 @@ choices worth flagging for review:
   rather than embed the Rust code via PyO3. Subprocess overhead is
   ~milliseconds per epoch, and the file mirror doubles as an auditor-
   friendly local cache. PyO3 stays available as a future optimisation.
-- The validator pubkey lookup (hotkey → uid) is left empty by default;
-  Phase 2 I3 fills it from the subnet metagraph at startup. With an
-  empty lookup the `MockSubmitter` receives empty `uids`/`weights`
-  lists, which is logged but not an error — useful for build-phase
-  smoke tests.
+- The validator hotkey → uid lookup is populated from the subnet
+  metagraph at startup when a real wallet is configured; with the
+  `MockSubmitter` (no wallet) it stays empty, so build-phase smoke
+  tests submit empty `uids`/`weights` lists (logged, not an error).
 
-## Integration notes for Phase 2 (I1, I3)
+## Real weight submission (`bittensor`)
 
-- Real `bittensor-py` `RealSubmitter` is referenced in `main.py` but
-  not implemented (`bittensor_real` module is intentionally absent so
-  the test path doesn't pull in the heavy dep). Land it in I3 at the
-  same time as the metagraph-driven UID lookup.
+- `RealSubmitter` (`bittensor_real.py`) and `load_miner_uid_lookup`
+  (`metagraph.py`) wrap the `bittensor` SDK. Both lazy-import the SDK so
+  the test path, which uses `MockSubmitter` and explicit lookup dicts,
+  never loads it.
+- Env config: `BITTENSOR_NETUID`, `BITTENSOR_ENDPOINT` (subtensor
+  `wss://` URL; default network when unset), `BITTENSOR_WALLET_NAME`,
+  `BITTENSOR_WALLET_HOTKEY`. Set `BITTENSOR_MOCK=0` and populate the
+  wallet secrets to enable on-chain submission.
+- `MIRROR_RETENTION_EPOCHS` (default 10) bounds the local mirror cache.
+  `PROCESSED_STATE_PATH` (default `/var/cache/gm-validator/processed.json`)
+  records processed epoch ids so a restart skips already-submitted
+  epochs.
+
+## Integration notes
+
 - The default sample size is 16 records per tuple. With ed25519 verify
   cost ~50µs and ~50 tuples per epoch at v1 scale, full-epoch
   verification is sub-second.
