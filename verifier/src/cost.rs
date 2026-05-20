@@ -282,6 +282,45 @@ mod tests {
     }
 
     #[test]
+    fn per_token_floors_each_dimension_before_summing() {
+        // Two dimensions, each with a sub-1e6 product (1 token ×
+        // 999_999 pUSD/Mtok). Per-dimension floor: 0 + 0 = 0.
+        // Summing first then dividing would give 1 (floor) or 2 (ceil);
+        // this fixes the convention shared with the gateway's
+        // `money::settle` and the Finalizer's `_compute_record_costs`.
+        let cost = cost_of(
+            r#"{
+                "success": true,
+                "miner_price": {"dimensions": {
+                    "input_per_mtok_pdollars": "999999",
+                    "output_per_mtok_pdollars": "999999"
+                }},
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "modifiers": {}, "surcharges": {}
+            }"#,
+        );
+        assert_eq!(cost.earnings_pdollars, 0);
+    }
+
+    #[test]
+    fn modifier_floors_on_non_divisible_product() {
+        // 7 tokens × 1e6 pUSD/Mtok = 7 pUSD. batch 3333 bps:
+        // 7 × 3333 / 10_000 = 23331 / 10000 = 2 (floor), not 3 (ceil).
+        let cost = cost_of(
+            r#"{
+                "success": true,
+                "miner_price": {"dimensions": {
+                    "input_per_mtok_pdollars": "1000000"
+                }},
+                "usage": {"input_tokens": 7},
+                "modifiers": {"batch_bps": 3333},
+                "surcharges": {}
+            }"#,
+        );
+        assert_eq!(cost.earnings_pdollars, 2);
+    }
+
+    #[test]
     fn contract_worked_example() {
         // The validator-log-record.md worked example: 812/1456/1200
         // tokens at the documented prices => 22_993_600_000 pUSD.
