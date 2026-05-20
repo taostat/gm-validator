@@ -87,23 +87,6 @@ def normalise_weights(scores: dict[str, MinerScore]) -> dict[str, MinerScore]:
     return scores
 
 
-def usd_for_alpha(scores: dict[str, MinerScore], alpha_per_usd: float) -> dict[str, float]:
-    """Convert per-miner pdollar earnings to subnet alpha.
-
-    Args:
-        scores: Output of `normalise_weights`.
-        alpha_per_usd: Spot exchange rate (alpha tokens per 1 USD).
-
-    Returns:
-        Mapping of miner hotkey -> alpha amount.
-    """
-    # picodollars -> dollars: divide by 1e12; -> alpha: multiply by rate.
-    return {
-        miner_id: (s.earnings_pdollars + s.surcharge_pdollars) / 1e12 * alpha_per_usd
-        for miner_id, s in scores.items()
-    }
-
-
 def aggregated_path(mirror_dir: str) -> str:
     """Convenience: path-join helper for the canonical filename."""
     return os.path.join(mirror_dir, "aggregated.jsonl")
