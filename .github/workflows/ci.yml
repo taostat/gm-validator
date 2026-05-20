@@ -126,7 +126,12 @@ jobs:
 
       - name: pip-audit
         working-directory: validator
-        run: uv tool run --from "pip-audit==2.10.0" pip-audit
+        # PYSEC-2022-42969: ReDoS in py.path.svnwc, an unmaintained
+        # transitive dep of bittensor (via retry). The vulnerable
+        # Subversion code path is never reached; no fixed release exists.
+        run: >-
+          uv tool run --from "pip-audit==2.10.0" pip-audit
+          --ignore-vuln PYSEC-2022-42969
 
   shell:
     name: Shell (shellcheck + shfmt)

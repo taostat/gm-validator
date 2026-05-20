@@ -200,6 +200,8 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             aws_region="us-east-1",
             s3_anonymous=False,
             local_mirror_dir=str(tmp_path),
+            mirror_retention_epochs=10,
+            processed_state_path=str(tmp_path / "processed.json"),
             bittensor_netuid=42,
             bittensor_endpoint=None,
             bittensor_wallet_name=None,
@@ -247,6 +249,57 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             assert os.path.exists(os.path.join(epoch_dir, name)), f"missing: {name}"
 
 
+def test_validator_restart_does_not_resubmit(tmp_path: pathlib.Path) -> None:
+    """A restarted validator reads the persisted processed-epoch state and
+    must not re-submit weights for an epoch still present in S3."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
+        _populate_epoch(s3, epoch_id=7, records=records)
+
+        config = ValidatorConfig(
+            s3_bucket=BUCKET,
+            s3_prefix=PREFIX,
+            s3_endpoint_url=None,
+            aws_region="us-east-1",
+            s3_anonymous=False,
+            local_mirror_dir=str(tmp_path),
+            mirror_retention_epochs=10,
+            processed_state_path=str(tmp_path / "processed.json"),
+            bittensor_netuid=42,
+            bittensor_endpoint=None,
+            bittensor_wallet_name=None,
+            bittensor_wallet_hotkey=None,
+            bittensor_mock=True,
+            verifier_bin=_verifier_bin(),
+            verifier_sample_per_tuple=0,
+            poll_interval_secs=1,
+            metrics_port=9092,
+        )
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+
+        # First process: a fresh validator submits epoch 7.
+        first = Validator(config, mirror, MockSubmitter(), miner_uid_lookup={miner_a: 0})
+        assert len(first.process_once()) == 1
+
+        # Restart: a brand-new Validator (fresh in-memory state) reads the
+        # persisted processed.json and discovers epoch 7 still in S3.
+        restarted_submitter = MockSubmitter()
+        restarted = Validator(
+            config,
+            S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
+            restarted_submitter,
+            miner_uid_lookup={miner_a: 0},
+        )
+        outcomes = restarted.process_once()
+
+        assert outcomes == []
+        assert restarted_submitter.calls == []
+
+
 def test_validator_skips_submission_on_verifier_failure(tmp_path: pathlib.Path) -> None:
     """If aggregated.jsonl claims a raw_hash that doesn't match raw.jsonl.zst,
     the verifier exits non-zero and the validator must skip weight submission."""
@@ -288,6 +341,8 @@ def test_validator_skips_submission_on_verifier_failure(tmp_path: pathlib.Path) 
             aws_region="us-east-1",
             s3_anonymous=False,
             local_mirror_dir=str(tmp_path),
+            mirror_retention_epochs=10,
+            processed_state_path=str(tmp_path / "processed.json"),
             bittensor_netuid=42,
             bittensor_endpoint=None,
             bittensor_wallet_name=None,

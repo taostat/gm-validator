@@ -12,6 +12,11 @@ dependencies = [
     "pydantic>=2.10,<3",
     "prometheus-client>=0.21,<0.23",
     "cryptography>=43,<46",
+    # Real on-chain weight submission + metagraph uid lookup. Imported
+    # lazily (inside functions) so the test path, which uses
+    # MockSubmitter, never loads it; declared here because production
+    # and `ty` resolution both need it installed.
+    "bittensor>=10.3,<11",
 ]
 
 [dependency-groups]

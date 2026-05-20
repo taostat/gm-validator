@@ -20,6 +20,7 @@ from typing import Any
 
 from gm_validator.bittensor_adapter import Submitter
 from gm_validator.config import ValidatorConfig
+from gm_validator.processed_state import ProcessedState
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import aggregated_path, load_aggregated, normalise_weights, score
 from gm_validator.verifier import VerifierResult, verify_epoch
@@ -47,12 +48,15 @@ class Validator:
         mirror: S3Mirror,
         submitter: Submitter,
         miner_uid_lookup: dict[str, int] | None = None,
+        processed_state: ProcessedState | None = None,
     ) -> None:
         self._config = config
         self._mirror = mirror
         self._submitter = submitter
         self._miner_uid_lookup = miner_uid_lookup or {}
-        self._processed: set[int] = set()
+        # Durable processed-epoch state survives restarts. Defaults to
+        # the configured state-file path; tests inject an explicit one.
+        self._processed = processed_state or ProcessedState(config.processed_state_path)
 
     def process_once(self) -> list[EpochOutcome]:
         """One iteration: process every newly-finalized epoch."""
@@ -65,9 +69,9 @@ class Validator:
             except Exception:
                 LOGGER.exception("epoch %d processing failed", epoch_id)
                 continue
-            self._processed.add(epoch_id)
+            self._processed.mark(epoch_id)
             outcomes.append(outcome)
-        self._mirror.prune(self._processed)
+        self._mirror.prune(self._config.mirror_retention_epochs)
         return outcomes
 
     def _process_epoch(self, epoch_id: int) -> EpochOutcome:
