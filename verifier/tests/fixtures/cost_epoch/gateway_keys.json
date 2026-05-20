@@ -1,0 +1,14 @@
+{
+  "schema_version": "1",
+  "epoch_id": 700,
+  "gateways": {
+    "gw-prod-1": [
+      {
+        "pubkey": "Ak3pX2yMQ0000000000000000000000000000000000=",
+        "first_seen_at": "2026-05-17T11:02:14.000Z",
+        "retired_at": null,
+        "attestation_quote_hash": "0c1d2e3f"
+      }
+    ]
+  }
+}

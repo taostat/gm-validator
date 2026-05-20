@@ -26,6 +26,7 @@ use clap::{Parser, Subcommand};
 use serde_json::Value;
 
 use gm_verifier::canonical;
+use gm_verifier::cost;
 use gm_verifier::hash;
 use gm_verifier::signature;
 use gm_verifier::{parse_record, ValidatorLogRecord, VerificationError};
@@ -259,14 +260,17 @@ fn verify_row(
     Ok(())
 }
 
-/// Re-derive the aggregated row's request-count fields from the raw
-/// records and compare against what `aggregated.jsonl` published.
+/// Re-derive the aggregated row's request-count **and cost** fields from
+/// the raw records and compare against what `aggregated.jsonl` published.
 ///
-/// Cost fields (`earnings_pdollars`, `surcharge_pdollars`) are left as
-/// a follow-up: re-deriving them requires porting the finalizer's
-/// pricing-and-modifier logic into Rust, which is meaningful work and
-/// is filed separately. Verifying counts here closes the phantom-row
-/// class of attack and catches off-by-one bugs in the aggregator.
+/// Counts (`raw_record_count`, `successful_requests`, `failed_requests`)
+/// close the phantom-row class of attack and catch off-by-one bugs in
+/// the aggregator. The cost fields (`earnings_pdollars`,
+/// `surcharge_pdollars`) re-run the finalizer's pricing-and-modifier
+/// math over the same records — without this, a buggy or malicious
+/// finalizer's payout numbers flow straight to validator weights with
+/// nothing checking them. The arithmetic is ported in [`cost`] and must
+/// stay byte-for-byte aligned with the finalizer's `_compute_record_costs`.
 fn check_aggregated_totals(entry: &Value, records: &[ValidatorLogRecord]) -> Result<()> {
     let claimed = |key: &str| -> Result<u64> {
         let v = entry
@@ -286,12 +290,17 @@ fn check_aggregated_totals(entry: &Value, records: &[ValidatorLogRecord]) -> Res
 
     let mut actual_ok: u64 = 0;
     let mut actual_failed: u64 = 0;
+    let mut actual_earnings: u128 = 0;
+    let mut actual_surcharge: u128 = 0;
     for record in records {
         if record.success()? {
             actual_ok += 1;
         } else {
             actual_failed += 1;
         }
+        let record_cost = cost::compute_record_cost(record)?;
+        actual_earnings += record_cost.earnings_pdollars;
+        actual_surcharge += record_cost.surcharge_pdollars;
     }
 
     let claimed_ok = claimed("successful_requests")?;
@@ -308,7 +317,37 @@ fn check_aggregated_totals(entry: &Value, records: &[ValidatorLogRecord]) -> Res
         ));
     }
 
+    let claimed_earnings = claimed_pdollars(entry, "earnings_pdollars")?;
+    if claimed_earnings != actual_earnings {
+        return Err(anyhow!(
+            "earnings_pdollars claimed={claimed_earnings} actual={actual_earnings}"
+        ));
+    }
+
+    let claimed_surcharge = claimed_pdollars(entry, "surcharge_pdollars")?;
+    if claimed_surcharge != actual_surcharge {
+        return Err(anyhow!(
+            "surcharge_pdollars claimed={claimed_surcharge} actual={actual_surcharge}"
+        ));
+    }
+
     Ok(())
+}
+
+/// Read an aggregated-row picodollar field as a `u128`.
+///
+/// Per `docs/contracts/picodollar-denomination.md`, aggregated totals
+/// are serialised as decimal strings (`U64String`), not JSON numbers,
+/// because epoch-scale totals exceed `f64`'s 53-bit mantissa.
+fn claimed_pdollars(entry: &Value, key: &str) -> Result<u128> {
+    let v = entry
+        .get(key)
+        .ok_or_else(|| anyhow!("aggregated row missing {key}"))?;
+    let s = v
+        .as_str()
+        .ok_or_else(|| anyhow!("aggregated row field {key} must be a decimal string"))?;
+    s.parse::<u128>()
+        .with_context(|| format!("aggregated row field {key} is not a decimal integer: {s:?}"))
 }
 
 fn parse_jsonl<R: BufRead>(reader: R) -> Result<Vec<ValidatorLogRecord>> {
