@@ -57,12 +57,13 @@ class ProcessedState:
 
 
 def _load(path: str) -> set[int]:
-    if not os.path.exists(path):
-        return set()
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         return {int(e) for e in data.get("processed_epochs", [])}
+    except FileNotFoundError:
+        # Expected on a fresh deploy — no marker file yet.
+        return set()
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         LOGGER.warning(
             "processed-state file %s unreadable (%s); starting with empty state",
