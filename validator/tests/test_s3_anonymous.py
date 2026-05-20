@@ -54,6 +54,8 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "aws_region": "us-east-1",
         "s3_anonymous": False,
         "local_mirror_dir": "/var/cache/gm-test",
+        "mirror_retention_epochs": 10,
+        "processed_state_path": "/var/cache/gm-test/processed.json",
         "bittensor_netuid": 0,
         "bittensor_endpoint": None,
         "bittensor_wallet_name": None,

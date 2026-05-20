@@ -36,6 +36,13 @@ class ValidatorConfig:
 
     # Local mirror for the gm-verifier subprocess.
     local_mirror_dir: str
+    # How many of the most-recent epoch mirrors to keep on disk; older
+    # ones are pruned each tick. Env: MIRROR_RETENTION_EPOCHS.
+    mirror_retention_epochs: int
+    # Path to the JSON file recording processed epoch ids, so a restart
+    # does not re-submit weights for epochs already finalized in S3.
+    # Env: PROCESSED_STATE_PATH.
+    processed_state_path: str
 
     # Bittensor.
     bittensor_netuid: int
@@ -68,6 +75,10 @@ class ValidatorConfig:
             aws_region=os.environ.get("AWS_REGION", "us-east-1"),
             s3_anonymous=os.environ.get("GM_VALIDATOR_S3_ANONYMOUS", "0") in {"1", "true", "True"},
             local_mirror_dir=os.environ.get("LOCAL_MIRROR_DIR", "/var/cache/gm-validator"),
+            mirror_retention_epochs=_int_env("MIRROR_RETENTION_EPOCHS", 10),
+            processed_state_path=os.environ.get(
+                "PROCESSED_STATE_PATH", "/var/cache/gm-validator/processed.json"
+            ),
             bittensor_netuid=_int_env("BITTENSOR_NETUID", 0),
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
             bittensor_wallet_name=os.environ.get("BITTENSOR_WALLET_NAME"),

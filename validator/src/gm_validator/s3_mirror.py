@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterable
 from typing import Any
 
 LOGGER = logging.getLogger(__name__)
@@ -108,11 +107,17 @@ class S3Mirror:
 
     # ---- cleanup ----
 
-    def prune(self, keep_epoch_ids: Iterable[int]) -> None:
-        """Drop local mirrors for epochs not in *keep_epoch_ids*."""
-        keep = set(keep_epoch_ids)
-        if not os.path.isdir(self._local_root):
+    def prune(self, retention_epochs: int) -> None:
+        """Keep only the *retention_epochs* highest epoch mirrors on disk.
+
+        Older mirrors are deleted. The local mirror is a convenience
+        audit cache; keeping every epoch ever processed would grow it
+        without bound, so we retain a fixed recent window. A
+        non-positive *retention_epochs* disables pruning.
+        """
+        if retention_epochs <= 0 or not os.path.isdir(self._local_root):
             return
+        epoch_dirs: list[tuple[int, str]] = []
         for entry in os.listdir(self._local_root):
             if not entry.startswith("epoch="):
                 continue
@@ -120,8 +125,9 @@ class S3Mirror:
                 epoch_id = int(entry.removeprefix("epoch="))
             except ValueError:
                 continue
-            if epoch_id in keep:
-                continue
+            epoch_dirs.append((epoch_id, entry))
+        epoch_dirs.sort(reverse=True)
+        for _, entry in epoch_dirs[retention_epochs:]:
             path = os.path.join(self._local_root, entry)
             LOGGER.info("pruning stale local mirror: %s", path)
             for f in os.listdir(path):
