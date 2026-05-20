@@ -31,11 +31,13 @@
 #![deny(missing_docs)]
 
 pub mod canonical;
+pub mod cost;
 pub mod errors;
 pub mod hash;
 pub mod record;
 pub mod signature;
 
+pub use cost::{compute_record_cost, RecordCost};
 pub use errors::{VerificationError, VerifierError};
 pub use hash::{raw_hash, raw_hash_lines};
 pub use record::{parse_record, ValidatorLogRecord};
