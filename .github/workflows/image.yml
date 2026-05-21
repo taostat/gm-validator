@@ -59,3 +59,55 @@ jobs:
           tags: quay.io/taostats/gm-validator:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # On merge to main, after the image is pushed, bump the gm-validator tag in
+  # the ci-cd repo's testnet overlay so ArgoCD rolls the new image out. The
+  # mainnet overlay is promoted by hand, as a separate release step.
+  update-deployment:
+    name: Bump gm-validator tag in ci-cd testnet overlay
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      # persist-credentials stays on: the GH_PAT must remain in the local git
+      # config so the "Commit and push" step can push the tag bump back to
+      # ci-cd-repo. This is the whole point of the job, so the artipacked
+      # audit is a deliberate false positive here.
+      - name: Clone ci-cd-repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2  # zizmor: ignore[artipacked]
+        with:
+          repository: taostat/ci-cd-repo
+          token: ${{ secrets.GH_PAT }}
+          path: ci-cd-repo
+
+      - name: Install kustomize
+        run: |
+          set -euo pipefail
+          KUSTOMIZE_VERSION=v5.8.1
+          curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Bump gm-validator image tag
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd ci-cd-repo/gm-validator/kustomize/overlays/testnet
+          kustomize edit set image "quay.io/taostats/gm-validator=quay.io/taostats/gm-validator:${SHA}"
+
+      - name: Commit and push
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd ci-cd-repo
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add gm-validator/kustomize/overlays/testnet/kustomization.yaml
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "gm-validator: bump testnet gm-validator to ${SHA}"
+          git pull --rebase
+          git push
