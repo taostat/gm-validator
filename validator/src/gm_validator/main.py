@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
+from typing import Any
 
 import boto3
 import botocore
@@ -60,30 +61,45 @@ def _build_miner_uid_lookup(config: ValidatorConfig) -> dict[str, int]:
     return load_miner_uid_lookup(config.bittensor_netuid, config.bittensor_endpoint)
 
 
+def _build_s3_client(config: ValidatorConfig) -> Any:
+    """Build the boto3 S3 client.
+
+    The client always carries a botocore ``Config`` pinning
+    ``request_checksum_calculation`` / ``response_checksum_validation``
+    to ``when_required``. botocore >=1.36 defaults these to
+    ``when_supported``, which attaches CRC32 checksum headers to every
+    request; S3-compatible providers such as OVH Object Storage reject
+    those with an ``InvalidRequest`` error on operations like
+    ``ListObjectsV2``. ``when_required`` only sends a checksum when the
+    operation actually mandates one, which AWS S3 accepts as well.
+
+    When ``config.s3_anonymous`` is set the client also signs no requests
+    (``botocore.UNSIGNED``) — required for OVH public-read buckets or any
+    bucket reachable without IAM credentials.
+
+    boto3-stubs types ``boto3.client()`` as an overload set keyed on the
+    Literal service name; passing the remaining args via ``**kwargs``
+    erases their types and falls outside every overload. The two
+    ``endpoint_url`` cases are therefore spelled out with explicit named
+    args.
+    """
+    client_config = Config(
+        request_checksum_calculation="when_required",
+        response_checksum_validation="when_required",
+        signature_version=botocore.UNSIGNED if config.s3_anonymous else None,
+    )
+    if config.s3_endpoint_url:
+        return boto3.client(
+            "s3",
+            region_name=config.aws_region,
+            endpoint_url=config.s3_endpoint_url,
+            config=client_config,
+        )
+    return boto3.client("s3", region_name=config.aws_region, config=client_config)
+
+
 def _run(config: ValidatorConfig) -> None:
-    # boto3-stubs types boto3.client() as an overload set keyed on the
-    # Literal service_name. Passing the remaining args via **kwargs
-    # erases their types and falls outside every overload, so build the
-    # client with explicit named args instead. We enumerate each combination
-    # of (endpoint_url, anonymous) to keep the explicit-arg pattern intact.
-    anon_config = Config(signature_version=botocore.UNSIGNED) if config.s3_anonymous else None
-    if config.s3_endpoint_url and anon_config:
-        s3 = boto3.client(
-            "s3",
-            region_name=config.aws_region,
-            endpoint_url=config.s3_endpoint_url,
-            config=anon_config,
-        )
-    elif config.s3_endpoint_url:
-        s3 = boto3.client(
-            "s3",
-            region_name=config.aws_region,
-            endpoint_url=config.s3_endpoint_url,
-        )
-    elif anon_config:
-        s3 = boto3.client("s3", region_name=config.aws_region, config=anon_config)
-    else:
-        s3 = boto3.client("s3", region_name=config.aws_region)
+    s3 = _build_s3_client(config)
     mirror = S3Mirror(s3, config.s3_bucket, config.s3_prefix, config.local_mirror_dir)
     submitter = _build_submitter(config)
     miner_uid_lookup = _build_miner_uid_lookup(config)

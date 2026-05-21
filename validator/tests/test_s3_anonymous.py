@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from unittest.mock import MagicMock, patch
 
 import botocore
@@ -70,54 +69,91 @@ def _make_config(**overrides: object) -> ValidatorConfig:
     return ValidatorConfig(**defaults)  # type: ignore[arg-type]
 
 
-def _run_and_capture_client_kwargs(config: ValidatorConfig) -> dict[str, object]:
-    """Invoke _run, capture the kwargs passed to boto3.client, then exit early."""
+class _CapturedClient:
+    """Captured kwargs from a single ``boto3.client`` call in ``_build_s3_client``."""
+
+    def __init__(self, kwargs: dict[str, object]) -> None:
+        self._kwargs = kwargs
+
+    @property
+    def endpoint_url(self) -> object:
+        return self._kwargs.get("endpoint_url")
+
+    @property
+    def config(self) -> Config | None:
+        value = self._kwargs.get("config")
+        assert value is None or isinstance(value, Config)
+        return value
+
+
+def _capture_client_call(config: ValidatorConfig) -> _CapturedClient:
+    """Invoke _build_s3_client, capturing the kwargs passed to boto3.client."""
     captured: dict[str, object] = {}
 
     def fake_client(service: str, **kwargs: object) -> MagicMock:
         captured["service"] = service
-        captured["kwargs"] = dict(kwargs)
+        captured.update(kwargs)
         return MagicMock()
 
-    with (
-        patch.object(main_mod, "boto3") as mock_boto3,
-        patch.object(main_mod, "S3Mirror"),
-        patch.object(main_mod, "_build_submitter"),
-        patch.object(main_mod, "Validator") as mock_validator_cls,
-        patch.object(main_mod.time, "sleep", side_effect=StopIteration),
-    ):
+    with patch.object(main_mod, "boto3") as mock_boto3:
         mock_boto3.client.side_effect = fake_client
-        mock_validator_cls.return_value.process_once.return_value = []
-        with contextlib.suppress(StopIteration):
-            main_mod._run(config)
+        main_mod._build_s3_client(config)
 
-    return captured
+    return _CapturedClient(captured)
+
+
+def _signature_version(config: Config) -> object:
+    """Read Config.signature_version (omitted from ty's stub)."""
+    return getattr(config, "signature_version", None)
+
+
+def _checksum_calculation(config: Config) -> object:
+    """Read Config.request_checksum_calculation (omitted from ty's stub)."""
+    return getattr(config, "request_checksum_calculation", None)
+
+
+def _checksum_validation(config: Config) -> object:
+    """Read Config.response_checksum_validation (omitted from ty's stub)."""
+    return getattr(config, "response_checksum_validation", None)
 
 
 def test_anonymous_client_uses_unsigned_signature() -> None:
     """When s3_anonymous=True, boto3.client must receive Config(UNSIGNED)."""
-    captured = _run_and_capture_client_kwargs(_make_config(s3_anonymous=True))
-    kwargs: dict[str, object] = captured["kwargs"]  # type: ignore[assignment]
-    assert "config" in kwargs, "Expected 'config' kwarg passed to boto3.client"
-    client_config: Config = kwargs["config"]  # type: ignore[assignment]
-    assert client_config.signature_version == botocore.UNSIGNED
+    captured = _capture_client_call(_make_config(s3_anonymous=True))
+    assert captured.config is not None, "expected a 'config' kwarg on boto3.client"
+    assert _signature_version(captured.config) == botocore.UNSIGNED
 
 
-def test_signed_client_has_no_config_kwarg() -> None:
-    """When s3_anonymous=False (default), boto3.client must not pass a Config."""
-    captured = _run_and_capture_client_kwargs(_make_config(s3_anonymous=False))
-    kwargs: dict[str, object] = captured["kwargs"]  # type: ignore[assignment]
-    assert "config" not in kwargs, (
-        "boto3.client should not receive a 'config' kwarg when s3_anonymous=False"
-    )
+def test_signed_client_still_has_config_kwarg() -> None:
+    """s3_anonymous=False still passes a Config (it carries the checksum knobs)."""
+    captured = _capture_client_call(_make_config(s3_anonymous=False))
+    assert captured.config is not None, "expected a 'config' kwarg on boto3.client"
+    assert _signature_version(captured.config) is None
 
 
 def test_anonymous_with_endpoint_url() -> None:
     """s3_anonymous=True with an endpoint_url passes both endpoint_url and Config(UNSIGNED)."""
-    captured = _run_and_capture_client_kwargs(
+    captured = _capture_client_call(
         _make_config(s3_anonymous=True, s3_endpoint_url="https://s3.example.com")
     )
-    kwargs: dict[str, object] = captured["kwargs"]  # type: ignore[assignment]
-    assert kwargs.get("endpoint_url") == "https://s3.example.com"
-    assert "config" in kwargs
-    assert kwargs["config"].signature_version == botocore.UNSIGNED  # type: ignore[union-attr]
+    assert captured.endpoint_url == "https://s3.example.com"
+    assert captured.config is not None
+    assert _signature_version(captured.config) == botocore.UNSIGNED
+
+
+@pytest.mark.parametrize("anonymous", [True, False])
+@pytest.mark.parametrize("endpoint_url", [None, "https://s3.gra.io.cloud.ovh.net"])
+def test_client_pins_checksums_to_when_required(anonymous: bool, endpoint_url: str | None) -> None:
+    """Every S3 client pins request/response checksums to ``when_required``.
+
+    botocore >=1.36 defaults these to ``when_supported``, which makes
+    S3-compatible providers (OVH Object Storage) reject ``ListObjectsV2``
+    with ``InvalidRequest``. This guards against a boto3 bump or a
+    refactor of ``_build_s3_client`` silently dropping the override.
+    """
+    captured = _capture_client_call(
+        _make_config(s3_anonymous=anonymous, s3_endpoint_url=endpoint_url)
+    )
+    assert captured.config is not None, "expected a 'config' kwarg on boto3.client"
+    assert _checksum_calculation(captured.config) == "when_required"
+    assert _checksum_validation(captured.config) == "when_required"
