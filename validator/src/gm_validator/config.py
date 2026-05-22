@@ -47,8 +47,12 @@ class ValidatorConfig:
     # Bittensor.
     bittensor_netuid: int
     bittensor_endpoint: str | None
-    bittensor_wallet_name: str | None
-    bittensor_wallet_hotkey: str | None
+    # The validator hotkey keyfile contents — the bittensor
+    # unencrypted-hotkey JSON document ({accountId, publicKey,
+    # privateKey, secretPhrase, secretSeed, ss58Address}). The signing
+    # keypair is built in memory from its `secretSeed`; no wallet
+    # keyfile is read from disk. Env: BITTENSOR_HOTKEY_FILE.
+    bittensor_hotkey_file: str | None
     bittensor_mock: bool
 
     # Verifier subprocess.
@@ -81,8 +85,7 @@ class ValidatorConfig:
             ),
             bittensor_netuid=_int_env("BITTENSOR_NETUID", 0),
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
-            bittensor_wallet_name=os.environ.get("BITTENSOR_WALLET_NAME"),
-            bittensor_wallet_hotkey=os.environ.get("BITTENSOR_WALLET_HOTKEY"),
+            bittensor_hotkey_file=os.environ.get("BITTENSOR_HOTKEY_FILE"),
             bittensor_mock=os.environ.get("BITTENSOR_MOCK", "0") in {"1", "true", "True"},
             verifier_bin=os.environ.get("GM_VERIFIER_BIN", "gm-verifier"),
             verifier_sample_per_tuple=_int_env("VERIFIER_SAMPLE_PER_TUPLE", 16),

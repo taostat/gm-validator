@@ -57,10 +57,10 @@ Under `validator/`. Watches S3 for `_FINALIZED` markers and consumes:
   weight vector summing to 1.0 (or all zeros when total earnings = 0).
 - **`bittensor_adapter.py`** — `Submitter` protocol with a
   `MockSubmitter` for tests.
-- **`bittensor_real.py`** — `RealSubmitter`: opens a `bittensor` wallet,
-  connects to subtensor, and calls `set_weights` per epoch. Lazy-imported
-  in `main.py`; the test suite uses `MockSubmitter` and never loads the
-  SDK.
+- **`bittensor_real.py`** — `RealSubmitter`: builds the validator hotkey
+  keypair in memory from a seed (no wallet keyfile on disk), connects to
+  subtensor, and calls `set_weights` per epoch. Lazy-imported in
+  `main.py`; the test suite uses `MockSubmitter` and never loads the SDK.
 - **`metagraph.py`** — `load_miner_uid_lookup`: queries the subnet
   metagraph for the hotkey -> uid mapping `_uids_and_weights` needs.
 - **`processed_state.py`** — `ProcessedState`: persists processed epoch
@@ -127,9 +127,11 @@ choices worth flagging for review:
   the test path, which uses `MockSubmitter` and explicit lookup dicts,
   never loads it.
 - Env config: `BITTENSOR_NETUID`, `BITTENSOR_ENDPOINT` (subtensor
-  `wss://` URL; default network when unset), `BITTENSOR_WALLET_NAME`,
-  `BITTENSOR_WALLET_HOTKEY`. Set `BITTENSOR_MOCK=0` and populate the
-  wallet secrets to enable on-chain submission.
+  `wss://` URL; default network when unset), `BITTENSOR_HOTKEY_FILE`
+  (the bittensor unencrypted-hotkey keyfile JSON document — the
+  `secretSeed` field seeds an in-memory keypair; no keyfile is read from
+  disk). Set `BITTENSOR_MOCK=0` and populate `BITTENSOR_HOTKEY_FILE` to
+  enable on-chain submission.
 - `MIRROR_RETENTION_EPOCHS` (default 10) bounds the local mirror cache.
   `PROCESSED_STATE_PATH` (default `/var/cache/gm-validator/processed.json`)
   records processed epoch ids so a restart skips already-submitted

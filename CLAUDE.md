@@ -76,7 +76,8 @@ cargo build --release -p gm-verifier
 | `MIRROR_RETENTION_EPOCHS` | `10` | How many recent epoch mirrors to keep on disk |
 | `PROCESSED_STATE_PATH` | `<mirror_dir>/processed.json` | Crash-safe record of submitted epochs |
 | `BITTENSOR_NETUID` | `0` | Subnet UID |
-| `BITTENSOR_WALLET_NAME` / `BITTENSOR_WALLET_HOTKEY` | — | Required for real weight submission |
+| `BITTENSOR_ENDPOINT` | — | Subtensor `wss://` URL (SDK default network when unset) |
+| `BITTENSOR_HOTKEY_FILE` | — | Bittensor unencrypted-hotkey keyfile JSON; its `secretSeed` seeds an in-memory keypair (no keyfile on disk). Required for real weight submission |
 | `BITTENSOR_MOCK` | `0` | Use `MockSubmitter` (records submissions in memory) |
 | `GM_VERIFIER_BIN` | `gm-verifier` | Path to the verifier binary |
 | `VERIFIER_SAMPLE_PER_TUPLE` | `16` | Number of records sampled per `(miner, product)` tuple |
