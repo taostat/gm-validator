@@ -265,8 +265,8 @@ fn verify_row(
 ///
 /// Counts (`raw_record_count`, `successful_requests`, `failed_requests`)
 /// close the phantom-row class of attack and catch off-by-one bugs in
-/// the aggregator. The cost fields (`earnings_pdollars`,
-/// `surcharge_pdollars`) re-run the finalizer's pricing-and-modifier
+/// the aggregator. The cost fields (`earnings_ndollars`,
+/// `surcharge_ndollars`) re-run the finalizer's pricing-and-modifier
 /// math over the same records — without this, a buggy or malicious
 /// finalizer's payout numbers flow straight to validator weights with
 /// nothing checking them. The arithmetic is ported in [`cost`] and must
@@ -299,8 +299,8 @@ fn check_aggregated_totals(entry: &Value, records: &[ValidatorLogRecord]) -> Res
             actual_failed += 1;
         }
         let record_cost = cost::compute_record_cost(record)?;
-        actual_earnings += record_cost.earnings_pdollars;
-        actual_surcharge += record_cost.surcharge_pdollars;
+        actual_earnings += record_cost.earnings_ndollars;
+        actual_surcharge += record_cost.surcharge_ndollars;
     }
 
     let claimed_ok = claimed("successful_requests")?;
@@ -317,29 +317,29 @@ fn check_aggregated_totals(entry: &Value, records: &[ValidatorLogRecord]) -> Res
         ));
     }
 
-    let claimed_earnings = claimed_pdollars(entry, "earnings_pdollars")?;
+    let claimed_earnings = claimed_ndollars(entry, "earnings_ndollars")?;
     if claimed_earnings != actual_earnings {
         return Err(anyhow!(
-            "earnings_pdollars claimed={claimed_earnings} actual={actual_earnings}"
+            "earnings_ndollars claimed={claimed_earnings} actual={actual_earnings}"
         ));
     }
 
-    let claimed_surcharge = claimed_pdollars(entry, "surcharge_pdollars")?;
+    let claimed_surcharge = claimed_ndollars(entry, "surcharge_ndollars")?;
     if claimed_surcharge != actual_surcharge {
         return Err(anyhow!(
-            "surcharge_pdollars claimed={claimed_surcharge} actual={actual_surcharge}"
+            "surcharge_ndollars claimed={claimed_surcharge} actual={actual_surcharge}"
         ));
     }
 
     Ok(())
 }
 
-/// Read an aggregated-row picodollar field as a `u128`.
+/// Read an aggregated-row nano-dollar field as a `u128`.
 ///
-/// Per `docs/contracts/picodollar-denomination.md`, aggregated totals
+/// Per `docs/contracts/nano-dollar-denomination.md`, aggregated totals
 /// are serialised as decimal strings (`U64String`), not JSON numbers,
 /// because epoch-scale totals exceed `f64`'s 53-bit mantissa.
-fn claimed_pdollars(entry: &Value, key: &str) -> Result<u128> {
+fn claimed_ndollars(entry: &Value, key: &str) -> Result<u128> {
     let v = entry
         .get(key)
         .ok_or_else(|| anyhow!("aggregated row missing {key}"))?;

@@ -36,7 +36,7 @@ class EpochOutcome:
     verifier_ok: bool
     weights_submitted: bool
     miner_count: int
-    total_pdollars: int
+    total_ndollars: int
 
 
 class Validator:
@@ -88,12 +88,12 @@ class Validator:
                 verifier_ok=False,
                 weights_submitted=False,
                 miner_count=0,
-                total_pdollars=0,
+                total_ndollars=0,
             )
 
         rows = load_aggregated(aggregated_path(mirror_dir))
         scores = normalise_weights(score(rows))
-        total = sum(s.earnings_pdollars + s.surcharge_pdollars for s in scores.values())
+        total = sum(s.earnings_ndollars + s.surcharge_ndollars for s in scores.values())
 
         uids, weights = self._uids_and_weights(scores)
         submitted = False
@@ -111,7 +111,7 @@ class Validator:
             verifier_ok=True,
             weights_submitted=submitted,
             miner_count=len(scores),
-            total_pdollars=total,
+            total_ndollars=total,
         )
 
     def _verify(self, epoch_id: int, mirror_dir: str) -> VerifierResult:

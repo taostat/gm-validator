@@ -1,7 +1,7 @@
 """Per-miner score derivation from `aggregated.jsonl`.
 
-A miner's epoch score is the sum of `earnings_pdollars +
-surcharge_pdollars` across every product they served. Normalized
+A miner's epoch score is the sum of `earnings_ndollars +
+surcharge_ndollars` across every product they served. Normalized
 across miners, this becomes the input to `subtensor.set_weights()`.
 
 The scoring is intentionally simple in v1 — `validator.md §15` and
@@ -23,8 +23,8 @@ class MinerScore:
     """Per-miner score components plus weight."""
 
     miner_id: str
-    earnings_pdollars: int = 0
-    surcharge_pdollars: int = 0
+    earnings_ndollars: int = 0
+    surcharge_ndollars: int = 0
     successful_requests: int = 0
     failed_requests: int = 0
     weight: float = 0.0
@@ -52,10 +52,10 @@ def score(rows: Iterable[dict]) -> dict[str, MinerScore]:
     for row in rows:
         miner_id = row["miner_id"]
         bucket = scores.setdefault(miner_id, MinerScore(miner_id=miner_id))
-        earn = int(row.get("earnings_pdollars", "0") or 0)
-        surch = int(row.get("surcharge_pdollars", "0") or 0)
-        bucket.earnings_pdollars += earn
-        bucket.surcharge_pdollars += surch
+        earn = int(row.get("earnings_ndollars", "0") or 0)
+        surch = int(row.get("surcharge_ndollars", "0") or 0)
+        bucket.earnings_ndollars += earn
+        bucket.surcharge_ndollars += surch
         bucket.successful_requests += int(row.get("successful_requests", 0))
         bucket.failed_requests += int(row.get("failed_requests", 0))
         product = row.get("product") or {}
@@ -70,10 +70,10 @@ def score(rows: Iterable[dict]) -> dict[str, MinerScore]:
 def normalise_weights(scores: dict[str, MinerScore]) -> dict[str, MinerScore]:
     """Compute per-miner weight as the fraction of total earnings.
 
-    Picodollar-precision input, float weight output suitable for
+    nano-dollar-precision input, float weight output suitable for
     `subtensor.set_weights()`.
     """
-    total = sum(s.earnings_pdollars + s.surcharge_pdollars for s in scores.values())
+    total = sum(s.earnings_ndollars + s.surcharge_ndollars for s in scores.values())
     if total <= 0:
         # No earnings this epoch — every miner gets equal weight (or 0).
         # Bittensor's set_weights requires the vector to sum to ~1.0 if
@@ -83,7 +83,7 @@ def normalise_weights(scores: dict[str, MinerScore]) -> dict[str, MinerScore]:
             s.weight = 0.0
         return scores
     for s in scores.values():
-        s.weight = (s.earnings_pdollars + s.surcharge_pdollars) / total
+        s.weight = (s.earnings_ndollars + s.surcharge_ndollars) / total
     return scores
 
 
