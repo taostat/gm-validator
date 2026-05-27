@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+
+from gm_validator.scoring import MINER_EMISSION_PCT_DEFAULT
 
 
 def _require_env(name: str) -> str:
@@ -18,6 +21,22 @@ def _int_env(name: str, default: int) -> int:
     if value is None:
         return default
     return int(value)
+
+
+def _decimal_env(name: str) -> Decimal | None:
+    """Parse an env var as ``Decimal``; return ``None`` when unset.
+
+    Raises:
+        ValueError: The variable is set to a string that does not parse
+            as a decimal.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return Decimal(raw)
+    except InvalidOperation as exc:
+        raise ValueError(f"{name}={raw!r} is not a valid decimal") from exc
 
 
 @dataclass
@@ -61,6 +80,24 @@ class ValidatorConfig:
     # Observability.
     metrics_port: int
 
+    # Alpha-economics cap (bm-pattern PR 1). See scoring.apply_emission_cap.
+    # MINER_EMISSION_PCT — protocol miner share. Default 0.41 mirrors bm.
+    miner_emission_pct: Decimal
+    # ALPHA_PRICE_OVERRIDE_USD — short-circuit the live oracle. None means
+    # "fetch from taostats". Set in tests/dev when the API is unreachable.
+    alpha_price_override_usd: Decimal | None
+    # TAOSTATS_API_KEY — Authorization header value. Required when the
+    # override is unset; we surface the empty case at the call site so
+    # mock-mode tests run without credentials.
+    taostats_api_key: str | None
+    # TAOSTATS_API_URL — override the API root. Default points at prod.
+    taostats_api_url: str
+    # EPOCH_ALPHA_EMISSION_OVERRIDE — full-epoch alpha emission. PR 1 reads
+    # this from config because the finalizer does not yet emit it and the
+    # chain-state pull lives in PR 2. None forces validator to skip
+    # cap-aware submission until the override is set.
+    epoch_alpha_emission_override: Decimal | None
+
     @classmethod
     def from_env(cls) -> ValidatorConfig:
         """Build from environment variables.
@@ -68,6 +105,12 @@ class ValidatorConfig:
         Raises:
             ValueError: A required environment variable is missing.
         """
+        miner_emission_pct_raw = _decimal_env("MINER_EMISSION_PCT")
+        miner_emission_pct = (
+            miner_emission_pct_raw
+            if miner_emission_pct_raw is not None
+            else MINER_EMISSION_PCT_DEFAULT
+        )
         return cls(
             s3_bucket=_require_env("S3_BUCKET"),
             s3_prefix=os.environ.get("S3_PREFIX", "v1").strip("/"),
@@ -88,6 +131,11 @@ class ValidatorConfig:
             verifier_sample_per_tuple=_int_env("VERIFIER_SAMPLE_PER_TUPLE", 16),
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),
+            miner_emission_pct=miner_emission_pct,
+            alpha_price_override_usd=_decimal_env("ALPHA_PRICE_OVERRIDE_USD"),
+            taostats_api_key=os.environ.get("TAOSTATS_API_KEY"),
+            taostats_api_url=os.environ.get("TAOSTATS_API_URL", "https://api.taostats.io"),
+            epoch_alpha_emission_override=_decimal_env("EPOCH_ALPHA_EMISSION_OVERRIDE"),
         )
 
     def finalized_prefix(self, epoch_id: int) -> str:

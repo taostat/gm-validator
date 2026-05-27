@@ -20,6 +20,7 @@ import json
 import os
 import pathlib
 import subprocess
+from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -29,10 +30,54 @@ from moto import mock_aws
 from gm_validator.bittensor_adapter import MockSubmitter
 from gm_validator.config import ValidatorConfig
 from gm_validator.s3_mirror import S3Mirror
+from gm_validator.scoring import MINER_EMISSION_PCT_DEFAULT
 from gm_validator.validator import Validator
 
 BUCKET = "gm-test-bucket"
 PREFIX = "v1"
+
+# Fixed test inputs to the emission cap. With $0.50/α and 1_000_000α
+# emission the miner pool is $205_000 — large enough that every test's
+# synthesized earnings stay under-subscribed (scale = 1).
+_TEST_ALPHA_PRICE_USD = Decimal("0.50")
+_TEST_EPOCH_ALPHA_EMISSION = Decimal("1000000")
+
+
+async def _fixed_alpha_price() -> Decimal:
+    return _TEST_ALPHA_PRICE_USD
+
+
+def _make_config(tmp_path: pathlib.Path) -> ValidatorConfig:
+    """Build a test ValidatorConfig wired for the new cap path.
+
+    Pins the alpha-price override and the epoch-emission override so the
+    integration tests do not hit Taostats and the cap math runs
+    deterministically.
+    """
+    return ValidatorConfig(
+        s3_bucket=BUCKET,
+        s3_prefix=PREFIX,
+        s3_endpoint_url=None,
+        aws_region="us-east-1",
+        s3_anonymous=False,
+        local_mirror_dir=str(tmp_path),
+        mirror_retention_epochs=10,
+        processed_state_path=str(tmp_path / "processed.json"),
+        bittensor_netuid=42,
+        bittensor_endpoint=None,
+        bittensor_wallet_name=None,
+        bittensor_wallet_hotkey=None,
+        bittensor_mock=True,
+        verifier_bin=_verifier_bin(),
+        verifier_sample_per_tuple=0,
+        poll_interval_secs=1,
+        metrics_port=9092,
+        miner_emission_pct=MINER_EMISSION_PCT_DEFAULT,
+        alpha_price_override_usd=_TEST_ALPHA_PRICE_USD,
+        taostats_api_key=None,
+        taostats_api_url="https://api.taostats.io",
+        epoch_alpha_emission_override=_TEST_EPOCH_ALPHA_EMISSION,
+    )
 
 
 def _record(rid: str, miner: str, success: bool = True) -> dict[str, Any]:
@@ -193,25 +238,7 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
 
         # Sample 0 means signatures are not checked (our records have
         # placeholder signatures); raw_hash is still verified.
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-        )
+        config = _make_config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(
@@ -219,6 +246,7 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             mirror,
             submitter,
             miner_uid_lookup={miner_a: 0, miner_b: 1},
+            alpha_price_fetcher=_fixed_alpha_price,
         )
 
         outcomes = validator.process_once()
@@ -235,8 +263,12 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
         assert call["epoch_id"] == 7
         assert call["netuid"] == 42
         assert set(call["uids"]) == {0, 1}
+        # Under-subscribed: sum of weights is the consumed-USD fraction of
+        # the miner pool — strictly less than 1.0. The leftover is the
+        # burn fraction that PR 2 will route to the subnet-owner UID.
         total_weight = sum(call["weights"])
-        assert abs(total_weight - 1.0) < 1e-12
+        assert 0.0 < total_weight < 1.0
+        assert outcome.burn_fraction == 1.0 - total_weight
 
         # Idempotency: a second tick should not re-process.
         more = validator.process_once()
@@ -260,29 +292,17 @@ def test_validator_restart_does_not_resubmit(tmp_path: pathlib.Path) -> None:
         records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
         _populate_epoch(s3, epoch_id=7, records=records)
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-        )
+        config = _make_config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
 
         # First process: a fresh validator submits epoch 7.
-        first = Validator(config, mirror, MockSubmitter(), miner_uid_lookup={miner_a: 0})
+        first = Validator(
+            config,
+            mirror,
+            MockSubmitter(),
+            miner_uid_lookup={miner_a: 0},
+            alpha_price_fetcher=_fixed_alpha_price,
+        )
         assert len(first.process_once()) == 1
 
         # Restart: a brand-new Validator (fresh in-memory state) reads the
@@ -293,6 +313,7 @@ def test_validator_restart_does_not_resubmit(tmp_path: pathlib.Path) -> None:
             S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
             restarted_submitter,
             miner_uid_lookup={miner_a: 0},
+            alpha_price_fetcher=_fixed_alpha_price,
         )
         outcomes = restarted.process_once()
 
@@ -334,28 +355,16 @@ def test_validator_skips_submission_on_verifier_failure(tmp_path: pathlib.Path) 
         )
         s3.put_object(Bucket=BUCKET, Key=f"{finalized_prefix}_FINALIZED", Body=b"")
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-        )
+        config = _make_config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
-        validator = Validator(config, mirror, submitter, miner_uid_lookup={miner_a: 0})
+        validator = Validator(
+            config,
+            mirror,
+            submitter,
+            miner_uid_lookup={miner_a: 0},
+            alpha_price_fetcher=_fixed_alpha_price,
+        )
 
         outcomes = validator.process_once()
         assert len(outcomes) == 1

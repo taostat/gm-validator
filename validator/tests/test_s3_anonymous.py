@@ -46,6 +46,8 @@ def test_s3_anonymous_falsy_values(monkeypatch: pytest.MonkeyPatch, value: str) 
 
 def _make_config(**overrides: object) -> ValidatorConfig:
     """Build a minimal ValidatorConfig for S3 client tests."""
+    from gm_validator.scoring import MINER_EMISSION_PCT_DEFAULT
+
     defaults: dict[str, object] = {
         "s3_bucket": "test-bucket",
         "s3_prefix": "v1",
@@ -64,6 +66,11 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "verifier_sample_per_tuple": 0,
         "poll_interval_secs": 60,
         "metrics_port": 9092,
+        "miner_emission_pct": MINER_EMISSION_PCT_DEFAULT,
+        "alpha_price_override_usd": None,
+        "taostats_api_key": None,
+        "taostats_api_url": "https://api.taostats.io",
+        "epoch_alpha_emission_override": None,
     }
     defaults.update(overrides)
     return ValidatorConfig(**defaults)  # type: ignore[arg-type]
