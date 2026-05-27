@@ -52,8 +52,8 @@ Under `validator/`. Watches S3 for `_FINALIZED` markers and consumes:
   This is the language boundary the W6 launch prompt mandated; drift
   cannot happen because the Python service never replicates the
   canonical-hash or signature logic.
-- **`scoring.py`** — per-miner score = sum of `earnings_pdollars +
-  surcharge_pdollars` across products. `normalise_weights` produces a
+- **`scoring.py`** — per-miner score = sum of `earnings_ndollars +
+  surcharge_ndollars` across products. `normalise_weights` produces a
   weight vector summing to 1.0 (or all zeros when total earnings = 0).
 - **`bittensor_adapter.py`** — `Submitter` protocol with a
   `MockSubmitter` for tests.

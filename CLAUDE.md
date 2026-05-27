@@ -17,7 +17,7 @@ earnings scores, normalizes them to weights, and calls
 - `src/gm_validator/main.py` — entry point; wires S3 mirror, submitter, miner-uid lookup
 - `src/gm_validator/validator.py` — `Validator.process_once()`: discover finalized epochs, mirror artifacts locally, run verifier subprocess, score, submit
 - `src/gm_validator/s3_mirror.py` — `S3Mirror`: syncs S3 epoch artifacts to a local directory; prunes old epochs
-- `src/gm_validator/scoring.py` — `score()` + `normalise_weights()`: sum `earnings_pdollars + surcharge_pdollars` per miner; normalize to weights
+- `src/gm_validator/scoring.py` — `score()` + `normalise_weights()`: sum `earnings_ndollars + surcharge_ndollars` per miner; normalize to weights
 - `src/gm_validator/verifier.py` — subprocess wrapper for the `gm-verifier` binary
 - `src/gm_validator/bittensor_adapter.py` — `Submitter` protocol; `MockSubmitter` for testing
 - `src/gm_validator/bittensor_real.py` — `RealSubmitter`: lazily-imported to avoid loading bittensor-py in tests
@@ -86,5 +86,5 @@ cargo build --release -p gm-verifier
 - The `raw_hash` algorithm is byte-for-byte identical between the epoch-finalizer (Python, calling the verifier binary) and this validator (calling the same binary). Any drift fails the verification sample and triggers an alert.
 - `bittensor` is lazily imported to keep the test path independent of the bittensor-py wheel.
 - Processed epoch state is persisted to disk so a validator restart does not re-submit weights for epochs already finalized on-chain.
-- Scoring uses picodollar-precision integer arithmetic throughout. Weights are the only floating-point values, derived only after all integer sums are complete.
+- Scoring uses nano-dollar-precision integer arithmetic throughout. Weights are the only floating-point values, derived only after all integer sums are complete.
 - Supply-chain: `deny.toml` governs the Rust workspace (`cargo deny check`).

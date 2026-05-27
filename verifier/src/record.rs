@@ -147,8 +147,8 @@ mod tests {
             "miner_price": {
                 "price_id": "mp-v1-142-0017",
                 "dimensions": {
-                    "input_per_mtok_pdollars": "2800000000",
-                    "output_per_mtok_pdollars": "14000000000"
+                    "input_per_mtok_ndollars": 2800000,
+                    "output_per_mtok_ndollars": 14000000
                 }
             },
             "usage": { "input_tokens": 812, "output_tokens": 1456 },

@@ -1,7 +1,7 @@
 //! Per-record cost re-derivation, ported from the Epoch Finalizer's
 //! `gm_epoch_finalizer.aggregation._compute_record_costs`.
 //!
-//! The finalizer publishes `earnings_pdollars` and `surcharge_pdollars`
+//! The finalizer publishes `earnings_ndollars` and `surcharge_ndollars`
 //! per aggregated `(miner_id, product)` row. Nothing in the artifact set
 //! lets a validator check those numbers — `raw_hash` only proves the raw
 //! records are untampered, not that the finalizer summed them correctly.
@@ -10,20 +10,20 @@
 //! and fail the epoch on any mismatch.
 //!
 //! Parity requirements (see `docs/contracts/epoch-artifacts.md`,
-//! `docs/contracts/picodollar-denomination.md`, and
+//! `docs/contracts/nano-dollar-denomination.md`, and
 //! `docs/contracts/validator-log-record.md`):
 //!
-//! - All amounts are picodollars, integers only — no floating point.
+//! - All amounts are nano-dollars, integers only — no floating point.
 //! - `per_token = Σ usage[dim] × price[dim] / 1_000_000`, where `/` is
 //!   floor division applied **per dimension** before summing.
 //! - Modifiers are integer basis points (`10_000` == 1.0×) applied
 //!   sequentially in the fixed order `batch_bps`, `priority_bps`,
 //!   `residency_bps`, each as `value × bps / 10_000` (floor).
 //! - Surcharges are summed separately and are **never** multiplied by
-//!   modifiers. Each entry is either `count × unit_pdollars` or
-//!   `container_hours_bps × per_hour_pdollars / 10_000` (floor).
+//!   modifiers. Each entry is either `count × unit_ndollars` or
+//!   `container_hours_bps × per_hour_ndollars / 10_000` (floor).
 //! - `success == false` records contribute zero to both totals.
-//! - Picodollar amounts in the JSON are decimal strings (`U64String`),
+//! - nano-dollar amounts in the JSON are decimal strings (`U64String`),
 //!   token counts are JSON numbers.
 
 use serde_json::Value;
@@ -31,7 +31,7 @@ use serde_json::Value;
 use crate::errors::VerifierError;
 use crate::record::ValidatorLogRecord;
 
-/// Token dimensions tracked for earnings, paired with their picodollar
+/// Token dimensions tracked for earnings, paired with their nano-dollar
 /// price-per-million-token field name in `miner_price.dimensions`.
 ///
 /// Order mirrors `TOKEN_DIMENSIONS` in the finalizer's `aggregation.py`.
@@ -40,13 +40,13 @@ use crate::record::ValidatorLogRecord;
 /// it identical to the finalizer so the two implementations read the
 /// same.
 const TOKEN_DIMENSIONS: &[(&str, &str)] = &[
-    ("input_tokens", "input_per_mtok_pdollars"),
-    ("output_tokens", "output_per_mtok_pdollars"),
-    ("cache_read_tokens", "cache_read_per_mtok_pdollars"),
-    ("cache_write_5m_tokens", "cache_write_5m_per_mtok_pdollars"),
-    ("cache_write_1h_tokens", "cache_write_1h_per_mtok_pdollars"),
-    ("audio_input_tokens", "audio_input_per_mtok_pdollars"),
-    ("audio_output_tokens", "audio_output_per_mtok_pdollars"),
+    ("input_tokens", "input_per_mtok_ndollars"),
+    ("output_tokens", "output_per_mtok_ndollars"),
+    ("cache_read_tokens", "cache_read_per_mtok_ndollars"),
+    ("cache_write_5m_tokens", "cache_write_5m_per_mtok_ndollars"),
+    ("cache_write_1h_tokens", "cache_write_1h_per_mtok_ndollars"),
+    ("audio_input_tokens", "audio_input_per_mtok_ndollars"),
+    ("audio_output_tokens", "audio_output_per_mtok_ndollars"),
 ];
 
 /// Modifier basis-point fields, applied to `per_token` in this exact
@@ -61,31 +61,31 @@ const MODIFIER_FIELDS: &[&str] = &["batch_bps", "priority_bps", "residency_bps"]
 /// price replaces the base price for that dimension.
 const LONG_CONTEXT_OVERRIDES: &[(&str, &str)] = &[
     (
-        "input_per_mtok_pdollars",
-        "long_context_input_per_mtok_pdollars",
+        "input_per_mtok_ndollars",
+        "long_context_input_per_mtok_ndollars",
     ),
     (
-        "output_per_mtok_pdollars",
-        "long_context_output_per_mtok_pdollars",
+        "output_per_mtok_ndollars",
+        "long_context_output_per_mtok_ndollars",
     ),
 ];
 
-/// Picodollar denominator: dimension prices are per **million** tokens.
+/// nano-dollar denominator: dimension prices are per **million** tokens.
 const PER_MTOK_DIVISOR: u128 = 1_000_000;
 
 /// Basis-point denominator: `10_000` bps == 1.0×.
 const BPS_DIVISOR: u128 = 10_000;
 
-/// The picodollar earnings + surcharge contribution of a single record.
+/// The nano-dollar earnings + surcharge contribution of a single record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RecordCost {
-    /// Per-token earnings after modifiers, in picodollars.
-    pub earnings_pdollars: u128,
-    /// Surcharge total, in picodollars (modifiers never applied).
-    pub surcharge_pdollars: u128,
+    /// Per-token earnings after modifiers, in nano-dollars.
+    pub earnings_ndollars: u128,
+    /// Surcharge total, in nano-dollars (modifiers never applied).
+    pub surcharge_ndollars: u128,
 }
 
-/// Re-derive the `(earnings, surcharge)` picodollar contribution of one
+/// Re-derive the `(earnings, surcharge)` nano-dollar contribution of one
 /// record, matching the finalizer's `_compute_record_costs`.
 ///
 /// A `success == false` record bills zero on both axes, regardless of
@@ -96,7 +96,7 @@ pub struct RecordCost {
 ///
 /// Returns [`VerifierError::MalformedRecord`] when `success` is missing,
 /// or when a numeric field is present but cannot be parsed as a
-/// non-negative integer (token count, picodollar string, or basis
+/// non-negative integer (token count, nano-dollar string, or basis
 /// points).
 pub fn compute_record_cost(record: &ValidatorLogRecord) -> Result<RecordCost, VerifierError> {
     if !record.success()? {
@@ -134,7 +134,7 @@ pub fn compute_record_cost(record: &ValidatorLogRecord) -> Result<RecordCost, Ve
             // Dimension not priced on this product — finalizer skips it.
             continue;
         };
-        let unit_price = pdollars_of(unit_price, active_price_field)?;
+        let unit_price = ndollars_of(unit_price, active_price_field)?;
         per_token += token_count * unit_price / PER_MTOK_DIVISOR;
     }
 
@@ -155,8 +155,8 @@ pub fn compute_record_cost(record: &ValidatorLogRecord) -> Result<RecordCost, Ve
     }
 
     Ok(RecordCost {
-        earnings_pdollars: per_token,
-        surcharge_pdollars: surcharge,
+        earnings_ndollars: per_token,
+        surcharge_ndollars: surcharge,
     })
 }
 
@@ -184,12 +184,12 @@ fn resolve_price_field<'a>(
     base_field
 }
 
-/// Re-derive one surcharge entry's picodollar contribution.
+/// Re-derive one surcharge entry's nano-dollar contribution.
 ///
 /// Two shapes are supported, matching the finalizer:
-/// - `{count, unit_pdollars}` → `count × unit_pdollars`.
-/// - `{container_hours_bps, per_hour_pdollars}` →
-///   `container_hours_bps × per_hour_pdollars / 10_000` (floor).
+/// - `{count, unit_ndollars}` → `count × unit_ndollars`.
+/// - `{container_hours_bps, per_hour_ndollars}` →
+///   `container_hours_bps × per_hour_ndollars / 10_000` (floor).
 ///
 /// Any other shape contributes 0, as the finalizer's `else`-less branch
 /// does (a non-object or unrecognised entry is silently skipped).
@@ -197,16 +197,16 @@ fn surcharge_entry(entry: &Value) -> Result<u128, VerifierError> {
     let Some(obj) = entry.as_object() else {
         return Ok(0);
     };
-    if let (Some(count), Some(unit)) = (obj.get("count"), obj.get("unit_pdollars")) {
+    if let (Some(count), Some(unit)) = (obj.get("count"), obj.get("unit_ndollars")) {
         let count = token_count_of(count)?;
-        let unit = pdollars_of(unit, "surcharge.unit_pdollars")?;
+        let unit = ndollars_of(unit, "surcharge.unit_ndollars")?;
         return Ok(count * unit);
     }
     if let (Some(hours_bps), Some(per_hour)) =
-        (obj.get("container_hours_bps"), obj.get("per_hour_pdollars"))
+        (obj.get("container_hours_bps"), obj.get("per_hour_ndollars"))
     {
         let hours_bps = bps_of(hours_bps, "surcharge.container_hours_bps")?;
-        let per_hour = pdollars_of(per_hour, "surcharge.per_hour_pdollars")?;
+        let per_hour = ndollars_of(per_hour, "surcharge.per_hour_ndollars")?;
         return Ok(hours_bps * per_hour / BPS_DIVISOR);
     }
     Ok(0)
@@ -225,19 +225,16 @@ fn token_count_of(value: &Value) -> Result<u128, VerifierError> {
     })
 }
 
-/// Parse a picodollar amount: a decimal string (`U64String`) per the
-/// picodollar-denomination contract. `null` is treated as 0.
-fn pdollars_of(value: &Value, field: &str) -> Result<u128, VerifierError> {
+/// Parse a nano-dollar amount: a JSON number (`U64`) per the nano-dollar
+/// denomination contract. `null` is treated as 0.
+fn ndollars_of(value: &Value, field: &str) -> Result<u128, VerifierError> {
     if value.is_null() {
         return Ok(0);
     }
-    let s = value.as_str().ok_or_else(|| {
+    value.as_u64().map(u128::from).ok_or_else(|| {
         VerifierError::MalformedRecord(format!(
-            "{field}: picodollar amount must be a decimal string, got {value}"
+            "{field}: nano-dollar amount must be a non-negative integer, got {value}"
         ))
-    })?;
-    s.parse::<u128>().map_err(|e| {
-        VerifierError::MalformedRecord(format!("{field}: invalid picodollar string {s:?}: {e}"))
     })
 }
 
@@ -265,26 +262,26 @@ mod tests {
 
     #[test]
     fn per_token_floor_division_per_dimension() {
-        // input=1_000_000 tokens at $1/Mtok ($1 == 1e12 pUSD/Mtok).
+        // input=1_000_000 tokens at $1/Mtok ($1 == 1e12 nUSD/Mtok).
         let cost = cost_of(
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "1000000000000",
-                    "output_per_mtok_pdollars": "0"
+                    "input_per_mtok_ndollars": 1000000000,
+                    "output_per_mtok_ndollars": 0
                 }},
                 "usage": {"input_tokens": 1000000, "output_tokens": 0},
                 "modifiers": {}, "surcharges": {}
             }"#,
         );
-        assert_eq!(cost.earnings_pdollars, 1_000_000_000_000);
-        assert_eq!(cost.surcharge_pdollars, 0);
+        assert_eq!(cost.earnings_ndollars, 1_000_000_000);
+        assert_eq!(cost.surcharge_ndollars, 0);
     }
 
     #[test]
     fn per_token_floors_each_dimension_before_summing() {
         // Two dimensions, each with a sub-1e6 product (1 token ×
-        // 999_999 pUSD/Mtok). Per-dimension floor: 0 + 0 = 0.
+        // 999_999 nUSD/Mtok). Per-dimension floor: 0 + 0 = 0.
         // Summing first then dividing would give 1 (floor) or 2 (ceil);
         // this fixes the convention shared with the gateway's
         // `money::settle` and the Finalizer's `_compute_record_costs`.
@@ -292,45 +289,45 @@ mod tests {
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "999999",
-                    "output_per_mtok_pdollars": "999999"
+                    "input_per_mtok_ndollars": 999,
+                    "output_per_mtok_ndollars": 999
                 }},
                 "usage": {"input_tokens": 1, "output_tokens": 1},
                 "modifiers": {}, "surcharges": {}
             }"#,
         );
-        assert_eq!(cost.earnings_pdollars, 0);
+        assert_eq!(cost.earnings_ndollars, 0);
     }
 
     #[test]
     fn modifier_floors_on_non_divisible_product() {
-        // 7 tokens × 1e6 pUSD/Mtok = 7 pUSD. batch 3333 bps:
+        // 7 tokens × 1e6 nUSD/Mtok = 7 nUSD. batch 3333 bps:
         // 7 × 3333 / 10_000 = 23331 / 10000 = 2 (floor), not 3 (ceil).
         let cost = cost_of(
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "1000000"
+                    "input_per_mtok_ndollars": 1000000
                 }},
                 "usage": {"input_tokens": 7},
                 "modifiers": {"batch_bps": 3333},
                 "surcharges": {}
             }"#,
         );
-        assert_eq!(cost.earnings_pdollars, 2);
+        assert_eq!(cost.earnings_ndollars, 2);
     }
 
     #[test]
     fn contract_worked_example() {
         // The validator-log-record.md worked example: 812/1456/1200
-        // tokens at the documented prices => 22_993_600_000 pUSD.
+        // tokens at the documented prices => 22_993_600_000 nUSD.
         let cost = cost_of(
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "2800000000000",
-                    "output_per_mtok_pdollars": "14000000000000",
-                    "cache_read_per_mtok_pdollars": "280000000000"
+                    "input_per_mtok_ndollars": 2800000000,
+                    "output_per_mtok_ndollars": 14000000000,
+                    "cache_read_per_mtok_ndollars": 280000000
                 }},
                 "usage": {
                     "input_tokens": 812,
@@ -341,7 +338,7 @@ mod tests {
                 "modifiers": {}, "surcharges": {}
             }"#,
         );
-        assert_eq!(cost.earnings_pdollars, 22_993_600_000);
+        assert_eq!(cost.earnings_ndollars, 22_993_600);
     }
 
     #[test]
@@ -350,14 +347,14 @@ mod tests {
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "1000000000000"
+                    "input_per_mtok_ndollars": 1000000000
                 }},
                 "usage": {"input_tokens": 1000000},
                 "modifiers": {"batch_bps": 5000},
                 "surcharges": {}
             }"#,
         );
-        assert_eq!(cost.earnings_pdollars, 500_000_000_000);
+        assert_eq!(cost.earnings_ndollars, 500_000_000);
     }
 
     #[test]
@@ -368,16 +365,16 @@ mod tests {
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "1000000000000"
+                    "input_per_mtok_ndollars": 1000000000
                 }},
                 "usage": {"input_tokens": 1000000},
                 "modifiers": {"priority_bps": 3333, "batch_bps": 7777},
                 "surcharges": {}
             }"#,
         );
-        let after_batch = 1_000_000_000_000_u128 * 7777 / 10_000;
+        let after_batch = 1_000_000_000_u128 * 7777 / 10_000;
         let expected = after_batch * 3333 / 10_000;
-        assert_eq!(cost.earnings_pdollars, expected);
+        assert_eq!(cost.earnings_ndollars, expected);
     }
 
     #[test]
@@ -386,22 +383,22 @@ mod tests {
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "1000000000000"
+                    "input_per_mtok_ndollars": 1000000000
                 }},
                 "usage": {"input_tokens": 1000000},
                 "modifiers": {"batch_bps": 5000},
                 "surcharges": {"anthropic_web_search": {
-                    "count": 3, "unit_pdollars": "10000000000000"
+                    "count": 3, "unit_ndollars": 10000000000
                 }}
             }"#,
         );
-        assert_eq!(cost.earnings_pdollars, 500_000_000_000);
-        assert_eq!(cost.surcharge_pdollars, 30_000_000_000_000);
+        assert_eq!(cost.earnings_ndollars, 500_000_000);
+        assert_eq!(cost.surcharge_ndollars, 30_000_000_000);
     }
 
     #[test]
     fn container_hours_surcharge() {
-        // 12_500 bps (1.25h) * 4_000_000_000 pUSD/h / 10_000.
+        // 12_500 bps (1.25h) * 4_000_000 nUSD/h / 10_000.
         let cost = cost_of(
             r#"{
                 "success": true,
@@ -410,14 +407,11 @@ mod tests {
                 "modifiers": {},
                 "surcharges": {"container": {
                     "container_hours_bps": 12500,
-                    "per_hour_pdollars": "4000000000"
+                    "per_hour_ndollars": 4000000
                 }}
             }"#,
         );
-        assert_eq!(
-            cost.surcharge_pdollars,
-            12_500_u128 * 4_000_000_000 / 10_000
-        );
+        assert_eq!(cost.surcharge_ndollars, 12_500_u128 * 4_000_000 / 10_000);
     }
 
     #[test]
@@ -426,11 +420,11 @@ mod tests {
             r#"{
                 "success": false,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "1000000000000"
+                    "input_per_mtok_ndollars": 1000000000
                 }},
                 "usage": {"input_tokens": 999999},
                 "modifiers": {},
-                "surcharges": {"x": {"count": 9, "unit_pdollars": "999"}}
+                "surcharges": {"x": {"count": 9, "unit_ndollars": 0}}
             }"#,
         );
         assert_eq!(cost, RecordCost::default());
@@ -442,14 +436,14 @@ mod tests {
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "1000000000000",
-                    "long_context_input_per_mtok_pdollars": "2000000000000"
+                    "input_per_mtok_ndollars": 1000000000,
+                    "long_context_input_per_mtok_ndollars": 2000000000
                 }},
                 "usage": {"input_tokens": 1000000, "long_context_tier": true},
                 "modifiers": {}, "surcharges": {}
             }"#,
         );
-        assert_eq!(cost.earnings_pdollars, 2_000_000_000_000);
+        assert_eq!(cost.earnings_ndollars, 2_000_000_000);
     }
 
     #[test]
@@ -458,13 +452,13 @@ mod tests {
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "1000000000000"
+                    "input_per_mtok_ndollars": 1000000000
                 }},
                 "usage": {"input_tokens": 1000000, "long_context_tier": true},
                 "modifiers": {}, "surcharges": {}
             }"#,
         );
-        assert_eq!(cost.earnings_pdollars, 1_000_000_000_000);
+        assert_eq!(cost.earnings_ndollars, 1_000_000_000);
     }
 
     #[test]
@@ -473,22 +467,24 @@ mod tests {
             r#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": "1000000000000"
+                    "input_per_mtok_ndollars": 1000000000
                 }},
                 "usage": {"input_tokens": 1000000, "audio_input_tokens": 5000},
                 "modifiers": {}, "surcharges": {}
             }"#,
         );
-        assert_eq!(cost.earnings_pdollars, 1_000_000_000_000);
+        assert_eq!(cost.earnings_ndollars, 1_000_000_000);
     }
 
     #[test]
-    fn rejects_picodollar_json_number() {
+    fn rejects_ndollar_decimal_string() {
+        // Wire format is JSON Number, not string — a string-form value is
+        // a malformed record under the post-cutover contract.
         let record = parse_record(
             br#"{
                 "success": true,
                 "miner_price": {"dimensions": {
-                    "input_per_mtok_pdollars": 1000000000000
+                    "input_per_mtok_ndollars": "1000000000"
                 }},
                 "usage": {"input_tokens": 1000000},
                 "modifiers": {}, "surcharges": {}

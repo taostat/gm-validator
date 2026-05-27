@@ -11,7 +11,7 @@ Per `workstreams.md W6` and `docs/contracts/epoch-artifacts.md`:
    tuple, verifies a sample of ed25519 signatures against
    `gateway_keys.json`. Mismatches => alert + skip weight submission.
 4. Compute per-miner score:
-   sum of `earnings_pdollars + surcharge_pdollars` across products.
+   sum of `earnings_ndollars + surcharge_ndollars` across products.
 5. Convert to subnet alpha at current exchange rate.
 6. Submit weights via the configured Bittensor adapter (a mock during
    build; real `bittensor-py` `subtensor.set_weights()` in deploy).

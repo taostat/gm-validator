@@ -2,24 +2,24 @@
 //!
 //! `check_aggregated_totals` re-runs the finalizer's pricing math over
 //! the raw records and fails the epoch if the published
-//! `earnings_pdollars` / `surcharge_pdollars` do not match. These tests
+//! `earnings_ndollars` / `surcharge_ndollars` do not match. These tests
 //! drive the `gm-verifier` binary over a fixture epoch directory:
 //!
 //! - `cost_epoch/aggregated.jsonl` — correct totals; `verify` exits 0.
-//! - `cost_epoch/aggregated_tampered.jsonl` — `earnings_pdollars`
-//!   inflated from `1_500_000_000_000` to `9_900_000_000_000` while
-//!   counts and `raw_hash` stay valid; `verify` must exit non-zero,
-//!   proving the cost check (not the count or hash check) caught it.
+//! - `cost_epoch/aggregated_tampered.jsonl` — `earnings_ndollars`
+//!   inflated from `1_500_000_000` to `9_900_000_000` while counts and
+//!   `raw_hash` stay valid; `verify` must exit non-zero, proving the
+//!   cost check (not the count or hash check) caught it.
 //!
 //! The fixture's three records (`raw.jsonl`, also stored zstd-compressed
 //! as `raw.jsonl.zst`) re-derive by hand to:
-//!   - record A: input `1_000_000` at $1/Mtok = `1e12`, `batch_bps` 5000
-//!     → `5e11`; surcharge count 2 × `1e10` = `2e10`.
-//!   - record B: output `500_000` at $2/Mtok = `1e12`; no
+//!   - record A: input `1_000_000` at $1/Mtok = `1e9`, `batch_bps` 5000
+//!     → `5e8`; surcharge count 2 × `1e7` = `2e7`.
+//!   - record B: output `500_000` at $2/Mtok = `1e9`; no
 //!     modifiers/surcharge.
 //!   - record C: `success` false → contributes 0.
 //!
-//! Totals: earnings = `1_500_000_000_000`, surcharge = `20_000_000_000`.
+//! Totals: earnings = `1_500_000_000`, surcharge = `20_000_000`.
 //!
 //! Signature verification is skipped (`--sample 0`): the fixture
 //! signatures are placeholders and the cost check runs independently of
@@ -92,14 +92,14 @@ fn tampered_earnings_fail_verification() {
 
     assert!(
         !output.status.success(),
-        "verify must fail when earnings_pdollars is tampered; logs:\n{logs}",
+        "verify must fail when earnings_ndollars is tampered; logs:\n{logs}",
     );
     assert!(
-        logs.contains("earnings_pdollars"),
-        "failure should name the earnings_pdollars mismatch; logs:\n{logs}",
+        logs.contains("earnings_ndollars"),
+        "failure should name the earnings_ndollars mismatch; logs:\n{logs}",
     );
     assert!(
-        logs.contains("9900000000000") && logs.contains("1500000000000"),
+        logs.contains("9900000000") && logs.contains("1500000000"),
         "failure should report claimed vs re-derived; logs:\n{logs}",
     );
 }

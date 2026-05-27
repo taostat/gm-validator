@@ -14,8 +14,8 @@ def _row(miner_id: str, earnings: int, surcharge: int = 0) -> dict:
         "miner_id": miner_id,
         "product": {"provider": "anthropic", "model": "claude-sonnet-4-6"},
         "totals": {"input_tokens": 0, "output_tokens": 0},
-        "earnings_pdollars": str(earnings),
-        "surcharge_pdollars": str(surcharge),
+        "earnings_ndollars": str(earnings),
+        "surcharge_ndollars": str(surcharge),
         "successful_requests": 1,
         "failed_requests": 0,
         "raw_record_count": 1,
@@ -30,8 +30,8 @@ def test_sums_per_miner_across_products() -> None:
         _row("B", 25),
     ]
     s = score(rows)
-    assert s["A"].earnings_pdollars == 150
-    assert s["B"].earnings_pdollars == 25
+    assert s["A"].earnings_ndollars == 150
+    assert s["B"].earnings_ndollars == 25
 
 
 def test_normalise_weights_sum_to_one_when_total_positive() -> None:

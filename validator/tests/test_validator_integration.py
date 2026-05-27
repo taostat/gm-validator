@@ -52,8 +52,8 @@ def _record(rid: str, miner: str, success: bool = True) -> dict[str, Any]:
         "miner_price": {
             "price_id": "mp-v1-7-1",
             "dimensions": {
-                "input_per_mtok_pdollars": "1000000000",
-                "output_per_mtok_pdollars": "5000000000",
+                "input_per_mtok_ndollars": 1_000_000_000,
+                "output_per_mtok_ndollars": 5_000_000_000,
             },
         },
         "usage": usage,
@@ -90,10 +90,10 @@ def _aggregate(records: list[dict], epoch_id: int) -> list[dict]:
         for r in success:
             dims = r["miner_price"]["dimensions"]
             earnings += (
-                r["usage"]["input_tokens"] * int(dims["input_per_mtok_pdollars"]) // 1_000_000
+                r["usage"]["input_tokens"] * int(dims["input_per_mtok_ndollars"]) // 1_000_000
             )
             earnings += (
-                r["usage"]["output_tokens"] * int(dims["output_per_mtok_pdollars"]) // 1_000_000
+                r["usage"]["output_tokens"] * int(dims["output_per_mtok_ndollars"]) // 1_000_000
             )
         raw_hash = _compute_raw_hash_via_verifier(bucket)
         rows.append(
@@ -102,8 +102,8 @@ def _aggregate(records: list[dict], epoch_id: int) -> list[dict]:
                 "miner_id": miner_id,
                 "product": {"provider": provider, "model": model},
                 "totals": {"input_tokens": in_tokens, "output_tokens": out_tokens},
-                "earnings_pdollars": str(earnings),
-                "surcharge_pdollars": "0",
+                "earnings_ndollars": str(earnings),
+                "surcharge_ndollars": "0",
                 "successful_requests": len(success),
                 "failed_requests": len(failed),
                 "raw_record_count": len(bucket),
