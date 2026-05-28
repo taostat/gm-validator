@@ -148,3 +148,25 @@ def test_miner_outside_lookup_dropped() -> None:
     )
     assert "UNKNOWN" not in (str(u) for u in vector.uids)
     assert sum(vector.weights) == MAX_WEIGHT
+
+
+def test_legacy_path_zero_revenue_submits_all_zeros() -> None:
+    """Legacy path with all-zero earnings still emits a uid vector (zero weights).
+
+    The previous epoch's weights stay active on chain until something new
+    is submitted; we must submit explicit zeros to clear them.
+    """
+    rows = [_row("A", 0), _row("B", 0)]
+    scores = score(rows)
+    vector = compute_weights(
+        scores,
+        miner_uid_lookup={"A": 1, "B": 2},
+        use_emission_cap=False,
+        epoch_summary=None,
+        alpha_emission_per_epoch=Decimal("100"),
+        subnet_owner_uid=0,
+    )
+    assert vector.used_emission_cap is False
+    assert vector.burn_uid is None
+    assert set(vector.uids) == {1, 2}
+    assert vector.weights == [0, 0]

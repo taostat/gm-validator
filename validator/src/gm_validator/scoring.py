@@ -172,16 +172,26 @@ def _compute_legacy(
     pairs: list[tuple[int, Decimal]] = []
     for miner_id, s in scores.items():
         uid = miner_uid_lookup.get(miner_id)
-        if uid is None or s.weight <= 0:
+        if uid is None:
             continue
         pairs.append((uid, Decimal(str(s.weight))))
     if not pairs:
         return WeightVector(uids=[], weights=[], burn_uid=None, used_emission_cap=False)
+    total = sum((w for _, w in pairs), Decimal(0))
+    # Zero-revenue epoch: submit all-zeros so the chain clears the prior
+    # epoch's weights. The naive path has no burn slot to absorb pool.
+    if total <= 0:
+        zero_uids = [uid for uid, _ in pairs]
+        return WeightVector(
+            uids=zero_uids,
+            weights=[0] * len(zero_uids),
+            burn_uid=None,
+            used_emission_cap=False,
+        )
     # Floor-rounding into u16 with no burn slot — naive path doesn't
     # know a subnet owner uid. Any remainder lands on the highest-
     # weighted miner so the vector still sums to MAX_WEIGHT.
     pairs.sort(key=lambda kv: kv[1], reverse=True)
-    total = sum((w for _, w in pairs), Decimal(0))
     renorm = total if total > Decimal(1) else Decimal(1)
     u16: list[tuple[int, int]] = []
     running = 0

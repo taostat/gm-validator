@@ -96,8 +96,20 @@ class ValidatorConfig:
         """Build from environment variables.
 
         Raises:
-            ValueError: A required environment variable is missing.
+            ValueError: A required environment variable is missing, or
+                ``USE_EMISSION_CAP=true`` was set without ``SUBNET_OWNER_UID``.
         """
+        use_emission_cap_val = _bool_env("USE_EMISSION_CAP", default=False)
+        subnet_owner_uid_raw = os.environ.get("SUBNET_OWNER_UID")
+        if use_emission_cap_val and not subnet_owner_uid_raw:
+            raise ValueError(
+                "USE_EMISSION_CAP=true requires SUBNET_OWNER_UID to be set explicitly. "
+                "Set SUBNET_OWNER_UID to the subnet-owner UID for emission burn. "
+                "(If you don't have one yet, leave USE_EMISSION_CAP=false until you do.)"
+            )
+        # When cap is disabled the default is unused — parse leniently so
+        # disabled deploys don't fail at boot.
+        subnet_owner_uid_val = int(subnet_owner_uid_raw) if subnet_owner_uid_raw else 0
         return cls(
             s3_bucket=_require_env("S3_BUCKET"),
             s3_prefix=os.environ.get("S3_PREFIX", "v1").strip("/"),
@@ -118,9 +130,9 @@ class ValidatorConfig:
             verifier_sample_per_tuple=_int_env("VERIFIER_SAMPLE_PER_TUPLE", 16),
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),
-            use_emission_cap=_bool_env("USE_EMISSION_CAP", default=False),
+            use_emission_cap=use_emission_cap_val,
             alpha_emission_per_epoch=_decimal_env("ALPHA_EMISSION_PER_EPOCH", Decimal("100")),
-            subnet_owner_uid=_int_env("SUBNET_OWNER_UID", 0),
+            subnet_owner_uid=subnet_owner_uid_val,
         )
 
     def finalized_prefix(self, epoch_id: int) -> str:
