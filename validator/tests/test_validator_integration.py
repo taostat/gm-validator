@@ -24,12 +24,15 @@ from decimal import Decimal
 from typing import Any
 
 import boto3
+import pytest
 import zstandard as zstd
 from moto import mock_aws
+from pydantic import ValidationError
 
 from gm_validator.alpha_economics import MAX_WEIGHT
 from gm_validator.bittensor_adapter import MockSubmitter
 from gm_validator.config import ValidatorConfig
+from gm_validator.epoch_summary import epoch_summary_path, load_epoch_summary
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.validator import Validator
 
@@ -599,3 +602,128 @@ def test_validator_uses_emission_cap_when_flag_on_and_summary_present(
         # Big pool against tiny demand: burn slot should dominate.
         weights_by_uid = dict(zip(call["uids"], call["weights"], strict=True))
         assert weights_by_uid.get(99, 0) > MAX_WEIGHT // 2
+
+
+def _populate_epoch_with_malformed_summary(s3: Any, epoch_id: int, records: list[dict]) -> None:
+    """Same as `_populate_epoch` but writes a structurally-invalid summary."""
+    _populate_epoch(s3, epoch_id, records, with_epoch_summary=False)
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"{PREFIX}/finalized/epoch={epoch_id}/epoch_summary.json",
+        Body=b'{"epoch_id": "not-an-int", "finalized_at": null}',
+    )
+
+
+def test_legacy_path_ignores_malformed_epoch_summary(tmp_path: pathlib.Path) -> None:
+    """When USE_EMISSION_CAP=false a malformed epoch_summary.json must not
+    fail the epoch — the legacy scoring path doesn't read it.
+    """
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        miner_b = "5Ehm" + "B" * 44
+        records = [
+            _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a),
+            _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
+        ]
+        _populate_epoch_with_malformed_summary(s3, epoch_id=21, records=records)
+
+        config = ValidatorConfig(
+            s3_bucket=BUCKET,
+            s3_prefix=PREFIX,
+            s3_endpoint_url=None,
+            aws_region="us-east-1",
+            s3_anonymous=False,
+            local_mirror_dir=str(tmp_path),
+            mirror_retention_epochs=10,
+            processed_state_path=str(tmp_path / "processed.json"),
+            bittensor_netuid=42,
+            bittensor_endpoint=None,
+            bittensor_wallet_name=None,
+            bittensor_wallet_hotkey=None,
+            bittensor_mock=True,
+            verifier_bin=_verifier_bin(),
+            verifier_sample_per_tuple=0,
+            poll_interval_secs=1,
+            metrics_port=9092,
+            use_emission_cap=False,
+            alpha_emission_per_epoch=Decimal("100"),
+            subnet_owner_uid=0,
+        )
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(
+            config,
+            mirror,
+            submitter,
+            miner_uid_lookup={miner_a: 0, miner_b: 1},
+        )
+
+        outcomes = validator.process_once()
+        assert len(outcomes) == 1
+        assert outcomes[0].verifier_ok
+        assert outcomes[0].weights_submitted
+        assert outcomes[0].used_emission_cap is False
+
+        call = submitter.calls[0]
+        assert set(call["uids"]) == {0, 1}
+        assert sum(call["weights"]) == MAX_WEIGHT
+
+
+def test_cap_path_propagates_malformed_epoch_summary(tmp_path: pathlib.Path) -> None:
+    """When USE_EMISSION_CAP=true a malformed epoch_summary.json must raise —
+    silent fallback would mis-weight an epoch the operator opted in to cap.
+    """
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
+        _populate_epoch_with_malformed_summary(s3, epoch_id=22, records=records)
+
+        config = ValidatorConfig(
+            s3_bucket=BUCKET,
+            s3_prefix=PREFIX,
+            s3_endpoint_url=None,
+            aws_region="us-east-1",
+            s3_anonymous=False,
+            local_mirror_dir=str(tmp_path),
+            mirror_retention_epochs=10,
+            processed_state_path=str(tmp_path / "processed.json"),
+            bittensor_netuid=42,
+            bittensor_endpoint=None,
+            bittensor_wallet_name=None,
+            bittensor_wallet_hotkey=None,
+            bittensor_mock=True,
+            verifier_bin=_verifier_bin(),
+            verifier_sample_per_tuple=0,
+            poll_interval_secs=1,
+            metrics_port=9092,
+            use_emission_cap=True,
+            alpha_emission_per_epoch=Decimal("100"),
+            subnet_owner_uid=99,
+        )
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(
+            config,
+            mirror,
+            submitter,
+            miner_uid_lookup={miner_a: 0},
+        )
+
+        # process_once() catches per-epoch exceptions internally and logs
+        # them, so assert via the side effect: no submission, no
+        # processed-state mark (epoch will retry next tick).
+        outcomes = validator.process_once()
+        assert outcomes == []
+        assert submitter.calls == []
+
+        # And confirm the raw read itself raises so operators see schema
+        # errors loudly at the function boundary.
+        mirror_dir = mirror.mirror_epoch(22)
+        with pytest.raises(ValidationError):
+            load_epoch_summary(epoch_summary_path(mirror_dir))

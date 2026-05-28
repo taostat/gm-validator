@@ -150,6 +150,79 @@ def test_miner_outside_lookup_dropped() -> None:
     assert sum(vector.weights) == MAX_WEIGHT
 
 
+def test_cap_path_all_miners_missing_uid_skips_submit() -> None:
+    """All scored miners absent from the uid lookup => empty vector, no burn.
+
+    Symmetric with the legacy path: a stale metagraph must defer
+    submission, not torch the whole epoch to the subnet owner.
+    """
+    rows = [_row("A", 1_000_000_000), _row("B", 2_000_000_000)]
+    scores = score(rows)
+    vector = compute_weights(
+        scores,
+        miner_uid_lookup={},  # neither miner known
+        use_emission_cap=True,
+        epoch_summary=_summary("0.50"),
+        alpha_emission_per_epoch=Decimal("100"),
+        subnet_owner_uid=99,
+    )
+    assert vector.uids == []
+    assert vector.weights == []
+    assert vector.burn_uid is None
+    assert vector.used_emission_cap is True
+
+
+def test_cap_path_partial_missing_uid_uses_correct_cap() -> None:
+    """Partial uid misses still submit; missing demand counts toward the cap.
+
+    2 known miners ($5, $3) + 1 unknown ($2). Total demand = $10. Pool is
+    over-subscribed at $5.125 (50 alpha * 0.41 * $0.25), so scale =
+    $5.125 / $10 = 0.5125. Known miners get their proportional share of
+    that scaled payout — the unknown miner's $2 still suppresses the
+    others' share. The bug was the unknown's $2 being ignored, which
+    inflated the known miners' weights.
+    """
+    rows = [
+        _row("A", 5_000_000_000),  # $5
+        _row("B", 3_000_000_000),  # $3
+        _row("UNKNOWN", 2_000_000_000),  # $2
+    ]
+    scores = score(rows)
+    vector = compute_weights(
+        scores,
+        miner_uid_lookup={"A": 1, "B": 2},  # UNKNOWN absent
+        use_emission_cap=True,
+        epoch_summary=_summary("0.25"),  # pool = 50 * 0.41 * 0.25 = $5.125
+        alpha_emission_per_epoch=Decimal("50"),
+        subnet_owner_uid=99,
+    )
+    assert vector.used_emission_cap is True
+    assert vector.burn_uid == 99
+    assert sum(vector.weights) == MAX_WEIGHT
+    assert "UNKNOWN" not in {str(u) for u in vector.uids}
+
+    # Cap denominator includes UNKNOWN. With scale = 0.5125, total
+    # payout_alpha across all three = 0.5125 * $10 / $0.25 = 20.5 alpha
+    # against a 20.5-alpha pool -> burn weight = 0. UNKNOWN's slice
+    # (0.5125 * $2 / $0.25 / 20.5 = 0.2) is forfeited and lost.
+    # A: (5 / 10) * scale -> 0.5 of the pool's payout fraction
+    # B: (3 / 10) * scale -> 0.3 of the pool's payout fraction
+    # As a fraction of (A+B+UNKNOWN) cleaned weights:
+    # A_share = 0.5 / 0.8 = 0.625; B_share = 0.3 / 0.8 = 0.375
+    # If UNKNOWN had been ignored, A and B would have split a higher cap
+    # share (no demand suppression), but the renormalisation across cleaned
+    # weights still yields 0.625/0.375. The key assertion: the
+    # *result.scale* used the full demand.
+    assert vector.epoch_result is not None
+    assert vector.epoch_result.total_consumed_usd == Decimal("10")
+    assert vector.epoch_result.scale == Decimal("5.125") / Decimal("10")
+
+    # Per-miner ratio for known miners on the submitted vector.
+    weights_by_uid = dict(zip(vector.uids, vector.weights, strict=True))
+    # A / B ratio should match 5:3 to within floor-rounding dust.
+    assert abs((weights_by_uid[1] / max(weights_by_uid[2], 1)) - (5 / 3)) < 0.01
+
+
 def test_legacy_path_zero_revenue_submits_all_zeros() -> None:
     """Legacy path with all-zero earnings still emits a uid vector (zero weights).
 

@@ -218,14 +218,14 @@ def _compute_capped(
     alpha_emission_per_epoch: Decimal,
     subnet_owner_uid: int,
 ) -> WeightVector:
+    # All scored miners contribute to the cap denominator — missing-uid
+    # miners are still real demand against the pool. The uid lookup only
+    # gates whether we can route them in this epoch's submission.
     miners_data: list[MinerEpochData] = []
-    # Pair the MinerEpochData entries with their uids in lockstep so we
-    # can map results back to uids without a second hotkey lookup.
-    hotkeys_with_uid: list[tuple[str, int]] = []
+    uids_by_index: list[int | None] = []
+    missing_hotkeys: list[str] = []
     for miner_id, s in scores.items():
         uid = miner_uid_lookup.get(miner_id)
-        if uid is None:
-            continue
         total_ndollars = Decimal(s.earnings_ndollars + s.surcharge_ndollars)
         miners_data.append(
             MinerEpochData(
@@ -233,7 +233,30 @@ def _compute_capped(
                 consumed_usd=total_ndollars / NDOLLARS_PER_USD,
             )
         )
-        hotkeys_with_uid.append((miner_id, uid))
+        uids_by_index.append(uid)
+        if uid is None:
+            missing_hotkeys.append(miner_id)
+
+    # All scored miners missing from the lookup means the metagraph is
+    # stale. Defer submission — symmetric with the legacy path — so we
+    # don't burn the whole epoch to the subnet owner.
+    if miners_data and all(uid is None for uid in uids_by_index):
+        LOGGER.warning(
+            "epoch cap path: all %d scored miners missing from miner_uid_lookup "
+            "(metagraph may be stale); deferring weight submission. hotkeys=%s",
+            len(missing_hotkeys),
+            missing_hotkeys,
+        )
+        return WeightVector(uids=[], weights=[], burn_uid=None, used_emission_cap=True)
+
+    if missing_hotkeys:
+        LOGGER.warning(
+            "epoch cap path: %d scored miner(s) missing from miner_uid_lookup; "
+            "their demand counts toward the cap but they miss this epoch's payout. "
+            "hotkeys=%s",
+            len(missing_hotkeys),
+            missing_hotkeys,
+        )
 
     result = compute_epoch_weights(
         miners_data,
@@ -242,7 +265,9 @@ def _compute_capped(
     )
 
     miner_pairs: list[tuple[int, Decimal]] = []
-    for miner_weight, (_, uid) in zip(result.miners, hotkeys_with_uid, strict=True):
+    for miner_weight, uid in zip(result.miners, uids_by_index, strict=True):
+        if uid is None:
+            continue
         miner_pairs.append((uid, miner_weight.weight))
 
     u16 = normalize_weights(miner_pairs, burn_uid=subnet_owner_uid)

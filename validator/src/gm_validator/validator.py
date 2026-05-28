@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from gm_validator.bittensor_adapter import Submitter
 from gm_validator.config import ValidatorConfig
-from gm_validator.epoch_summary import epoch_summary_path, load_epoch_summary
+from gm_validator.epoch_summary import EpochSummary, epoch_summary_path, load_epoch_summary
 from gm_validator.processed_state import ProcessedState
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import (
@@ -104,7 +104,14 @@ class Validator:
         scores = score(rows)
         total = sum(s.earnings_ndollars + s.surcharge_ndollars for s in scores.values())
 
-        epoch_summary = load_epoch_summary(epoch_summary_path(mirror_dir))
+        # Only the cap path consumes epoch_summary.json; reading it when
+        # the flag is off lets a malformed artifact fail an opted-out
+        # deployment, so gate the read. Schema errors here are loud on
+        # purpose when the cap is on.
+        epoch_summary: EpochSummary | None = None
+        if self._config.use_emission_cap:
+            epoch_summary = load_epoch_summary(epoch_summary_path(mirror_dir))
+
         vector = compute_weights(
             scores,
             self._miner_uid_lookup,
