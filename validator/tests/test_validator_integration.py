@@ -20,12 +20,14 @@ import json
 import os
 import pathlib
 import subprocess
+from decimal import Decimal
 from typing import Any
 
 import boto3
 import zstandard as zstd
 from moto import mock_aws
 
+from gm_validator.alpha_economics import MAX_WEIGHT
 from gm_validator.bittensor_adapter import MockSubmitter
 from gm_validator.config import ValidatorConfig
 from gm_validator.s3_mirror import S3Mirror
@@ -134,7 +136,14 @@ def _compute_raw_hash_via_verifier(records: list[dict]) -> str:
         os.unlink(path)
 
 
-def _populate_epoch(s3: Any, epoch_id: int, records: list[dict]) -> None:
+def _populate_epoch(
+    s3: Any,
+    epoch_id: int,
+    records: list[dict],
+    *,
+    with_epoch_summary: bool = False,
+    alpha_price_usd: str = "0.50",
+) -> None:
     finalized_prefix = f"{PREFIX}/finalized/epoch={epoch_id}/"
 
     # raw.jsonl.zst
@@ -157,6 +166,24 @@ def _populate_epoch(s3: Any, epoch_id: int, records: list[dict]) -> None:
         Key=f"{finalized_prefix}gateway_keys.json",
         Body=json.dumps(manifest).encode("utf-8"),
     )
+
+    if with_epoch_summary:
+        summary = {
+            "epoch_id": epoch_id,
+            "finalized_at": "2026-05-27T12:00:00Z",
+            "alpha_price_in_tao": "0.05",
+            "tao_price_usd": "10",
+            "alpha_price_usd": alpha_price_usd,
+            "price_block_height": 1,
+            "price_alpha_source": "chain",
+            "price_tao_usd_source": "taostats",
+            "finalizer_version": "test",
+        }
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=f"{finalized_prefix}epoch_summary.json",
+            Body=json.dumps(summary).encode("utf-8"),
+        )
 
     # _FINALIZED (last)
     s3.put_object(Bucket=BUCKET, Key=f"{finalized_prefix}_FINALIZED", Body=b"")
@@ -211,6 +238,9 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             verifier_sample_per_tuple=0,
             poll_interval_secs=1,
             metrics_port=9092,
+            use_emission_cap=False,
+            alpha_emission_per_epoch=Decimal("100"),
+            subnet_owner_uid=0,
         )
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
@@ -235,8 +265,8 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
         assert call["epoch_id"] == 7
         assert call["netuid"] == 42
         assert set(call["uids"]) == {0, 1}
-        total_weight = sum(call["weights"])
-        assert abs(total_weight - 1.0) < 1e-12
+        # u16 weight vector sums to exactly MAX_WEIGHT.
+        assert sum(call["weights"]) == MAX_WEIGHT
 
         # Idempotency: a second tick should not re-process.
         more = validator.process_once()
@@ -278,6 +308,9 @@ def test_validator_restart_does_not_resubmit(tmp_path: pathlib.Path) -> None:
             verifier_sample_per_tuple=0,
             poll_interval_secs=1,
             metrics_port=9092,
+            use_emission_cap=False,
+            alpha_emission_per_epoch=Decimal("100"),
+            subnet_owner_uid=0,
         )
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
 
@@ -352,6 +385,9 @@ def test_validator_skips_submission_on_verifier_failure(tmp_path: pathlib.Path) 
             verifier_sample_per_tuple=0,
             poll_interval_secs=1,
             metrics_port=9092,
+            use_emission_cap=False,
+            alpha_emission_per_epoch=Decimal("100"),
+            subnet_owner_uid=0,
         )
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
@@ -362,3 +398,69 @@ def test_validator_skips_submission_on_verifier_failure(tmp_path: pathlib.Path) 
         assert not outcomes[0].verifier_ok
         assert not outcomes[0].weights_submitted
         assert submitter.calls == []
+
+
+def test_validator_uses_emission_cap_when_flag_on_and_summary_present(
+    tmp_path: pathlib.Path,
+) -> None:
+    """End-to-end cap+burn: summary present + flag on -> burn slot in submission."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        miner_b = "5Ehm" + "B" * 44
+
+        records = [
+            _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a),
+            _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
+        ]
+        _populate_epoch(
+            s3,
+            epoch_id=11,
+            records=records,
+            with_epoch_summary=True,
+            alpha_price_usd="0.50",
+        )
+
+        config = ValidatorConfig(
+            s3_bucket=BUCKET,
+            s3_prefix=PREFIX,
+            s3_endpoint_url=None,
+            aws_region="us-east-1",
+            s3_anonymous=False,
+            local_mirror_dir=str(tmp_path),
+            mirror_retention_epochs=10,
+            processed_state_path=str(tmp_path / "processed.json"),
+            bittensor_netuid=42,
+            bittensor_endpoint=None,
+            bittensor_wallet_name=None,
+            bittensor_wallet_hotkey=None,
+            bittensor_mock=True,
+            verifier_bin=_verifier_bin(),
+            verifier_sample_per_tuple=0,
+            poll_interval_secs=1,
+            metrics_port=9092,
+            use_emission_cap=True,
+            alpha_emission_per_epoch=Decimal("1000000"),
+            subnet_owner_uid=99,
+        )
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(
+            config,
+            mirror,
+            submitter,
+            miner_uid_lookup={miner_a: 0, miner_b: 1},
+        )
+
+        outcomes = validator.process_once()
+        assert len(outcomes) == 1
+        assert outcomes[0].used_emission_cap is True
+        assert outcomes[0].weights_submitted
+
+        call = submitter.calls[0]
+        assert sum(call["weights"]) == MAX_WEIGHT
+        # Big pool against tiny demand: burn slot should dominate.
+        weights_by_uid = dict(zip(call["uids"], call["weights"], strict=True))
+        assert weights_by_uid.get(99, 0) > MAX_WEIGHT // 2

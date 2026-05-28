@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal
 
 
 def _require_env(name: str) -> str:
@@ -18,6 +19,20 @@ def _int_env(name: str, default: int) -> int:
     if value is None:
         return default
     return int(value)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _decimal_env(name: str, default: Decimal) -> Decimal:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return Decimal(value)
 
 
 @dataclass
@@ -61,6 +76,21 @@ class ValidatorConfig:
     # Observability.
     metrics_port: int
 
+    # Emission cap + burn (bm pattern).
+    # When True, scoring caps total miner alpha at
+    # ``alpha_emission_per_epoch * MINER_EMISSION_PCT * alpha_price_usd``
+    # and routes any unconsumed pool to ``subnet_owner_uid`` as burn
+    # weight. Requires ``epoch_summary.json`` in S3; legacy epochs
+    # without it fall back to the naive normalisation regardless.
+    use_emission_cap: bool
+    # Full-epoch alpha emission. Static configuration knob until a
+    # follow-up pulls it from the chain dynamically.
+    alpha_emission_per_epoch: Decimal
+    # Uid that absorbs the burn slot + floor-rounding dust. bm reads the
+    # subnet-owner hotkey from the chain and resolves to a uid; the gm
+    # port defers that lookup to a follow-up.
+    subnet_owner_uid: int
+
     @classmethod
     def from_env(cls) -> ValidatorConfig:
         """Build from environment variables.
@@ -88,6 +118,9 @@ class ValidatorConfig:
             verifier_sample_per_tuple=_int_env("VERIFIER_SAMPLE_PER_TUPLE", 16),
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),
+            use_emission_cap=_bool_env("USE_EMISSION_CAP", default=False),
+            alpha_emission_per_epoch=_decimal_env("ALPHA_EMISSION_PER_EPOCH", Decimal("100")),
+            subnet_owner_uid=_int_env("SUBNET_OWNER_UID", 0),
         )
 
     def finalized_prefix(self, epoch_id: int) -> str:
