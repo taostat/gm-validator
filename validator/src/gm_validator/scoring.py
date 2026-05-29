@@ -1,21 +1,51 @@
 """Per-miner score derivation from `aggregated.jsonl`.
 
 A miner's epoch score is the sum of `earnings_ndollars +
-surcharge_ndollars` across every product they served. Normalized
-across miners, this becomes the input to `subtensor.set_weights()`.
+surcharge_ndollars` across every product they served. The validator
+turns those sums into u16 weights via one of two paths:
 
-The scoring is intentionally simple in v1 — `validator.md §15` and
-`research.md §H.3` confirm "for each (miner, product) tuple in the
-summary, the miner's earned amount is miner_price * tokens_served
-summed across all products" with no protocol-margin adjustment.
+- **Naive** (legacy) — miner share of total earnings, normalised across
+  miners to a u16 vector summing to ``MAX_WEIGHT``.
+- **Emission cap + burn** (bm pattern) — miners' total demand is capped
+  at ``alpha_emission_per_epoch * MINER_EMISSION_PCT * alpha_price_usd``;
+  any unconsumed pool is routed to the subnet-owner uid as burn weight.
+  See :mod:`gm_validator.alpha_economics`.
+
+The selection is driven by ``ValidatorConfig.use_emission_cap`` and the
+presence of ``epoch_summary.json`` on S3.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from decimal import Decimal
+
+from gm_validator.alpha_economics import (
+    MAX_WEIGHT,
+    EpochWeightsResult,
+    MinerEpochData,
+    compute_epoch_weights,
+    normalize_weights,
+)
+from gm_validator.epoch_summary import EpochSummary
+
+LOGGER = logging.getLogger(__name__)
+
+NDOLLARS_PER_USD = Decimal(10**9)
+
+
+class StaleMetagraphError(Exception):
+    """All scored miners missing from miner_uid_lookup — defer this epoch.
+
+    Raised when the cap path detects the metagraph hotkey->uid lookup is
+    stale (every scored miner is unknown). The next process_once() tick
+    will retry; if the metagraph has refreshed by then, the epoch
+    proceeds normally.
+    """
 
 
 @dataclass
@@ -31,6 +61,17 @@ class MinerScore:
     per_product: dict[tuple[str, str], int] = field(default_factory=dict)
 
 
+@dataclass
+class WeightVector:
+    """Result of the score → weights pipeline."""
+
+    uids: list[int]
+    weights: list[int]
+    burn_uid: int | None
+    used_emission_cap: bool
+    epoch_result: EpochWeightsResult | None = None
+
+
 def load_aggregated(path: str) -> list[dict]:
     """Read `aggregated.jsonl` from a local file. Skips blank lines."""
     rows: list[dict] = []
@@ -43,11 +84,7 @@ def load_aggregated(path: str) -> list[dict]:
 
 
 def score(rows: Iterable[dict]) -> dict[str, MinerScore]:
-    """Aggregate `aggregated.jsonl` rows into per-miner scores.
-
-    Returns a dict keyed by miner hotkey. `weight` is populated by
-    `normalise_weights`.
-    """
+    """Aggregate `aggregated.jsonl` rows into per-miner scores."""
     scores: dict[str, MinerScore] = {}
     for row in rows:
         miner_id = row["miner_id"]
@@ -70,15 +107,11 @@ def score(rows: Iterable[dict]) -> dict[str, MinerScore]:
 def normalise_weights(scores: dict[str, MinerScore]) -> dict[str, MinerScore]:
     """Compute per-miner weight as the fraction of total earnings.
 
-    nano-dollar-precision input, float weight output suitable for
-    `subtensor.set_weights()`.
+    Float-domain output suitable for further conversion to u16. The
+    weight vector sums to 1.0 when any miner earned, else 0.
     """
     total = sum(s.earnings_ndollars + s.surcharge_ndollars for s in scores.values())
     if total <= 0:
-        # No earnings this epoch — every miner gets equal weight (or 0).
-        # Bittensor's set_weights requires the vector to sum to ~1.0 if
-        # we're emitting any weights at all, so we emit an all-zero vector
-        # which corresponds to "no incentive this epoch."
         for s in scores.values():
             s.weight = 0.0
         return scores
@@ -90,3 +123,174 @@ def normalise_weights(scores: dict[str, MinerScore]) -> dict[str, MinerScore]:
 def aggregated_path(mirror_dir: str) -> str:
     """Convenience: path-join helper for the canonical filename."""
     return os.path.join(mirror_dir, "aggregated.jsonl")
+
+
+def compute_weights(
+    scores: dict[str, MinerScore],
+    miner_uid_lookup: dict[str, int],
+    *,
+    use_emission_cap: bool,
+    epoch_summary: EpochSummary | None,
+    alpha_emission_per_epoch: Decimal,
+    subnet_owner_uid: int,
+) -> WeightVector:
+    """Convert per-miner scores to a u16 weight vector for `set_weights`.
+
+    Args:
+        scores: Per-miner score totals (from :func:`score`).
+        miner_uid_lookup: Mapping from miner hotkey to subnet uid. Miners
+            absent here are dropped silently.
+        use_emission_cap: When True, apply the bm-style cap+burn from
+            :func:`alpha_economics.compute_epoch_weights`. Requires
+            ``epoch_summary``; falls back to the naive path when None.
+        epoch_summary: Per-epoch price snapshot written by the finalizer.
+            ``None`` means a legacy epoch from before PR #161; the cap
+            path is skipped and the legacy normalisation runs instead.
+        alpha_emission_per_epoch: Full-epoch alpha emission (chain-level
+            constant; a follow-up will pull this from substrate).
+        subnet_owner_uid: Uid that absorbs the burn slot + floor-rounding
+            dust under the cap path.
+
+    Returns:
+        WeightVector: aligned ``uids``, ``weights`` (u16, sum =
+            ``MAX_WEIGHT``), plus the per-epoch result for audit
+            logging when the cap path ran.
+    """
+    if use_emission_cap and epoch_summary is not None:
+        return _compute_capped(
+            scores,
+            miner_uid_lookup,
+            epoch_summary=epoch_summary,
+            alpha_emission_per_epoch=alpha_emission_per_epoch,
+            subnet_owner_uid=subnet_owner_uid,
+        )
+
+    if use_emission_cap and epoch_summary is None:
+        LOGGER.warning(
+            "USE_EMISSION_CAP=true but epoch_summary.json absent — "
+            "falling back to legacy normalisation for this epoch."
+        )
+
+    return _compute_legacy(scores, miner_uid_lookup)
+
+
+def _compute_legacy(
+    scores: dict[str, MinerScore],
+    miner_uid_lookup: dict[str, int],
+) -> WeightVector:
+    normalise_weights(scores)
+    pairs: list[tuple[int, Decimal]] = []
+    for miner_id, s in scores.items():
+        uid = miner_uid_lookup.get(miner_id)
+        if uid is None:
+            continue
+        pairs.append((uid, Decimal(str(s.weight))))
+    if not pairs:
+        return WeightVector(uids=[], weights=[], burn_uid=None, used_emission_cap=False)
+    total = sum((w for _, w in pairs), Decimal(0))
+    if total <= 0:
+        # bittensor.set_weights drops sum-zero vectors before building the
+        # extrinsic, so submitting all-zeros doesn't actually clear the
+        # chain — prior epoch's weights stay active. Skip submission
+        # explicitly so the behaviour is visible in logs. Proper clearing
+        # would require routing to a burn UID even on the legacy path,
+        # which means SUBNET_OWNER_UID would have to become required even
+        # when USE_EMISSION_CAP=false — deferred.
+        LOGGER.info(
+            "zero-revenue legacy epoch: skipping submission "
+            "(SDK drops sum-zero vectors; prior weights persist)"
+        )
+        return WeightVector(uids=[], weights=[], burn_uid=None, used_emission_cap=False)
+    # Floor-rounding into u16 with no burn slot — naive path doesn't
+    # know a subnet owner uid. Any remainder lands on the highest-
+    # weighted miner so the vector still sums to MAX_WEIGHT.
+    pairs.sort(key=lambda kv: kv[1], reverse=True)
+    renorm = total if total > Decimal(1) else Decimal(1)
+    u16: list[tuple[int, int]] = []
+    running = 0
+    for uid, w in pairs:
+        v = int((w / renorm) * MAX_WEIGHT)
+        if v <= 0:
+            continue
+        u16.append((uid, v))
+        running += v
+    remainder = MAX_WEIGHT - running
+    if remainder > 0 and u16:
+        head_uid, head_w = u16[0]
+        u16[0] = (head_uid, head_w + remainder)
+    uids = [uid for uid, _ in u16]
+    weights = [w for _, w in u16]
+    return WeightVector(uids=uids, weights=weights, burn_uid=None, used_emission_cap=False)
+
+
+def _compute_capped(
+    scores: dict[str, MinerScore],
+    miner_uid_lookup: dict[str, int],
+    *,
+    epoch_summary: EpochSummary,
+    alpha_emission_per_epoch: Decimal,
+    subnet_owner_uid: int,
+) -> WeightVector:
+    # All scored miners contribute to the cap denominator — missing-uid
+    # miners are still real demand against the pool. The uid lookup only
+    # gates whether we can route them in this epoch's submission.
+    miners_data: list[MinerEpochData] = []
+    uids_by_index: list[int | None] = []
+    missing_hotkeys: list[str] = []
+    for miner_id, s in scores.items():
+        uid = miner_uid_lookup.get(miner_id)
+        total_ndollars = Decimal(s.earnings_ndollars + s.surcharge_ndollars)
+        miners_data.append(
+            MinerEpochData(
+                hotkey=miner_id,
+                consumed_usd=total_ndollars / NDOLLARS_PER_USD,
+            )
+        )
+        uids_by_index.append(uid)
+        if uid is None:
+            missing_hotkeys.append(miner_id)
+
+    # All scored miners missing from the lookup means the metagraph is
+    # stale. Raise StaleMetagraphError so process_once() defers without
+    # marking the epoch processed — the next tick retries once the
+    # metagraph has refreshed. A bare empty-vector return would get
+    # silently marked processed and the epoch would be lost.
+    if miners_data and all(uid is None for uid in uids_by_index):
+        sample = missing_hotkeys[:10]
+        ellipsis = "..." if len(missing_hotkeys) > 10 else ""
+        raise StaleMetagraphError(
+            f"all {len(missing_hotkeys)} scored miners missing from "
+            f"miner_uid_lookup; hotkeys={sample}{ellipsis}"
+        )
+
+    if missing_hotkeys:
+        LOGGER.warning(
+            "epoch cap path: %d scored miner(s) missing from miner_uid_lookup; "
+            "their demand counts toward the cap but they miss this epoch's payout. "
+            "hotkeys=%s",
+            len(missing_hotkeys),
+            missing_hotkeys,
+        )
+
+    result = compute_epoch_weights(
+        miners_data,
+        alpha_price_usd=epoch_summary.alpha_price_usd,
+        emissions_alpha=alpha_emission_per_epoch,
+    )
+
+    miner_pairs: list[tuple[int, Decimal]] = []
+    for miner_weight, uid in zip(result.miners, uids_by_index, strict=True):
+        if uid is None:
+            continue
+        miner_pairs.append((uid, miner_weight.weight))
+
+    u16 = normalize_weights(miner_pairs, burn_uid=subnet_owner_uid)
+    uids = [uid for uid, _ in u16]
+    weights = [w for _, w in u16]
+    return WeightVector(
+        uids=uids,
+        weights=weights,
+        burn_uid=subnet_owner_uid,
+        used_emission_cap=True,
+        epoch_result=result,
+    )

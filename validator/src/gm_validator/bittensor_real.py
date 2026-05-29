@@ -90,7 +90,7 @@ class RealSubmitter:
         *,
         netuid: int,
         uids: list[int],
-        weights: list[float],
+        weights: list[int],
         epoch_id: int,
     ) -> None:
         """Submit one epoch's weight vector to the subnet.
@@ -98,7 +98,7 @@ class RealSubmitter:
         Args:
             netuid: Subnet id; must match the configured netuid.
             uids: Miner uids to set weights for.
-            weights: Per-uid weights, aligned with ``uids``.
+            weights: Per-uid u16 weights summing to ``MAX_WEIGHT``.
             epoch_id: Finalized epoch id, for logging only.
 
         Raises:
@@ -119,7 +119,7 @@ class RealSubmitter:
             return
 
         LOGGER.info(
-            "submitting weights: netuid=%d epoch=%d n_uids=%d sum=%.4f",
+            "submitting weights: netuid=%d epoch=%d n_uids=%d sum=%d",
             netuid,
             epoch_id,
             len(uids),

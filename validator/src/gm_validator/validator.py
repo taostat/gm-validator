@@ -4,11 +4,15 @@ Loop:
 
 1. Discover finalized epoch ids in S3.
 2. For each not yet processed:
-   a. Mirror artifacts locally.
+   a. Mirror artifacts locally (raw, aggregated, gateway_keys,
+      _FINALIZED, and best-effort epoch_summary.json).
    b. Invoke `gm-verifier verify`. On failure: alert + skip submission.
    c. Compute per-miner scores from `aggregated.jsonl`.
-   d. Normalise weights, submit via the configured `Submitter`.
-   e. Mark the epoch processed.
+   d. Build a u16 weight vector — emission cap + burn when
+      `USE_EMISSION_CAP=true` and `epoch_summary.json` is present;
+      naive normalisation otherwise.
+   e. Submit via the configured `Submitter`.
+   f. Mark the epoch processed.
 3. Prune local mirrors older than the retention window.
 """
 
@@ -16,13 +20,19 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
 
 from gm_validator.bittensor_adapter import Submitter
 from gm_validator.config import ValidatorConfig
+from gm_validator.epoch_summary import EpochSummary, epoch_summary_path, load_epoch_summary
 from gm_validator.processed_state import ProcessedState
 from gm_validator.s3_mirror import S3Mirror
-from gm_validator.scoring import aggregated_path, load_aggregated, normalise_weights, score
+from gm_validator.scoring import (
+    StaleMetagraphError,
+    aggregated_path,
+    compute_weights,
+    load_aggregated,
+    score,
+)
 from gm_validator.verifier import VerifierResult, verify_epoch
 
 LOGGER = logging.getLogger(__name__)
@@ -37,6 +47,7 @@ class EpochOutcome:
     weights_submitted: bool
     miner_count: int
     total_ndollars: int
+    used_emission_cap: bool
 
 
 class Validator:
@@ -54,8 +65,6 @@ class Validator:
         self._mirror = mirror
         self._submitter = submitter
         self._miner_uid_lookup = miner_uid_lookup or {}
-        # Durable processed-epoch state survives restarts. Defaults to
-        # the configured state-file path; tests inject an explicit one.
         self._processed = processed_state or ProcessedState(config.processed_state_path)
 
     def process_once(self) -> list[EpochOutcome]:
@@ -66,6 +75,16 @@ class Validator:
                 continue
             try:
                 outcome = self._process_epoch(epoch_id)
+            except StaleMetagraphError as exc:
+                # Transient — metagraph hotkey->uid lookup is stale. Skip
+                # marking processed so the next tick retries once the
+                # lookup has refreshed.
+                LOGGER.warning(
+                    "epoch %d deferred (stale metagraph): %s — next tick will retry",
+                    epoch_id,
+                    exc,
+                )
+                continue
             except Exception:
                 LOGGER.exception("epoch %d processing failed", epoch_id)
                 continue
@@ -89,22 +108,48 @@ class Validator:
                 weights_submitted=False,
                 miner_count=0,
                 total_ndollars=0,
+                used_emission_cap=False,
             )
 
         rows = load_aggregated(aggregated_path(mirror_dir))
-        scores = normalise_weights(score(rows))
+        scores = score(rows)
         total = sum(s.earnings_ndollars + s.surcharge_ndollars for s in scores.values())
 
-        uids, weights = self._uids_and_weights(scores)
+        # Only the cap path consumes epoch_summary.json; reading it when
+        # the flag is off lets a malformed artifact fail an opted-out
+        # deployment, so gate the read. Schema errors here are loud on
+        # purpose when the cap is on.
+        epoch_summary: EpochSummary | None = None
+        if self._config.use_emission_cap:
+            epoch_summary = load_epoch_summary(epoch_summary_path(mirror_dir))
+
+        vector = compute_weights(
+            scores,
+            self._miner_uid_lookup,
+            use_emission_cap=self._config.use_emission_cap,
+            epoch_summary=epoch_summary,
+            alpha_emission_per_epoch=self._config.alpha_emission_per_epoch,
+            subnet_owner_uid=self._config.subnet_owner_uid,
+        )
+
         submitted = False
-        if uids:
+        if vector.uids:
             self._submitter.submit(
                 netuid=self._config.bittensor_netuid,
-                uids=uids,
-                weights=weights,
+                uids=vector.uids,
+                weights=vector.weights,
                 epoch_id=epoch_id,
             )
             submitted = True
+            if vector.epoch_result is not None:
+                LOGGER.info(
+                    "epoch %d: cap+burn scale=%s burn_weight=%s pool_usd=%s consumed_usd=%s",
+                    epoch_id,
+                    vector.epoch_result.scale,
+                    vector.epoch_result.burn_weight,
+                    vector.epoch_result.pool_usd_total,
+                    vector.epoch_result.total_consumed_usd,
+                )
 
         return EpochOutcome(
             epoch_id=epoch_id,
@@ -112,6 +157,7 @@ class Validator:
             weights_submitted=submitted,
             miner_count=len(scores),
             total_ndollars=total,
+            used_emission_cap=vector.used_emission_cap,
         )
 
     def _verify(self, epoch_id: int, mirror_dir: str) -> VerifierResult:
@@ -121,20 +167,3 @@ class Validator:
             mirror_dir=mirror_dir,
             sample_per_tuple=self._config.verifier_sample_per_tuple,
         )
-
-    def _uids_and_weights(self, scores: dict[str, Any]) -> tuple[list[int], list[float]]:
-        """Translate hotkey-keyed scores to (uid, weight) lists.
-
-        Miners not in the lookup table are skipped silently; in real
-        deployment the lookup is populated from the subnet's metagraph
-        at startup.
-        """
-        uids: list[int] = []
-        weights: list[float] = []
-        for miner_id, s in scores.items():
-            uid = self._miner_uid_lookup.get(miner_id)
-            if uid is None:
-                continue
-            uids.append(uid)
-            weights.append(s.weight)
-        return uids, weights

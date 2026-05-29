@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import botocore
@@ -40,6 +41,41 @@ def test_s3_anonymous_falsy_values(monkeypatch: pytest.MonkeyPatch, value: str) 
 
 
 # ---------------------------------------------------------------------------
+# USE_EMISSION_CAP / SUBNET_OWNER_UID coupling
+# ---------------------------------------------------------------------------
+
+
+def test_emission_cap_requires_subnet_owner_uid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Enabling the cap path without SUBNET_OWNER_UID must fail loudly —
+    burn weight would otherwise default to uid 0 (a real miner)."""
+    monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("USE_EMISSION_CAP", "true")
+    monkeypatch.delenv("SUBNET_OWNER_UID", raising=False)
+    with pytest.raises(ValueError, match="explicitly"):
+        ValidatorConfig.from_env()
+
+
+def test_emission_cap_with_subnet_owner_uid_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("USE_EMISSION_CAP", "true")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "103")
+    config = ValidatorConfig.from_env()
+    assert config.use_emission_cap is True
+    assert config.subnet_owner_uid == 103
+
+
+def test_emission_cap_disabled_without_subnet_owner_uid_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.delenv("USE_EMISSION_CAP", raising=False)
+    monkeypatch.delenv("SUBNET_OWNER_UID", raising=False)
+    config = ValidatorConfig.from_env()
+    assert config.use_emission_cap is False
+    assert config.subnet_owner_uid == 0
+
+
+# ---------------------------------------------------------------------------
 # S3 client construction in _run
 # ---------------------------------------------------------------------------
 
@@ -64,6 +100,9 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "verifier_sample_per_tuple": 0,
         "poll_interval_secs": 60,
         "metrics_port": 9092,
+        "use_emission_cap": False,
+        "alpha_emission_per_epoch": Decimal("100"),
+        "subnet_owner_uid": 0,
     }
     defaults.update(overrides)
     return ValidatorConfig(**defaults)  # type: ignore[arg-type]
