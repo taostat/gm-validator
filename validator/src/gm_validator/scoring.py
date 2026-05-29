@@ -40,6 +40,20 @@ class StaleMetagraphError(Exception):
     """
 
 
+class StaleEpochSummaryError(Exception):
+    """`epoch_summary.json` predates the chain-read ``emissions_alpha`` field.
+
+    Raised when the artifact was written by an older finalizer release
+    (pre gm PR #176) and so does not carry ``emissions_alpha``. The
+    validator defers the epoch — the cap+burn pool denominator cannot be
+    invented without ground-truth — and the next ``process_once`` tick
+    retries. Once every prod finalizer is at >= the chain-read release
+    this branch is unreachable; the field stays optional in the parser
+    only to surface this transient cleanly rather than fail-fast on
+    parser load.
+    """
+
+
 @dataclass
 class MinerScore:
     """Per-miner score components aggregated from `aggregated.jsonl`."""
@@ -104,7 +118,6 @@ def compute_weights(
     miner_uid_lookup: dict[str, int],
     *,
     epoch_summary: EpochSummary,
-    alpha_emission_per_epoch: Decimal,
     subnet_owner_uid: int,
 ) -> WeightVector:
     """Convert per-miner scores to a u16 weight vector for `set_weights`.
@@ -114,9 +127,10 @@ def compute_weights(
         miner_uid_lookup: Mapping from miner hotkey to subnet uid. Miners
             absent here still count toward the pool denominator but are
             dropped from the submitted vector.
-        epoch_summary: Per-epoch price snapshot written by the finalizer.
-        alpha_emission_per_epoch: Full-epoch alpha emission (chain-level
-            constant; a follow-up will pull this from substrate).
+        epoch_summary: Per-epoch price + emission snapshot written by the
+            finalizer. Both ``alpha_price_usd`` and ``emissions_alpha``
+            come from the same chain read pinned to the epoch-close
+            block, so every validator sees identical pool inputs.
         subnet_owner_uid: Uid that absorbs the burn slot + floor-rounding
             dust.
 
@@ -129,7 +143,17 @@ def compute_weights(
         StaleMetagraphError: All scored miners are absent from
             ``miner_uid_lookup``. The caller should defer the epoch
             rather than mark it processed.
+        StaleEpochSummaryError: ``epoch_summary.emissions_alpha`` is
+            missing — the artifact was written by a pre-chain-read
+            finalizer. The caller should defer the epoch rather than
+            invent a pool denominator.
     """
+    if epoch_summary.emissions_alpha is None:
+        raise StaleEpochSummaryError(
+            f"epoch {epoch_summary.epoch_id}: epoch_summary.json is missing "
+            f"emissions_alpha (finalizer_version={epoch_summary.finalizer_version!r}); "
+            f"refusing to score until the finalizer republishes with chain-read emission"
+        )
     # All scored miners contribute to the pool denominator — missing-uid
     # miners are still real demand against it. The uid lookup only gates
     # whether we can route them in this epoch's submission.
@@ -173,7 +197,7 @@ def compute_weights(
     result = compute_epoch_weights(
         miners_data,
         alpha_price_usd=epoch_summary.alpha_price_usd,
-        emissions_alpha=alpha_emission_per_epoch,
+        emissions_alpha=epoch_summary.emissions_alpha,
     )
 
     miner_pairs: list[tuple[int, Decimal]] = []

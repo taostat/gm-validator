@@ -8,23 +8,34 @@ import pytest
 
 from gm_validator.alpha_economics import MAX_WEIGHT
 from gm_validator.epoch_summary import EpochSummary
-from gm_validator.scoring import StaleMetagraphError, compute_weights, score
+from gm_validator.scoring import (
+    StaleEpochSummaryError,
+    StaleMetagraphError,
+    compute_weights,
+    score,
+)
 
 
-def _summary(alpha_price_usd: str = "0.50") -> EpochSummary:
-    return EpochSummary.model_validate(
-        {
-            "epoch_id": 1,
-            "finalized_at": "2026-05-27T12:00:00Z",
-            "alpha_price_in_tao": "0.05",
-            "tao_price_usd": "10",
-            "alpha_price_usd": alpha_price_usd,
-            "price_block_height": 1,
-            "price_alpha_source": "chain",
-            "price_tao_usd_source": "taostats",
-            "finalizer_version": "test",
-        }
-    )
+def _summary(
+    alpha_price_usd: str = "0.50",
+    *,
+    emissions_alpha: str | None = "50",
+) -> EpochSummary:
+    payload: dict[str, object] = {
+        "epoch_id": 1,
+        "finalized_at": "2026-05-27T12:00:00Z",
+        "alpha_price_in_tao": "0.05",
+        "tao_price_usd": "10",
+        "alpha_price_usd": alpha_price_usd,
+        "price_block_height": 1,
+        "price_alpha_source": "chain",
+        "price_tao_usd_source": "taostats",
+        "finalizer_version": "test",
+    }
+    if emissions_alpha is not None:
+        payload["emissions_alpha"] = emissions_alpha
+        payload["emissions_alpha_source"] = "chain"
+    return EpochSummary.model_validate(payload)
 
 
 def _row(miner_id: str, earnings_ndollars: int) -> dict:
@@ -54,8 +65,7 @@ def test_undersubscribed_routes_residue_to_burn_uid() -> None:
     vector = compute_weights(
         scores,
         miner_uid_lookup={"A": 1, "B": 2, "C": 3},
-        epoch_summary=_summary("0.50"),
-        alpha_emission_per_epoch=Decimal("50"),
+        epoch_summary=_summary("0.50", emissions_alpha="50"),
         subnet_owner_uid=99,
     )
     assert vector.burn_uid == 99
@@ -78,8 +88,7 @@ def test_oversubscribed_renorms_no_burn_slice() -> None:
     vector = compute_weights(
         scores,
         miner_uid_lookup={"A": 1, "B": 2},
-        epoch_summary=_summary("0.50"),
-        alpha_emission_per_epoch=Decimal("50"),  # pool = $10.25 < $15
+        epoch_summary=_summary("0.50", emissions_alpha="50"),  # pool = $10.25 < $15
         subnet_owner_uid=99,
     )
     assert sum(vector.weights) == MAX_WEIGHT
@@ -94,8 +103,7 @@ def test_zero_consumption_all_to_burn() -> None:
     vector = compute_weights(
         scores,
         miner_uid_lookup={"A": 1, "B": 2},
-        epoch_summary=_summary("0.50"),
-        alpha_emission_per_epoch=Decimal("50"),
+        epoch_summary=_summary("0.50", emissions_alpha="50"),
         subnet_owner_uid=99,
     )
     assert vector.uids == [99]
@@ -108,8 +116,7 @@ def test_miner_outside_lookup_dropped() -> None:
     vector = compute_weights(
         scores,
         miner_uid_lookup={"A": 1},
-        epoch_summary=_summary("0.50"),
-        alpha_emission_per_epoch=Decimal("100"),
+        epoch_summary=_summary("0.50", emissions_alpha="100"),
         subnet_owner_uid=99,
     )
     assert "UNKNOWN" not in (str(u) for u in vector.uids)
@@ -129,8 +136,7 @@ def test_all_miners_missing_uid_raises_stale_metagraph() -> None:
         compute_weights(
             scores,
             miner_uid_lookup={},  # neither miner known
-            epoch_summary=_summary("0.50"),
-            alpha_emission_per_epoch=Decimal("100"),
+            epoch_summary=_summary("0.50", emissions_alpha="100"),
             subnet_owner_uid=99,
         )
     message = str(exc_info.value)
@@ -159,8 +165,8 @@ def test_partial_missing_uid_still_counted_against_pool() -> None:
     vector = compute_weights(
         scores,
         miner_uid_lookup={"A": 1, "B": 2},  # UNKNOWN absent
-        epoch_summary=_summary("0.25"),  # pool = 50 * 0.41 * 0.25 = $5.125
-        alpha_emission_per_epoch=Decimal("50"),
+        # pool = 50 * 0.41 * 0.25 = $5.125
+        epoch_summary=_summary("0.25", emissions_alpha="50"),
         subnet_owner_uid=99,
     )
     assert vector.burn_uid == 99
@@ -176,3 +182,25 @@ def test_partial_missing_uid_still_counted_against_pool() -> None:
     # floor-rounding dust.
     weights_by_uid = dict(zip(vector.uids, vector.weights, strict=True))
     assert abs((weights_by_uid[1] / max(weights_by_uid[2], 1)) - (5 / 3)) < 0.01
+
+
+def test_missing_emissions_alpha_raises_stale_epoch_summary() -> None:
+    """epoch_summary.json without emissions_alpha => StaleEpochSummaryError.
+
+    A pre-chain-read finalizer wrote the artifact; the validator defers
+    rather than inventing a pool denominator. process_once() catches this
+    and skips the processed-state mark so the next tick retries once
+    the finalizer republishes.
+    """
+    rows = [_row("A", 1_000_000_000)]
+    scores = score(rows)
+    with pytest.raises(StaleEpochSummaryError) as exc_info:
+        compute_weights(
+            scores,
+            miner_uid_lookup={"A": 1},
+            epoch_summary=_summary("0.50", emissions_alpha=None),
+            subnet_owner_uid=99,
+        )
+    message = str(exc_info.value)
+    assert "emissions_alpha" in message
+    assert "epoch 1" in message

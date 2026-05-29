@@ -15,6 +15,7 @@ invokes the `gm-verifier` subprocess against that directory. Reasons:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from typing import Any
@@ -84,6 +85,20 @@ class S3Mirror:
         """True iff every artifact is already on local disk."""
         local_dir = self._epoch_dir(epoch_id)
         return all(os.path.exists(os.path.join(local_dir, name)) for name in _ARTIFACTS)
+
+    def invalidate_artifact(self, epoch_id: int, name: str) -> None:
+        """Drop the cached copy of *name* so the next ``mirror_epoch`` refetches it.
+
+        Used when the validator detects that the cached artifact is
+        stale (e.g. an ``epoch_summary.json`` written by a pre-PR#176
+        finalizer): the operator republishes the corrected artifact in
+        S3 and the next tick must re-download it. ``_download`` is a
+        no-op when the local file exists, so without this invalidation
+        the validator would keep reading the stale cached copy forever.
+        """
+        path = os.path.join(self._epoch_dir(epoch_id), name)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
 
     def _epoch_dir(self, epoch_id: int) -> str:
         return os.path.join(self._local_root, f"epoch={epoch_id}")

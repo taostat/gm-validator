@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import botocore
@@ -89,7 +88,6 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "verifier_sample_per_tuple": 0,
         "poll_interval_secs": 60,
         "metrics_port": 9092,
-        "alpha_emission_per_epoch": Decimal("100"),
         "subnet_owner_uid": 0,
     }
     defaults.update(overrides)

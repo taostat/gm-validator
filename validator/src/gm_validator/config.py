@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from decimal import Decimal
 
 
 def _require_env(name: str) -> str:
@@ -19,13 +18,6 @@ def _int_env(name: str, default: int) -> int:
     if value is None:
         return default
     return int(value)
-
-
-def _decimal_env(name: str, default: Decimal) -> Decimal:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return Decimal(value)
 
 
 @dataclass
@@ -69,9 +61,6 @@ class ValidatorConfig:
     # Observability.
     metrics_port: int
 
-    # Full-epoch alpha emission. Static configuration knob until a
-    # follow-up pulls it from the chain dynamically.
-    alpha_emission_per_epoch: Decimal
     # Uid that absorbs the burn slot + floor-rounding dust. bm reads the
     # subnet-owner hotkey from the chain and resolves to a uid; the gm
     # port defers that lookup to a follow-up.
@@ -104,7 +93,6 @@ class ValidatorConfig:
             verifier_sample_per_tuple=_int_env("VERIFIER_SAMPLE_PER_TUPLE", 16),
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),
-            alpha_emission_per_epoch=_decimal_env("ALPHA_EMISSION_PER_EPOCH", Decimal("100")),
             subnet_owner_uid=int(_require_env("SUBNET_OWNER_UID")),
         )
 
