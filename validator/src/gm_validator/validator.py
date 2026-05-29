@@ -23,7 +23,11 @@ from dataclasses import dataclass
 
 from gm_validator.bittensor_adapter import Submitter
 from gm_validator.config import ValidatorConfig
-from gm_validator.epoch_summary import epoch_summary_path, load_epoch_summary
+from gm_validator.epoch_summary import (
+    EPOCH_SUMMARY_FILENAME,
+    epoch_summary_path,
+    load_epoch_summary,
+)
 from gm_validator.processed_state import ProcessedState
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import (
@@ -91,6 +95,11 @@ class Validator:
                 # Skip marking processed so the next tick retries once
                 # the finalizer has republished (the artifact's
                 # _FINALIZED rewrite path is the operator escalation).
+                # Invalidate the cached copy too: S3Mirror._download is a
+                # no-op when the local file exists, so without this the
+                # validator would keep rereading the stale cached summary
+                # and defer forever.
+                self._mirror.invalidate_artifact(epoch_id, EPOCH_SUMMARY_FILENAME)
                 LOGGER.warning(
                     "epoch %d deferred (stale epoch_summary): %s — next tick will retry",
                     epoch_id,

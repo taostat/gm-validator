@@ -493,7 +493,10 @@ def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
 
     Without emissions_alpha the cap+burn pool denominator is unknown;
     the validator must skip submission AND the processed-state mark so
-    the next tick retries once the finalizer republishes.
+    the next tick retries once the finalizer republishes. The deferral
+    also invalidates the local cached copy of epoch_summary.json so the
+    next tick re-downloads the corrected artifact instead of rereading
+    the stale cache.
     """
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
@@ -510,11 +513,22 @@ def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
         submitter = MockSubmitter()
         validator = Validator(config, mirror, submitter, miner_uid_lookup={miner_a: 0})
 
-        # Missing emissions_alpha -> defer, no submission, no processed mark.
+        # First tick: missing emissions_alpha -> defer.
         outcomes = validator.process_once()
         assert outcomes == []
         assert submitter.calls == []
         assert 31 not in validator._processed
+
+        # Operator republishes epoch_summary.json with the chain-read field.
+        # The stale cached copy must have been invalidated so the next
+        # tick re-downloads the corrected artifact.
+        _populate_epoch(s3, epoch_id=31, records=records, emissions_alpha="100")
+
+        outcomes = validator.process_once()
+        assert len(outcomes) == 1
+        assert outcomes[0].epoch_id == 31
+        assert outcomes[0].weights_submitted is True
+        assert 31 in validator._processed
 
 
 def test_validator_submits_cap_burn_weights(tmp_path: pathlib.Path) -> None:
