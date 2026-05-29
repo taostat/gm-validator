@@ -12,14 +12,11 @@ module parses them back into :class:`Decimal`.
 from __future__ import annotations
 
 import json
-import logging
 import os
 from decimal import Decimal
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, PlainSerializer
-
-LOGGER = logging.getLogger(__name__)
 
 EPOCH_SUMMARY_FILENAME = "epoch_summary.json"
 
@@ -52,16 +49,15 @@ def epoch_summary_path(mirror_dir: str) -> str:
     return os.path.join(mirror_dir, EPOCH_SUMMARY_FILENAME)
 
 
-def load_epoch_summary(path: str) -> EpochSummary | None:
-    """Read ``epoch_summary.json``; return None if the file is absent.
+def load_epoch_summary(path: str) -> EpochSummary:
+    """Read ``epoch_summary.json``.
 
-    A missing file is the legacy-epoch signal — finalizers that pre-date
-    PR #161 do not emit this artifact. The validator falls back to the
-    naive scoring path on ``None``.
+    Raises:
+        FileNotFoundError: The file is absent. Every finalizer from
+            gm-epoch-finalizer #161 onward emits this artifact; a
+            missing file means an upstream regression and the epoch
+            should not be scored until it's resolved.
     """
-    if not os.path.exists(path):
-        LOGGER.warning("epoch_summary.json not present at %s — legacy epoch", path)
-        return None
     with open(path, encoding="utf-8") as f:
         data: dict[str, Any] = json.load(f)
     return EpochSummary.model_validate(data)

@@ -5,12 +5,12 @@ Loop:
 1. Discover finalized epoch ids in S3.
 2. For each not yet processed:
    a. Mirror artifacts locally (raw, aggregated, gateway_keys,
-      _FINALIZED, and best-effort epoch_summary.json).
+      _FINALIZED, epoch_summary.json).
    b. Invoke `gm-verifier verify`. On failure: alert + skip submission.
    c. Compute per-miner scores from `aggregated.jsonl`.
-   d. Build a u16 weight vector — emission cap + burn when
-      `USE_EMISSION_CAP=true` and `epoch_summary.json` is present;
-      naive normalisation otherwise.
+   d. Build a u16 weight vector via cap+burn — miner i gets
+      ``consumed_usd_i / pool_usd``; residue routes to the subnet-owner
+      uid as burn weight.
    e. Submit via the configured `Submitter`.
    f. Mark the epoch processed.
 3. Prune local mirrors older than the retention window.
@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from gm_validator.bittensor_adapter import Submitter
 from gm_validator.config import ValidatorConfig
-from gm_validator.epoch_summary import EpochSummary, epoch_summary_path, load_epoch_summary
+from gm_validator.epoch_summary import epoch_summary_path, load_epoch_summary
 from gm_validator.processed_state import ProcessedState
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import (
@@ -47,7 +47,6 @@ class EpochOutcome:
     weights_submitted: bool
     miner_count: int
     total_ndollars: int
-    used_emission_cap: bool
 
 
 class Validator:
@@ -108,25 +107,17 @@ class Validator:
                 weights_submitted=False,
                 miner_count=0,
                 total_ndollars=0,
-                used_emission_cap=False,
             )
 
         rows = load_aggregated(aggregated_path(mirror_dir))
         scores = score(rows)
         total = sum(s.earnings_ndollars + s.surcharge_ndollars for s in scores.values())
 
-        # Only the cap path consumes epoch_summary.json; reading it when
-        # the flag is off lets a malformed artifact fail an opted-out
-        # deployment, so gate the read. Schema errors here are loud on
-        # purpose when the cap is on.
-        epoch_summary: EpochSummary | None = None
-        if self._config.use_emission_cap:
-            epoch_summary = load_epoch_summary(epoch_summary_path(mirror_dir))
+        epoch_summary = load_epoch_summary(epoch_summary_path(mirror_dir))
 
         vector = compute_weights(
             scores,
             self._miner_uid_lookup,
-            use_emission_cap=self._config.use_emission_cap,
             epoch_summary=epoch_summary,
             alpha_emission_per_epoch=self._config.alpha_emission_per_epoch,
             subnet_owner_uid=self._config.subnet_owner_uid,
@@ -141,15 +132,13 @@ class Validator:
                 epoch_id=epoch_id,
             )
             submitted = True
-            if vector.epoch_result is not None:
-                LOGGER.info(
-                    "epoch %d: cap+burn scale=%s burn_weight=%s pool_usd=%s consumed_usd=%s",
-                    epoch_id,
-                    vector.epoch_result.scale,
-                    vector.epoch_result.burn_weight,
-                    vector.epoch_result.pool_usd_total,
-                    vector.epoch_result.total_consumed_usd,
-                )
+            LOGGER.info(
+                "epoch %d: miners=%d pool_usd=%s consumed_usd=%s",
+                epoch_id,
+                len(scores),
+                vector.epoch_result.pool_usd_total,
+                vector.epoch_result.total_consumed_usd,
+            )
 
         return EpochOutcome(
             epoch_id=epoch_id,
@@ -157,7 +146,6 @@ class Validator:
             weights_submitted=submitted,
             miner_count=len(scores),
             total_ndollars=total,
-            used_emission_cap=vector.used_emission_cap,
         )
 
     def _verify(self, epoch_id: int, mirror_dir: str) -> VerifierResult:

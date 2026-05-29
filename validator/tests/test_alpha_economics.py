@@ -10,6 +10,7 @@ from hypothesis import strategies as st
 
 from gm_validator.alpha_economics import (
     MAX_WEIGHT,
+    MINER_EMISSION_PCT,
     MinerEpochData,
     compute_epoch_weights,
     normalize_weights,
@@ -20,43 +21,49 @@ def _miners(values: list[tuple[str, str]]) -> list[MinerEpochData]:
     return [MinerEpochData(hotkey=h, consumed_usd=Decimal(v)) for h, v in values]
 
 
-def test_case_b_under_subscribed_burns_residue() -> None:
-    """Worked example A from the deep-dive: demand $9, pool $10.25."""
+def _pool_usd(alpha_price: Decimal, emissions: Decimal) -> Decimal:
+    return emissions * MINER_EMISSION_PCT * alpha_price
+
+
+def test_under_subscribed_weights_match_consumed_over_pool() -> None:
+    """Demand $9 against a $10.25 pool: weight_i = consumed_i / pool_usd."""
     miners = _miners([("A", "5"), ("B", "3"), ("C", "1")])
     result = compute_epoch_weights(
         miners,
         alpha_price_usd=Decimal("0.50"),
         emissions_alpha=Decimal("50"),
     )
-    assert result.scale == Decimal(1)
+    pool_usd = _pool_usd(Decimal("0.50"), Decimal("50"))
     assert result.total_consumed_usd == Decimal(9)
-    assert result.pool_usd_total == Decimal("10.25")
-    assert result.burn_alpha == Decimal("2.5")
-    expected_burn_weight = Decimal("2.5") / Decimal("20.5")
-    assert result.burn_weight == expected_burn_weight
-    weights_sum = sum((m.weight for m in result.miners), Decimal(0)) + result.burn_weight
-    assert weights_sum == Decimal(1)
+    assert result.pool_usd_total == pool_usd
+    for miner in result.miners:
+        assert miner.weight == miner.consumed_usd / pool_usd
+    # Sum of miner weights < 1: residue lands on burn in normalize_weights.
+    total_miner_weight = sum((m.weight for m in result.miners), Decimal(0))
+    assert total_miner_weight < Decimal(1)
 
 
-def test_case_a_over_subscribed_no_burn() -> None:
-    """Demand exceeds pool: scale < 1, burn weight is zero."""
+def test_over_subscribed_weights_sum_above_one() -> None:
+    """Demand $15 against a $10.25 pool: per-miner weight = consumed/pool,
+    aggregate sum > 1, normalize_weights renorms downstream."""
     miners = _miners([("A", "10"), ("B", "5")])
     result = compute_epoch_weights(
         miners,
         alpha_price_usd=Decimal("0.50"),
         emissions_alpha=Decimal("50"),
     )
+    pool_usd = _pool_usd(Decimal("0.50"), Decimal("50"))
     assert result.total_consumed_usd == Decimal(15)
-    assert result.pool_usd_total == Decimal("10.25")
-    assert result.scale < Decimal(1)
-    assert result.burn_alpha == Decimal(0)
-    assert result.burn_weight == Decimal(0)
-    weights_sum = sum((m.weight for m in result.miners), Decimal(0)) + result.burn_weight
-    assert weights_sum == Decimal(1)
+    assert result.pool_usd_total == pool_usd
+    total_miner_weight = sum((m.weight for m in result.miners), Decimal(0))
+    assert total_miner_weight > Decimal(1)
+    for miner in result.miners:
+        assert miner.weight == miner.consumed_usd / pool_usd
 
 
-def test_case_c_no_consumption_all_to_burn() -> None:
-    """Zero demand: scale = 1 by convention, all weight burns."""
+def test_zero_consumption_all_weights_zero() -> None:
+    """Zero demand: every miner weight is 0; normalize_weights routes
+    the full MAX_WEIGHT to burn."""
     miners = _miners([("A", "0"), ("B", "0")])
     result = compute_epoch_weights(
         miners,
@@ -64,21 +71,24 @@ def test_case_c_no_consumption_all_to_burn() -> None:
         emissions_alpha=Decimal("50"),
     )
     assert result.total_consumed_usd == Decimal(0)
-    assert result.scale == Decimal(1)
-    assert result.burn_weight == Decimal(1)
     for m in result.miners:
         assert m.weight == Decimal(0)
 
 
-def test_case_d_single_miner_takes_whole_pool_when_demand_exceeds() -> None:
+def test_single_miner_demand_above_pool_renorms_to_full() -> None:
+    """A single miner whose demand exceeds the pool ends up with the
+    entire MAX_WEIGHT after normalize_weights renorms."""
     miners = _miners([("solo", "100")])
     result = compute_epoch_weights(
         miners,
         alpha_price_usd=Decimal("0.50"),
         emissions_alpha=Decimal("50"),
     )
-    assert result.miners[0].weight == Decimal(1)
-    assert result.burn_weight == Decimal(0)
+    pairs = [(0, result.miners[0].weight)]
+    u16 = normalize_weights(pairs, burn_uid=99)
+    weights_by_uid = dict(u16)
+    assert weights_by_uid[0] == MAX_WEIGHT
+    assert 99 not in weights_by_uid
 
 
 def test_blacklisted_miner_contributes_zero() -> None:

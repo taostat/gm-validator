@@ -21,6 +21,14 @@ from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
+_ARTIFACTS = (
+    "raw.jsonl.zst",
+    "aggregated.jsonl",
+    "gateway_keys.json",
+    "epoch_summary.json",
+    "_FINALIZED",
+)
+
 
 class S3Mirror:
     """Wraps a boto3 S3 client + a local cache directory."""
@@ -68,22 +76,14 @@ class S3Mirror:
         """
         local_dir = self._epoch_dir(epoch_id)
         os.makedirs(local_dir, exist_ok=True)
-        names = ("raw.jsonl.zst", "aggregated.jsonl", "gateway_keys.json", "_FINALIZED")
-        for name in names:
+        for name in _ARTIFACTS:
             self._download(epoch_id, name, os.path.join(local_dir, name))
-        # epoch_summary.json is best-effort — finalizers pre-PR #161 do
-        # not write it. The scoring path detects its absence and falls
-        # back to the legacy normalisation; the mirror must not raise.
-        self._download_optional(epoch_id, "epoch_summary.json", local_dir)
         return local_dir
 
     def epoch_already_mirrored(self, epoch_id: int) -> bool:
-        """True iff all four artifacts are already on local disk."""
+        """True iff every artifact is already on local disk."""
         local_dir = self._epoch_dir(epoch_id)
-        return all(
-            os.path.exists(os.path.join(local_dir, name))
-            for name in ("raw.jsonl.zst", "aggregated.jsonl", "gateway_keys.json", "_FINALIZED")
-        )
+        return all(os.path.exists(os.path.join(local_dir, name)) for name in _ARTIFACTS)
 
     def _epoch_dir(self, epoch_id: int) -> str:
         return os.path.join(self._local_root, f"epoch={epoch_id}")
@@ -96,19 +96,6 @@ class S3Mirror:
         tmp = local_path + ".part"
         self._s3.download_file(self._bucket, key, tmp)
         os.replace(tmp, local_path)
-
-    def _download_optional(self, epoch_id: int, name: str, local_dir: str) -> None:
-        local_path = os.path.join(local_dir, name)
-        if os.path.exists(local_path):
-            return
-        try:
-            self._download(epoch_id, name, local_path)
-        except self._s3.exceptions.ClientError as e:
-            err = e.response.get("Error", {}).get("Code", "")
-            if err in {"404", "NoSuchKey", "NotFound"}:
-                LOGGER.info("optional artifact %s absent for epoch %d", name, epoch_id)
-                return
-            raise
 
     def _marker_exists(self, epoch_id: int) -> bool:
         key = f"{self._prefix}/finalized/epoch={epoch_id}/_FINALIZED"
