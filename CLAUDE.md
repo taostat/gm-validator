@@ -82,8 +82,9 @@ cargo build --release -p gm-verifier
 | `BITTENSOR_MOCK` | `0` | Use `MockSubmitter` (records submissions in memory) |
 | `GM_VERIFIER_BIN` | `gm-verifier` | Path to the verifier binary |
 | `VERIFIER_SAMPLE_PER_TUPLE` | `16` | Number of records sampled per `(miner, product)` tuple |
-| `ALPHA_EMISSION_PER_EPOCH` | `100` | Full-epoch alpha emission, the pool denominator. Static knob until a follow-up pulls it from chain. |
 | `SUBNET_OWNER_UID` | required | Uid that absorbs the burn slot + floor-rounding dust. Static knob until a follow-up resolves it from `SubnetOwnerHotkey`. |
+
+The pool denominator's `emissions_alpha` is read from `epoch_summary.json` (chain-truth, written by the gm finalizer); see `validator/src/gm_validator/epoch_summary.py`.
 
 ## Key conventions
 

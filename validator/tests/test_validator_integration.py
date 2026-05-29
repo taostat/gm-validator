@@ -20,7 +20,6 @@ import json
 import os
 import pathlib
 import subprocess
-from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -145,11 +144,14 @@ def _populate_epoch(
     records: list[dict],
     *,
     alpha_price_usd: str = "0.50",
+    emissions_alpha: str | None = "100",
 ) -> None:
     """Populate an epoch with the artifacts the validator now expects.
 
     epoch_summary.json is mandatory after the USE_EMISSION_CAP flag
-    drop — every finalizer emits one.
+    drop — every finalizer emits one. ``emissions_alpha`` is the
+    chain-read field added in gm finalizer PR #176; pass ``None`` to
+    simulate a pre-chain-read artifact for the deferral path.
     """
     finalized_prefix = f"{PREFIX}/finalized/epoch={epoch_id}/"
 
@@ -174,7 +176,7 @@ def _populate_epoch(
         Body=json.dumps(manifest).encode("utf-8"),
     )
 
-    summary = {
+    summary: dict[str, object] = {
         "epoch_id": epoch_id,
         "finalized_at": "2026-05-27T12:00:00Z",
         "alpha_price_in_tao": "0.05",
@@ -185,6 +187,9 @@ def _populate_epoch(
         "price_tao_usd_source": "taostats",
         "finalizer_version": "test",
     }
+    if emissions_alpha is not None:
+        summary["emissions_alpha"] = emissions_alpha
+        summary["emissions_alpha_source"] = "chain"
     s3.put_object(
         Bucket=BUCKET,
         Key=f"{finalized_prefix}epoch_summary.json",
@@ -209,11 +214,7 @@ def _verifier_bin() -> str:
     return str(candidate)
 
 
-def _config(
-    tmp_path: pathlib.Path,
-    *,
-    alpha_emission: Decimal = Decimal("1000000"),
-) -> ValidatorConfig:
+def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
     return ValidatorConfig(
         s3_bucket=BUCKET,
         s3_prefix=PREFIX,
@@ -232,7 +233,6 @@ def _config(
         verifier_sample_per_tuple=0,
         poll_interval_secs=1,
         metrics_port=9092,
-        alpha_emission_per_epoch=alpha_emission,
         subnet_owner_uid=99,
     )
 
@@ -250,12 +250,12 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
             _record("01CCCCCCCCCCCCCCCCCCCCCCCC", miner_a),
         ]
-        _populate_epoch(s3, epoch_id=7, records=records)
-
         # Smaller pool so the tiny per-record demand is still visible in
         # the u16 weights — otherwise floor-rounding wipes the miner
         # slots entirely.
-        config = _config(tmp_path, alpha_emission=Decimal("0.0001"))
+        _populate_epoch(s3, epoch_id=7, records=records, emissions_alpha="0.0001")
+
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(
@@ -372,9 +372,11 @@ def test_validator_skips_submission_on_verifier_failure(tmp_path: pathlib.Path) 
             "alpha_price_in_tao": "0.05",
             "tao_price_usd": "10",
             "alpha_price_usd": "0.50",
+            "emissions_alpha": "100",
             "price_block_height": 1,
             "price_alpha_source": "chain",
             "price_tao_usd_source": "taostats",
+            "emissions_alpha_source": "chain",
             "finalizer_version": "test",
         }
         s3.put_object(
@@ -482,6 +484,37 @@ def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
         assert len(submitter.calls) == 1
         assert submitter.calls[0]["epoch_id"] == 23
         assert 23 in validator._processed
+
+
+def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A pre-chain-read epoch_summary.json must defer rather than score.
+
+    Without emissions_alpha the cap+burn pool denominator is unknown;
+    the validator must skip submission AND the processed-state mark so
+    the next tick retries once the finalizer republishes.
+    """
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+
+        records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
+        # Simulate a pre-chain-read finalizer by omitting emissions_alpha.
+        _populate_epoch(s3, epoch_id=31, records=records, emissions_alpha=None)
+
+        config = _config(tmp_path)
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(config, mirror, submitter, miner_uid_lookup={miner_a: 0})
+
+        # Missing emissions_alpha -> defer, no submission, no processed mark.
+        outcomes = validator.process_once()
+        assert outcomes == []
+        assert submitter.calls == []
+        assert 31 not in validator._processed
 
 
 def test_validator_submits_cap_burn_weights(tmp_path: pathlib.Path) -> None:

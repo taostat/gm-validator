@@ -27,6 +27,7 @@ from gm_validator.epoch_summary import epoch_summary_path, load_epoch_summary
 from gm_validator.processed_state import ProcessedState
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import (
+    StaleEpochSummaryError,
     StaleMetagraphError,
     aggregated_path,
     compute_weights,
@@ -84,6 +85,18 @@ class Validator:
                     exc,
                 )
                 continue
+            except StaleEpochSummaryError as exc:
+                # Transient — epoch_summary.json was written by a
+                # pre-chain-read finalizer and so lacks emissions_alpha.
+                # Skip marking processed so the next tick retries once
+                # the finalizer has republished (the artifact's
+                # _FINALIZED rewrite path is the operator escalation).
+                LOGGER.warning(
+                    "epoch %d deferred (stale epoch_summary): %s — next tick will retry",
+                    epoch_id,
+                    exc,
+                )
+                continue
             except Exception:
                 LOGGER.exception("epoch %d processing failed", epoch_id)
                 continue
@@ -119,7 +132,6 @@ class Validator:
             scores,
             self._miner_uid_lookup,
             epoch_summary=epoch_summary,
-            alpha_emission_per_epoch=self._config.alpha_emission_per_epoch,
             subnet_owner_uid=self._config.subnet_owner_uid,
         )
 
