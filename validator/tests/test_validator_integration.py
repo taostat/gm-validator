@@ -477,11 +477,89 @@ def test_validator_zero_revenue_epoch_cap_path_submits_burn(
         assert len(submitter.calls) == 1
 
 
-def test_validator_zero_revenue_epoch_legacy_path_submits_zeros(
+def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
+    """Cap-path epoch where every scored miner is unknown to the uid lookup
+    must defer: no submission, no processed-state mark, retry next tick.
+
+    Simulates the metagraph refreshing between ticks by mutating the
+    Validator's uid lookup before the second process_once().
+    """
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        miner_b = "5Ehm" + "B" * 44
+
+        records = [
+            _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a),
+            _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
+        ]
+        _populate_epoch(
+            s3,
+            epoch_id=23,
+            records=records,
+            with_epoch_summary=True,
+            alpha_price_usd="0.50",
+        )
+
+        config = ValidatorConfig(
+            s3_bucket=BUCKET,
+            s3_prefix=PREFIX,
+            s3_endpoint_url=None,
+            aws_region="us-east-1",
+            s3_anonymous=False,
+            local_mirror_dir=str(tmp_path),
+            mirror_retention_epochs=10,
+            processed_state_path=str(tmp_path / "processed.json"),
+            bittensor_netuid=42,
+            bittensor_endpoint=None,
+            bittensor_wallet_name=None,
+            bittensor_wallet_hotkey=None,
+            bittensor_mock=True,
+            verifier_bin=_verifier_bin(),
+            verifier_sample_per_tuple=0,
+            poll_interval_secs=1,
+            metrics_port=9092,
+            use_emission_cap=True,
+            alpha_emission_per_epoch=Decimal("1000000"),
+            subnet_owner_uid=99,
+        )
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(
+            config,
+            mirror,
+            submitter,
+            miner_uid_lookup={},  # stale: neither miner present
+        )
+
+        # First tick: stale metagraph -> defer.
+        outcomes = validator.process_once()
+        assert outcomes == []
+        assert submitter.calls == []
+        assert 23 not in validator._processed
+
+        # Metagraph refreshes; next tick must process the same epoch.
+        validator._miner_uid_lookup = {miner_a: 0, miner_b: 1}
+        outcomes = validator.process_once()
+        assert len(outcomes) == 1
+        assert outcomes[0].epoch_id == 23
+        assert outcomes[0].weights_submitted is True
+        assert len(submitter.calls) == 1
+        assert submitter.calls[0]["epoch_id"] == 23
+        assert 23 in validator._processed
+
+
+def test_validator_zero_revenue_epoch_legacy_path_skips_submission(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Legacy path with all-zero earnings submits all-zero weights —
-    clearing any prior epoch's weights on chain."""
+    """Legacy path with zero earnings skips submission entirely.
+
+    The SDK drops sum-zero vectors before building the extrinsic, so
+    submitting all-zeros would NOT clear prior weights. Explicit skip +
+    log surfaces the limitation.
+    """
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -529,13 +607,8 @@ def test_validator_zero_revenue_epoch_legacy_path_submits_zeros(
         outcomes = validator.process_once()
         assert len(outcomes) == 1
         assert outcomes[0].used_emission_cap is False
-        assert outcomes[0].weights_submitted
-
-        assert len(submitter.calls) == 1
-        call = submitter.calls[0]
-        assert set(call["uids"]) == {0, 1}
-        assert call["weights"] == [0, 0]
-        assert sum(call["weights"]) == 0
+        assert outcomes[0].weights_submitted is False
+        assert submitter.calls == []
 
 
 def test_validator_uses_emission_cap_when_flag_on_and_summary_present(

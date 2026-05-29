@@ -38,6 +38,16 @@ LOGGER = logging.getLogger(__name__)
 NDOLLARS_PER_USD = Decimal(10**9)
 
 
+class StaleMetagraphError(Exception):
+    """All scored miners missing from miner_uid_lookup — defer this epoch.
+
+    Raised when the cap path detects the metagraph hotkey->uid lookup is
+    stale (every scored miner is unknown). The next process_once() tick
+    will retry; if the metagraph has refreshed by then, the epoch
+    proceeds normally.
+    """
+
+
 @dataclass
 class MinerScore:
     """Per-miner score components plus weight."""
@@ -178,16 +188,19 @@ def _compute_legacy(
     if not pairs:
         return WeightVector(uids=[], weights=[], burn_uid=None, used_emission_cap=False)
     total = sum((w for _, w in pairs), Decimal(0))
-    # Zero-revenue epoch: submit all-zeros so the chain clears the prior
-    # epoch's weights. The naive path has no burn slot to absorb pool.
     if total <= 0:
-        zero_uids = [uid for uid, _ in pairs]
-        return WeightVector(
-            uids=zero_uids,
-            weights=[0] * len(zero_uids),
-            burn_uid=None,
-            used_emission_cap=False,
+        # bittensor.set_weights drops sum-zero vectors before building the
+        # extrinsic, so submitting all-zeros doesn't actually clear the
+        # chain — prior epoch's weights stay active. Skip submission
+        # explicitly so the behaviour is visible in logs. Proper clearing
+        # would require routing to a burn UID even on the legacy path,
+        # which means SUBNET_OWNER_UID would have to become required even
+        # when USE_EMISSION_CAP=false — deferred.
+        LOGGER.info(
+            "zero-revenue legacy epoch: skipping submission "
+            "(SDK drops sum-zero vectors; prior weights persist)"
         )
+        return WeightVector(uids=[], weights=[], burn_uid=None, used_emission_cap=False)
     # Floor-rounding into u16 with no burn slot — naive path doesn't
     # know a subnet owner uid. Any remainder lands on the highest-
     # weighted miner so the vector still sums to MAX_WEIGHT.
@@ -238,16 +251,17 @@ def _compute_capped(
             missing_hotkeys.append(miner_id)
 
     # All scored miners missing from the lookup means the metagraph is
-    # stale. Defer submission — symmetric with the legacy path — so we
-    # don't burn the whole epoch to the subnet owner.
+    # stale. Raise StaleMetagraphError so process_once() defers without
+    # marking the epoch processed — the next tick retries once the
+    # metagraph has refreshed. A bare empty-vector return would get
+    # silently marked processed and the epoch would be lost.
     if miners_data and all(uid is None for uid in uids_by_index):
-        LOGGER.warning(
-            "epoch cap path: all %d scored miners missing from miner_uid_lookup "
-            "(metagraph may be stale); deferring weight submission. hotkeys=%s",
-            len(missing_hotkeys),
-            missing_hotkeys,
+        sample = missing_hotkeys[:10]
+        ellipsis = "..." if len(missing_hotkeys) > 10 else ""
+        raise StaleMetagraphError(
+            f"all {len(missing_hotkeys)} scored miners missing from "
+            f"miner_uid_lookup; hotkeys={sample}{ellipsis}"
         )
-        return WeightVector(uids=[], weights=[], burn_uid=None, used_emission_cap=True)
 
     if missing_hotkeys:
         LOGGER.warning(

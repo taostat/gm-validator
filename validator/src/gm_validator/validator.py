@@ -27,6 +27,7 @@ from gm_validator.epoch_summary import EpochSummary, epoch_summary_path, load_ep
 from gm_validator.processed_state import ProcessedState
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import (
+    StaleMetagraphError,
     aggregated_path,
     compute_weights,
     load_aggregated,
@@ -74,6 +75,16 @@ class Validator:
                 continue
             try:
                 outcome = self._process_epoch(epoch_id)
+            except StaleMetagraphError as exc:
+                # Transient — metagraph hotkey->uid lookup is stale. Skip
+                # marking processed so the next tick retries once the
+                # lookup has refreshed.
+                LOGGER.warning(
+                    "epoch %d deferred (stale metagraph): %s — next tick will retry",
+                    epoch_id,
+                    exc,
+                )
+                continue
             except Exception:
                 LOGGER.exception("epoch %d processing failed", epoch_id)
                 continue

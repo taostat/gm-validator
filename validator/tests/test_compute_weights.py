@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from gm_validator.alpha_economics import MAX_WEIGHT
 from gm_validator.epoch_summary import EpochSummary
-from gm_validator.scoring import compute_weights, score
+from gm_validator.scoring import StaleMetagraphError, compute_weights, score
 
 
 def _summary(alpha_price_usd: str = "0.50") -> EpochSummary:
@@ -150,26 +152,28 @@ def test_miner_outside_lookup_dropped() -> None:
     assert sum(vector.weights) == MAX_WEIGHT
 
 
-def test_cap_path_all_miners_missing_uid_skips_submit() -> None:
-    """All scored miners absent from the uid lookup => empty vector, no burn.
+def test_cap_path_all_miners_missing_uid_raises_stale_metagraph() -> None:
+    """All scored miners absent from the uid lookup => StaleMetagraphError.
 
-    Symmetric with the legacy path: a stale metagraph must defer
-    submission, not torch the whole epoch to the subnet owner.
+    process_once() catches this and defers the epoch without marking it
+    processed — a silent empty-vector return would get marked processed
+    and the epoch would be lost.
     """
     rows = [_row("A", 1_000_000_000), _row("B", 2_000_000_000)]
     scores = score(rows)
-    vector = compute_weights(
-        scores,
-        miner_uid_lookup={},  # neither miner known
-        use_emission_cap=True,
-        epoch_summary=_summary("0.50"),
-        alpha_emission_per_epoch=Decimal("100"),
-        subnet_owner_uid=99,
-    )
-    assert vector.uids == []
-    assert vector.weights == []
-    assert vector.burn_uid is None
-    assert vector.used_emission_cap is True
+    with pytest.raises(StaleMetagraphError) as exc_info:
+        compute_weights(
+            scores,
+            miner_uid_lookup={},  # neither miner known
+            use_emission_cap=True,
+            epoch_summary=_summary("0.50"),
+            alpha_emission_per_epoch=Decimal("100"),
+            subnet_owner_uid=99,
+        )
+    message = str(exc_info.value)
+    assert "2 scored miners missing" in message
+    assert "A" in message
+    assert "B" in message
 
 
 def test_cap_path_partial_missing_uid_uses_correct_cap() -> None:
@@ -223,11 +227,14 @@ def test_cap_path_partial_missing_uid_uses_correct_cap() -> None:
     assert abs((weights_by_uid[1] / max(weights_by_uid[2], 1)) - (5 / 3)) < 0.01
 
 
-def test_legacy_path_zero_revenue_submits_all_zeros() -> None:
-    """Legacy path with all-zero earnings still emits a uid vector (zero weights).
+def test_legacy_path_zero_revenue_skips_submission() -> None:
+    """Legacy path with zero total revenue returns an empty vector — skip submit.
 
-    The previous epoch's weights stay active on chain until something new
-    is submitted; we must submit explicit zeros to clear them.
+    bittensor.set_weights drops sum-zero vectors before building the
+    extrinsic, so an all-zeros submission would NOT clear the prior
+    epoch's weights as intended. Explicit skip + log makes the
+    limitation visible; clearing the chain on the legacy path would
+    require routing to a burn UID, which the legacy path doesn't know.
     """
     rows = [_row("A", 0), _row("B", 0)]
     scores = score(rows)
@@ -239,7 +246,7 @@ def test_legacy_path_zero_revenue_submits_all_zeros() -> None:
         alpha_emission_per_epoch=Decimal("100"),
         subnet_owner_uid=0,
     )
-    assert vector.used_emission_cap is False
+    assert vector.uids == []
+    assert vector.weights == []
     assert vector.burn_uid is None
-    assert set(vector.uids) == {1, 2}
-    assert vector.weights == [0, 0]
+    assert vector.used_emission_cap is False
