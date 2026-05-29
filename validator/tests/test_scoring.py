@@ -1,11 +1,8 @@
-"""Property tests on the scoring + weight normalisation."""
+"""Tests for the per-miner score aggregation."""
 
 from __future__ import annotations
 
-from hypothesis import given, settings
-from hypothesis import strategies as st
-
-from gm_validator.scoring import MinerScore, normalise_weights, score
+from gm_validator.scoring import MinerScore, score
 
 
 def _row(miner_id: str, earnings: int, surcharge: int = 0) -> dict:
@@ -34,46 +31,14 @@ def test_sums_per_miner_across_products() -> None:
     assert s["B"].earnings_ndollars == 25
 
 
-def test_normalise_weights_sum_to_one_when_total_positive() -> None:
-    rows = [_row("A", 700), _row("B", 300)]
-    s = normalise_weights(score(rows))
-    assert abs(s["A"].weight + s["B"].weight - 1.0) < 1e-12
-    assert abs(s["A"].weight - 0.7) < 1e-12
-
-
-def test_normalise_weights_all_zero_when_no_earnings() -> None:
-    rows = [_row("A", 0), _row("B", 0)]
-    s = normalise_weights(score(rows))
-    assert s["A"].weight == 0.0
-    assert s["B"].weight == 0.0
-
-
-def test_surcharges_included_in_weight() -> None:
+def test_surcharges_summed_into_score() -> None:
     rows = [
-        _row("A", 100, surcharge=0),
-        _row("B", 0, surcharge=100),
+        _row("A", 100, surcharge=10),
+        _row("A", 0, surcharge=5),
     ]
-    s = normalise_weights(score(rows))
-    assert abs(s["A"].weight - 0.5) < 1e-12
-    assert abs(s["B"].weight - 0.5) < 1e-12
-
-
-@given(
-    earnings=st.lists(
-        st.integers(min_value=0, max_value=10**18),
-        min_size=1,
-        max_size=20,
-    )
-)
-@settings(max_examples=80)
-def test_normalised_weights_sum_to_one_or_zero(earnings: list[int]) -> None:
-    rows = [_row(f"M{i:02d}", e) for i, e in enumerate(earnings)]
-    s = normalise_weights(score(rows))
-    total = sum(score_.weight for score_ in s.values())
-    if sum(earnings) > 0:
-        assert abs(total - 1.0) < 1e-9
-    else:
-        assert total == 0.0
+    s = score(rows)
+    assert s["A"].earnings_ndollars == 100
+    assert s["A"].surcharge_ndollars == 15
 
 
 def test_dataclass_defaults_are_independent_instances() -> None:

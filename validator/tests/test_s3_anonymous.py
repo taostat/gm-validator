@@ -19,6 +19,7 @@ from gm_validator.config import ValidatorConfig
 
 def test_s3_anonymous_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
     monkeypatch.delenv("GM_VALIDATOR_S3_ANONYMOUS", raising=False)
     config = ValidatorConfig.from_env()
     assert config.s3_anonymous is False
@@ -27,6 +28,7 @@ def test_s3_anonymous_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None
 @pytest.mark.parametrize("value", ["1", "true", "True"])
 def test_s3_anonymous_truthy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
     monkeypatch.setenv("GM_VALIDATOR_S3_ANONYMOUS", value)
     config = ValidatorConfig.from_env()
     assert config.s3_anonymous is True
@@ -35,44 +37,31 @@ def test_s3_anonymous_truthy_values(monkeypatch: pytest.MonkeyPatch, value: str)
 @pytest.mark.parametrize("value", ["0", "false", "False", "no", ""])
 def test_s3_anonymous_falsy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
     monkeypatch.setenv("GM_VALIDATOR_S3_ANONYMOUS", value)
     config = ValidatorConfig.from_env()
     assert config.s3_anonymous is False
 
 
 # ---------------------------------------------------------------------------
-# USE_EMISSION_CAP / SUBNET_OWNER_UID coupling
+# SUBNET_OWNER_UID is mandatory
 # ---------------------------------------------------------------------------
 
 
-def test_emission_cap_requires_subnet_owner_uid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Enabling the cap path without SUBNET_OWNER_UID must fail loudly —
-    burn weight would otherwise default to uid 0 (a real miner)."""
+def test_subnet_owner_uid_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SUBNET_OWNER_UID is the burn target; without it weight would
+    route to uid 0 (a real miner)."""
     monkeypatch.setenv("S3_BUCKET", "my-bucket")
-    monkeypatch.setenv("USE_EMISSION_CAP", "true")
     monkeypatch.delenv("SUBNET_OWNER_UID", raising=False)
-    with pytest.raises(ValueError, match="explicitly"):
+    with pytest.raises(ValueError, match="SUBNET_OWNER_UID"):
         ValidatorConfig.from_env()
 
 
-def test_emission_cap_with_subnet_owner_uid_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_subnet_owner_uid_parsed_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("S3_BUCKET", "my-bucket")
-    monkeypatch.setenv("USE_EMISSION_CAP", "true")
     monkeypatch.setenv("SUBNET_OWNER_UID", "103")
     config = ValidatorConfig.from_env()
-    assert config.use_emission_cap is True
     assert config.subnet_owner_uid == 103
-
-
-def test_emission_cap_disabled_without_subnet_owner_uid_ok(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("S3_BUCKET", "my-bucket")
-    monkeypatch.delenv("USE_EMISSION_CAP", raising=False)
-    monkeypatch.delenv("SUBNET_OWNER_UID", raising=False)
-    config = ValidatorConfig.from_env()
-    assert config.use_emission_cap is False
-    assert config.subnet_owner_uid == 0
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +89,6 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "verifier_sample_per_tuple": 0,
         "poll_interval_secs": 60,
         "metrics_port": 9092,
-        "use_emission_cap": False,
         "alpha_emission_per_epoch": Decimal("100"),
         "subnet_owner_uid": 0,
     }

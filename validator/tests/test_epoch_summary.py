@@ -31,7 +31,6 @@ def test_load_decimal_strings_parsed_with_full_precision(tmp_path: pathlib.Path)
     path = tmp_path / "epoch_summary.json"
     path.write_text(json.dumps(payload))
     summary = load_epoch_summary(str(path))
-    assert summary is not None
     assert summary.epoch_id == 7
     assert summary.alpha_price_usd == Decimal("22.5061728000")
     assert summary.tao_price_usd == Decimal("450.123456")
@@ -39,10 +38,11 @@ def test_load_decimal_strings_parsed_with_full_precision(tmp_path: pathlib.Path)
     assert summary.price_alpha_source == "chain"
 
 
-def test_missing_file_returns_none(tmp_path: pathlib.Path) -> None:
-    """The legacy-epoch path: no file means fall back to naive scoring."""
-    summary = load_epoch_summary(str(tmp_path / "absent.json"))
-    assert summary is None
+def test_missing_file_raises(tmp_path: pathlib.Path) -> None:
+    """Every finalizer emits epoch_summary.json — a missing file is an
+    upstream regression, not a legacy-epoch signal."""
+    with pytest.raises(FileNotFoundError):
+        load_epoch_summary(str(tmp_path / "absent.json"))
 
 
 def test_summary_is_frozen() -> None:

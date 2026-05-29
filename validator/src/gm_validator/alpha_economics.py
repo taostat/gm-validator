@@ -1,13 +1,17 @@
 """Cap-and-burn weight math, ported from bm-validator.
 
-The miner pool for one epoch is bounded by
-``emissions_alpha * MINER_EMISSION_PCT * alpha_price_usd``. Demand above
-the pool clamps proportionally; demand below the pool leaves a residue
-that routes to the subnet owner uid as burn weight, padded with any
-floor-rounding remainder so the submitted u16 vector sums to exactly
-``MAX_WEIGHT``.
+For each miner i:
 
-Reference: ``bm/validator/common/scoring/weights.py``.
+    weight_i = consumed_usd_i / pool_usd
+
+where ``pool_usd = emissions_alpha * MINER_EMISSION_PCT * alpha_price_usd``.
+
+When total miner demand is under the pool, the leftover surfaces as
+``1 - sum(weights)`` and routes to the subnet-owner uid as burn weight
+in :func:`normalize_weights`. When demand exceeds the pool the per-miner
+weights sum > 1 and ``normalize_weights`` renorms them down so the
+submitted u16 vector sums to exactly ``MAX_WEIGHT``; burn drops to
+floor-rounding dust.
 """
 
 from __future__ import annotations
@@ -19,7 +23,6 @@ MAX_WEIGHT = 65535
 MINER_EMISSION_PCT = Decimal("0.41")
 
 _ZERO = Decimal(0)
-_ONE = Decimal(1)
 
 
 @dataclass
@@ -38,8 +41,6 @@ class MinerWeight:
     hotkey: str
     is_banned: bool
     consumed_usd: Decimal
-    payout_usd: Decimal = _ZERO
-    payout_alpha: Decimal = _ZERO
     weight: Decimal = _ZERO
 
 
@@ -50,9 +51,6 @@ class EpochWeightsResult:
     pool_usd_total: Decimal
     pool_alpha_total: Decimal
     total_consumed_usd: Decimal
-    scale: Decimal
-    burn_alpha: Decimal
-    burn_weight: Decimal
     alpha_price_usd: Decimal
     emissions_alpha: Decimal
     miners: list[MinerWeight] = field(default_factory=list)
@@ -63,7 +61,11 @@ def compute_epoch_weights(
     alpha_price_usd: Decimal,
     emissions_alpha: Decimal,
 ) -> EpochWeightsResult:
-    """Apply bm-style cap+burn to one epoch's miner consumption.
+    """Compute per-miner weights as ``consumed_usd / pool_usd``.
+
+    Weights may sum > 1 when total billing exceeds the pool;
+    ``normalize_weights`` renorms downstream — miners share the pool,
+    burn drops to floor-rounding dust.
 
     Args:
         miners_data: Per-miner USD consumption for the epoch.
@@ -71,9 +73,9 @@ def compute_epoch_weights(
         emissions_alpha: Total alpha issued in the epoch (chain-level).
 
     Returns:
-        EpochWeightsResult: float-domain weights in [0, 1] plus the
-            burn-weight residue. ``sum(miner.weight) + burn_weight`` is
-            ``1`` modulo Decimal precision.
+        EpochWeightsResult: float-domain weights in the pool's units
+            (``consumed_i / pool_usd``) plus the totals used to derive
+            them.
 
     Raises:
         ValueError: ``alpha_price_usd`` or ``emissions_alpha`` is not
@@ -84,43 +86,30 @@ def compute_epoch_weights(
     if emissions_alpha <= 0:
         raise ValueError("emissions_alpha must be positive")
 
-    miner_pool_alpha = emissions_alpha * MINER_EMISSION_PCT
-    miner_pool_usd = miner_pool_alpha * alpha_price_usd
+    pool_alpha = emissions_alpha * MINER_EMISSION_PCT
+    pool_usd = pool_alpha * alpha_price_usd
 
     results: list[MinerWeight] = []
     total_consumed_usd = _ZERO
     for miner in miners_data:
         consumed = _ZERO if miner.is_blacklisted else miner.consumed_usd
         total_consumed_usd += consumed
+        weight = consumed / pool_usd if pool_usd > 0 else _ZERO
         results.append(
             MinerWeight(
                 hotkey=miner.hotkey,
                 is_banned=miner.is_blacklisted,
                 consumed_usd=consumed,
+                weight=weight,
             )
         )
 
-    scale = min(_ONE, miner_pool_usd / total_consumed_usd) if total_consumed_usd > 0 else _ONE
-
-    total_payout_alpha = _ZERO
-    for r in results:
-        r.payout_usd = r.consumed_usd * scale
-        r.payout_alpha = r.payout_usd / alpha_price_usd
-        total_payout_alpha += r.payout_alpha
-        r.weight = r.payout_alpha / miner_pool_alpha
-
-    burn_alpha = miner_pool_alpha - total_payout_alpha
-    burn_weight = burn_alpha / miner_pool_alpha
-
     return EpochWeightsResult(
-        pool_usd_total=miner_pool_usd,
-        pool_alpha_total=miner_pool_alpha,
+        pool_usd_total=pool_usd,
+        pool_alpha_total=pool_alpha,
         total_consumed_usd=total_consumed_usd,
-        scale=scale,
-        burn_alpha=burn_alpha,
-        burn_weight=burn_weight,
         alpha_price_usd=alpha_price_usd,
-        emissions_alpha=miner_pool_alpha,
+        emissions_alpha=pool_alpha,
         miners=results,
     )
 
@@ -132,7 +121,9 @@ def normalize_weights(
     """Convert float-domain weights to u16, padding the burn slot with dust.
 
     Args:
-        miner_weights: ``(uid, weight)`` pairs in the [0, 1] domain.
+        miner_weights: ``(uid, weight)`` pairs in pool units. When sum
+            > 1 the inputs are renormed before u16 conversion; when sum
+            < 1 the residue routes to ``burn_uid``.
         burn_uid: Uid that absorbs the floor-rounding remainder. When
             ``miner_weights`` is empty or sums to zero, the burn uid gets
             the entire ``MAX_WEIGHT``.
@@ -148,7 +139,7 @@ def normalize_weights(
     if total <= 0:
         return [(burn_uid, MAX_WEIGHT)]
 
-    renorm = total if total > _ONE else _ONE
+    renorm = total if total > Decimal(1) else Decimal(1)
 
     result: list[tuple[int, int]] = []
     running_total = 0

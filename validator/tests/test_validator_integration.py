@@ -6,7 +6,7 @@ asserts that:
 
 - the `gm-verifier` subprocess accepts the artifacts cleanly,
 - the MockSubmitter receives one `submit()` call per epoch,
-- the weights vector sums to 1.0,
+- the weights vector sums to ``MAX_WEIGHT``,
 - per-miner earnings match the synthesized inputs.
 
 The Rust verifier binary is built once via `cargo build` in conftest
@@ -144,9 +144,13 @@ def _populate_epoch(
     epoch_id: int,
     records: list[dict],
     *,
-    with_epoch_summary: bool = False,
     alpha_price_usd: str = "0.50",
 ) -> None:
+    """Populate an epoch with the artifacts the validator now expects.
+
+    epoch_summary.json is mandatory after the USE_EMISSION_CAP flag
+    drop — every finalizer emits one.
+    """
     finalized_prefix = f"{PREFIX}/finalized/epoch={epoch_id}/"
 
     # raw.jsonl.zst
@@ -170,23 +174,22 @@ def _populate_epoch(
         Body=json.dumps(manifest).encode("utf-8"),
     )
 
-    if with_epoch_summary:
-        summary = {
-            "epoch_id": epoch_id,
-            "finalized_at": "2026-05-27T12:00:00Z",
-            "alpha_price_in_tao": "0.05",
-            "tao_price_usd": "10",
-            "alpha_price_usd": alpha_price_usd,
-            "price_block_height": 1,
-            "price_alpha_source": "chain",
-            "price_tao_usd_source": "taostats",
-            "finalizer_version": "test",
-        }
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=f"{finalized_prefix}epoch_summary.json",
-            Body=json.dumps(summary).encode("utf-8"),
-        )
+    summary = {
+        "epoch_id": epoch_id,
+        "finalized_at": "2026-05-27T12:00:00Z",
+        "alpha_price_in_tao": "0.05",
+        "tao_price_usd": "10",
+        "alpha_price_usd": alpha_price_usd,
+        "price_block_height": 1,
+        "price_alpha_source": "chain",
+        "price_tao_usd_source": "taostats",
+        "finalizer_version": "test",
+    }
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"{finalized_prefix}epoch_summary.json",
+        Body=json.dumps(summary).encode("utf-8"),
+    )
 
     # _FINALIZED (last)
     s3.put_object(Bucket=BUCKET, Key=f"{finalized_prefix}_FINALIZED", Body=b"")
@@ -206,6 +209,34 @@ def _verifier_bin() -> str:
     return str(candidate)
 
 
+def _config(
+    tmp_path: pathlib.Path,
+    *,
+    alpha_emission: Decimal = Decimal("1000000"),
+) -> ValidatorConfig:
+    return ValidatorConfig(
+        s3_bucket=BUCKET,
+        s3_prefix=PREFIX,
+        s3_endpoint_url=None,
+        aws_region="us-east-1",
+        s3_anonymous=False,
+        local_mirror_dir=str(tmp_path),
+        mirror_retention_epochs=10,
+        processed_state_path=str(tmp_path / "processed.json"),
+        bittensor_netuid=42,
+        bittensor_endpoint=None,
+        bittensor_wallet_name=None,
+        bittensor_wallet_hotkey=None,
+        bittensor_mock=True,
+        verifier_bin=_verifier_bin(),
+        verifier_sample_per_tuple=0,
+        poll_interval_secs=1,
+        metrics_port=9092,
+        alpha_emission_per_epoch=alpha_emission,
+        subnet_owner_uid=99,
+    )
+
+
 def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
@@ -221,30 +252,10 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
         ]
         _populate_epoch(s3, epoch_id=7, records=records)
 
-        # Sample 0 means signatures are not checked (our records have
-        # placeholder signatures); raw_hash is still verified.
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-            use_emission_cap=False,
-            alpha_emission_per_epoch=Decimal("100"),
-            subnet_owner_uid=0,
-        )
+        # Smaller pool so the tiny per-record demand is still visible in
+        # the u16 weights — otherwise floor-rounding wipes the miner
+        # slots entirely.
+        config = _config(tmp_path, alpha_emission=Decimal("0.0001"))
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(
@@ -267,9 +278,11 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
         call = submitter.calls[0]
         assert call["epoch_id"] == 7
         assert call["netuid"] == 42
-        assert set(call["uids"]) == {0, 1}
         # u16 weight vector sums to exactly MAX_WEIGHT.
         assert sum(call["weights"]) == MAX_WEIGHT
+        # Both miners present in the vector; demand far exceeds the
+        # tiny pool so weights renorm and burn drops to dust.
+        assert {0, 1} <= set(call["uids"])
 
         # Idempotency: a second tick should not re-process.
         more = validator.process_once()
@@ -278,7 +291,13 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
 
         # The local mirror should still contain the epoch directory.
         epoch_dir = os.path.join(str(tmp_path), "epoch=7")
-        for name in ("raw.jsonl.zst", "aggregated.jsonl", "gateway_keys.json", "_FINALIZED"):
+        for name in (
+            "raw.jsonl.zst",
+            "aggregated.jsonl",
+            "gateway_keys.json",
+            "epoch_summary.json",
+            "_FINALIZED",
+        ):
             assert os.path.exists(os.path.join(epoch_dir, name)), f"missing: {name}"
 
 
@@ -293,28 +312,7 @@ def test_validator_restart_does_not_resubmit(tmp_path: pathlib.Path) -> None:
         records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
         _populate_epoch(s3, epoch_id=7, records=records)
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-            use_emission_cap=False,
-            alpha_emission_per_epoch=Decimal("100"),
-            subnet_owner_uid=0,
-        )
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
 
         # First process: a fresh validator submits epoch 7.
@@ -368,30 +366,25 @@ def test_validator_skips_submission_on_verifier_failure(tmp_path: pathlib.Path) 
                 {"schema_version": "1", "epoch_id": 9, "gateways": {"gw-test": []}}
             ).encode("utf-8"),
         )
+        summary = {
+            "epoch_id": 9,
+            "finalized_at": "2026-05-27T12:00:00Z",
+            "alpha_price_in_tao": "0.05",
+            "tao_price_usd": "10",
+            "alpha_price_usd": "0.50",
+            "price_block_height": 1,
+            "price_alpha_source": "chain",
+            "price_tao_usd_source": "taostats",
+            "finalizer_version": "test",
+        }
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=f"{finalized_prefix}epoch_summary.json",
+            Body=json.dumps(summary).encode("utf-8"),
+        )
         s3.put_object(Bucket=BUCKET, Key=f"{finalized_prefix}_FINALIZED", Body=b"")
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-            use_emission_cap=False,
-            alpha_emission_per_epoch=Decimal("100"),
-            subnet_owner_uid=0,
-        )
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(config, mirror, submitter, miner_uid_lookup={miner_a: 0})
@@ -403,13 +396,8 @@ def test_validator_skips_submission_on_verifier_failure(tmp_path: pathlib.Path) 
         assert submitter.calls == []
 
 
-def test_validator_zero_revenue_epoch_cap_path_submits_burn(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Cap-path epoch with only failed (zero-earnings) traffic must submit
-    weights — full pool routes to the burn slot — and mark the epoch
-    processed only after submission succeeds.
-    """
+def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) -> None:
+    """Zero billing => burn_uid gets the entire MAX_WEIGHT."""
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -422,36 +410,9 @@ def test_validator_zero_revenue_epoch_cap_path_submits_burn(
             _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a, success=False),
             _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b, success=False),
         ]
-        _populate_epoch(
-            s3,
-            epoch_id=13,
-            records=records,
-            with_epoch_summary=True,
-            alpha_price_usd="0.50",
-        )
+        _populate_epoch(s3, epoch_id=13, records=records, alpha_price_usd="0.50")
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-            use_emission_cap=True,
-            alpha_emission_per_epoch=Decimal("1000000"),
-            subnet_owner_uid=99,
-        )
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(
@@ -463,7 +424,6 @@ def test_validator_zero_revenue_epoch_cap_path_submits_burn(
 
         outcomes = validator.process_once()
         assert len(outcomes) == 1
-        assert outcomes[0].used_emission_cap is True
         assert outcomes[0].weights_submitted
 
         assert len(submitter.calls) == 1
@@ -495,36 +455,9 @@ def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
             _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a),
             _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
         ]
-        _populate_epoch(
-            s3,
-            epoch_id=23,
-            records=records,
-            with_epoch_summary=True,
-            alpha_price_usd="0.50",
-        )
+        _populate_epoch(s3, epoch_id=23, records=records, alpha_price_usd="0.50")
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-            use_emission_cap=True,
-            alpha_emission_per_epoch=Decimal("1000000"),
-            subnet_owner_uid=99,
-        )
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(
@@ -551,70 +484,8 @@ def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
         assert 23 in validator._processed
 
 
-def test_validator_zero_revenue_epoch_legacy_path_skips_submission(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Legacy path with zero earnings skips submission entirely.
-
-    The SDK drops sum-zero vectors before building the extrinsic, so
-    submitting all-zeros would NOT clear prior weights. Explicit skip +
-    log surfaces the limitation.
-    """
-    with mock_aws():
-        s3 = boto3.client("s3", region_name="us-east-1")
-        s3.create_bucket(Bucket=BUCKET)
-
-        miner_a = "5Ehm" + "A" * 44
-        miner_b = "5Ehm" + "B" * 44
-
-        records = [
-            _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a, success=False),
-            _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b, success=False),
-        ]
-        _populate_epoch(s3, epoch_id=14, records=records)
-
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-            use_emission_cap=False,
-            alpha_emission_per_epoch=Decimal("100"),
-            subnet_owner_uid=0,
-        )
-        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
-        submitter = MockSubmitter()
-        validator = Validator(
-            config,
-            mirror,
-            submitter,
-            miner_uid_lookup={miner_a: 0, miner_b: 1},
-        )
-
-        outcomes = validator.process_once()
-        assert len(outcomes) == 1
-        assert outcomes[0].used_emission_cap is False
-        assert outcomes[0].weights_submitted is False
-        assert submitter.calls == []
-
-
-def test_validator_uses_emission_cap_when_flag_on_and_summary_present(
-    tmp_path: pathlib.Path,
-) -> None:
-    """End-to-end cap+burn: summary present + flag on -> burn slot in submission."""
+def test_validator_submits_cap_burn_weights(tmp_path: pathlib.Path) -> None:
+    """End-to-end cap+burn: summary present -> burn slot in submission."""
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -626,36 +497,9 @@ def test_validator_uses_emission_cap_when_flag_on_and_summary_present(
             _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a),
             _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
         ]
-        _populate_epoch(
-            s3,
-            epoch_id=11,
-            records=records,
-            with_epoch_summary=True,
-            alpha_price_usd="0.50",
-        )
+        _populate_epoch(s3, epoch_id=11, records=records, alpha_price_usd="0.50")
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-            use_emission_cap=True,
-            alpha_emission_per_epoch=Decimal("1000000"),
-            subnet_owner_uid=99,
-        )
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(
@@ -667,7 +511,6 @@ def test_validator_uses_emission_cap_when_flag_on_and_summary_present(
 
         outcomes = validator.process_once()
         assert len(outcomes) == 1
-        assert outcomes[0].used_emission_cap is True
         assert outcomes[0].weights_submitted
 
         call = submitter.calls[0]
@@ -678,8 +521,8 @@ def test_validator_uses_emission_cap_when_flag_on_and_summary_present(
 
 
 def _populate_epoch_with_malformed_summary(s3: Any, epoch_id: int, records: list[dict]) -> None:
-    """Same as `_populate_epoch` but writes a structurally-invalid summary."""
-    _populate_epoch(s3, epoch_id, records, with_epoch_summary=False)
+    """Populate an epoch but overwrite epoch_summary.json with garbage."""
+    _populate_epoch(s3, epoch_id, records)
     s3.put_object(
         Bucket=BUCKET,
         Key=f"{PREFIX}/finalized/epoch={epoch_id}/epoch_summary.json",
@@ -687,68 +530,9 @@ def _populate_epoch_with_malformed_summary(s3: Any, epoch_id: int, records: list
     )
 
 
-def test_legacy_path_ignores_malformed_epoch_summary(tmp_path: pathlib.Path) -> None:
-    """When USE_EMISSION_CAP=false a malformed epoch_summary.json must not
-    fail the epoch — the legacy scoring path doesn't read it.
-    """
-    with mock_aws():
-        s3 = boto3.client("s3", region_name="us-east-1")
-        s3.create_bucket(Bucket=BUCKET)
-
-        miner_a = "5Ehm" + "A" * 44
-        miner_b = "5Ehm" + "B" * 44
-        records = [
-            _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a),
-            _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
-        ]
-        _populate_epoch_with_malformed_summary(s3, epoch_id=21, records=records)
-
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-            use_emission_cap=False,
-            alpha_emission_per_epoch=Decimal("100"),
-            subnet_owner_uid=0,
-        )
-        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
-        submitter = MockSubmitter()
-        validator = Validator(
-            config,
-            mirror,
-            submitter,
-            miner_uid_lookup={miner_a: 0, miner_b: 1},
-        )
-
-        outcomes = validator.process_once()
-        assert len(outcomes) == 1
-        assert outcomes[0].verifier_ok
-        assert outcomes[0].weights_submitted
-        assert outcomes[0].used_emission_cap is False
-
-        call = submitter.calls[0]
-        assert set(call["uids"]) == {0, 1}
-        assert sum(call["weights"]) == MAX_WEIGHT
-
-
-def test_cap_path_propagates_malformed_epoch_summary(tmp_path: pathlib.Path) -> None:
-    """When USE_EMISSION_CAP=true a malformed epoch_summary.json must raise —
-    silent fallback would mis-weight an epoch the operator opted in to cap.
-    """
+def test_propagates_malformed_epoch_summary(tmp_path: pathlib.Path) -> None:
+    """A malformed epoch_summary.json must raise — the cap path can't
+    proceed without a valid alpha_price_usd."""
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -757,28 +541,7 @@ def test_cap_path_propagates_malformed_epoch_summary(tmp_path: pathlib.Path) -> 
         records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
         _populate_epoch_with_malformed_summary(s3, epoch_id=22, records=records)
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-            use_emission_cap=True,
-            alpha_emission_per_epoch=Decimal("100"),
-            subnet_owner_uid=99,
-        )
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(

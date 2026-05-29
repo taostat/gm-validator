@@ -21,13 +21,6 @@ def _int_env(name: str, default: int) -> int:
     return int(value)
 
 
-def _bool_env(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _decimal_env(name: str, default: Decimal) -> Decimal:
     value = os.environ.get(name)
     if value is None:
@@ -76,13 +69,6 @@ class ValidatorConfig:
     # Observability.
     metrics_port: int
 
-    # Emission cap + burn (bm pattern).
-    # When True, scoring caps total miner alpha at
-    # ``alpha_emission_per_epoch * MINER_EMISSION_PCT * alpha_price_usd``
-    # and routes any unconsumed pool to ``subnet_owner_uid`` as burn
-    # weight. Requires ``epoch_summary.json`` in S3; legacy epochs
-    # without it fall back to the naive normalisation regardless.
-    use_emission_cap: bool
     # Full-epoch alpha emission. Static configuration knob until a
     # follow-up pulls it from the chain dynamically.
     alpha_emission_per_epoch: Decimal
@@ -96,20 +82,8 @@ class ValidatorConfig:
         """Build from environment variables.
 
         Raises:
-            ValueError: A required environment variable is missing, or
-                ``USE_EMISSION_CAP=true`` was set without ``SUBNET_OWNER_UID``.
+            ValueError: A required environment variable is missing.
         """
-        use_emission_cap_val = _bool_env("USE_EMISSION_CAP", default=False)
-        subnet_owner_uid_raw = os.environ.get("SUBNET_OWNER_UID")
-        if use_emission_cap_val and not subnet_owner_uid_raw:
-            raise ValueError(
-                "USE_EMISSION_CAP=true requires SUBNET_OWNER_UID to be set explicitly. "
-                "Set SUBNET_OWNER_UID to the subnet-owner UID for emission burn. "
-                "(If you don't have one yet, leave USE_EMISSION_CAP=false until you do.)"
-            )
-        # When cap is disabled the default is unused — parse leniently so
-        # disabled deploys don't fail at boot.
-        subnet_owner_uid_val = int(subnet_owner_uid_raw) if subnet_owner_uid_raw else 0
         return cls(
             s3_bucket=_require_env("S3_BUCKET"),
             s3_prefix=os.environ.get("S3_PREFIX", "v1").strip("/"),
@@ -130,9 +104,8 @@ class ValidatorConfig:
             verifier_sample_per_tuple=_int_env("VERIFIER_SAMPLE_PER_TUPLE", 16),
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),
-            use_emission_cap=use_emission_cap_val,
             alpha_emission_per_epoch=_decimal_env("ALPHA_EMISSION_PER_EPOCH", Decimal("100")),
-            subnet_owner_uid=subnet_owner_uid_val,
+            subnet_owner_uid=int(_require_env("SUBNET_OWNER_UID")),
         )
 
     def finalized_prefix(self, epoch_id: int) -> str:

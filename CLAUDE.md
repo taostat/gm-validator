@@ -17,8 +17,8 @@ earnings scores, normalizes them to weights, and calls
 - `src/gm_validator/main.py` — entry point; wires S3 mirror, submitter, miner-uid lookup
 - `src/gm_validator/validator.py` — `Validator.process_once()`: discover finalized epochs, mirror artifacts locally, run verifier subprocess, score, submit
 - `src/gm_validator/s3_mirror.py` — `S3Mirror`: syncs S3 epoch artifacts to a local directory; prunes old epochs
-- `src/gm_validator/scoring.py` — `score()` + `compute_weights()`: per-miner totals plus the legacy or emission-cap weight path; emits a u16 vector summing to `MAX_WEIGHT`
-- `src/gm_validator/alpha_economics.py` — `compute_epoch_weights()` (cap + scale) + `normalize_weights()` (float→u16, burn slot absorbs floor-rounding dust); ported from bm-validator
+- `src/gm_validator/scoring.py` — `score()` + `compute_weights()`: per-miner totals → u16 vector summing to `MAX_WEIGHT`; cap+burn pipeline only
+- `src/gm_validator/alpha_economics.py` — `compute_epoch_weights()` (per-miner `consumed_usd / pool_usd`) + `normalize_weights()` (float→u16, renorms when sum > 1, burn slot absorbs the residue when sum < 1); ported from bm-validator
 - `src/gm_validator/epoch_summary.py` — Pydantic model + S3 reader for the finalizer's per-epoch `epoch_summary.json` (alpha USD price snapshot)
 - `src/gm_validator/verifier.py` — subprocess wrapper for the `gm-verifier` binary
 - `src/gm_validator/bittensor_adapter.py` — `Submitter` protocol; `MockSubmitter` for testing
@@ -82,9 +82,8 @@ cargo build --release -p gm-verifier
 | `BITTENSOR_MOCK` | `0` | Use `MockSubmitter` (records submissions in memory) |
 | `GM_VERIFIER_BIN` | `gm-verifier` | Path to the verifier binary |
 | `VERIFIER_SAMPLE_PER_TUPLE` | `16` | Number of records sampled per `(miner, product)` tuple |
-| `USE_EMISSION_CAP` | `0` | When true, apply the bm-style cap+burn from `epoch_summary.json`. Falls back to the naive normalisation when the summary artifact is absent (legacy epochs). |
-| `ALPHA_EMISSION_PER_EPOCH` | `100` | Full-epoch alpha emission, used only by the cap path. Static knob until a follow-up pulls it from chain. |
-| `SUBNET_OWNER_UID` | `0` | Uid that absorbs the burn slot + floor-rounding dust under the cap path. Static knob until a follow-up resolves it from `SubnetOwnerHotkey`. |
+| `ALPHA_EMISSION_PER_EPOCH` | `100` | Full-epoch alpha emission, the pool denominator. Static knob until a follow-up pulls it from chain. |
+| `SUBNET_OWNER_UID` | required | Uid that absorbs the burn slot + floor-rounding dust. Static knob until a follow-up resolves it from `SubnetOwnerHotkey`. |
 
 ## Key conventions
 
