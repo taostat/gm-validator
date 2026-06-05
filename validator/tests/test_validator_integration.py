@@ -53,12 +53,10 @@ def _record(rid: str, miner: str, success: bool = True) -> dict[str, Any]:
         "gateway_id": "gw-test",
         "miner_id": miner,
         "product": {"provider": "anthropic", "model": "claude-sonnet-4-6"},
-        "miner_price": {
-            "price_id": "mp-v1-7-1",
-            "dimensions": {
-                "input_per_mtok_ndollars": 1_000_000_000,
-                "output_per_mtok_ndollars": 5_000_000_000,
-            },
+        "miner_discount_bp": 0,
+        "effective_price_ndollars": {
+            "input_per_mtok_ndollars": 1_000_000_000,
+            "output_per_mtok_ndollars": 5_000_000_000,
         },
         "usage": usage,
         "modifiers": {},
@@ -89,10 +87,13 @@ def _aggregate(records: list[dict], epoch_id: int) -> list[dict]:
         failed = [r for r in bucket if not r.get("success")]
         in_tokens = sum(r["usage"].get("input_tokens", 0) for r in success)
         out_tokens = sum(r["usage"].get("output_tokens", 0) for r in success)
-        # Per-record cost: tokens * miner_price / 1e6.
+        # Per-record cost: tokens * effective_price_ndollars / 1e6
+        # (post-PR-D: the gateway materialises post-discount per-Mtok
+        # prices onto every record, and the verifier re-derives payout
+        # directly from that block — `miner_price.dimensions` is gone).
         earnings = 0
         for r in success:
-            dims = r["miner_price"]["dimensions"]
+            dims = r["effective_price_ndollars"]
             earnings += (
                 r["usage"]["input_tokens"] * int(dims["input_per_mtok_ndollars"]) // 1_000_000
             )

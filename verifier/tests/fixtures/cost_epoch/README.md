@@ -16,7 +16,7 @@ not match.
 - `aggregated.jsonl` — one aggregated row with **correct** totals;
   `verify` exits 0.
 - `aggregated_tampered.jsonl` — identical, but `earnings_ndollars` is
-  inflated from `1500000000000` to `9900000000000` while
+  inflated from `1500000000` to `9900000000` while
   `successful_requests`, `failed_requests`, `raw_record_count`, and
   `raw_hash` stay valid. `verify` must exit non-zero, proving the cost
   check (not the count or hash check) caught the tamper.
@@ -26,15 +26,20 @@ The test stages `aggregated.jsonl` from either source into a temp dir.
 
 ## Re-derivation by hand
 
-- record A: `input_tokens` 1,000,000 at $1/Mtok (`1e12` nUSD/Mtok)
-  = `1e12`; `batch_bps` 5000 → `5e11`. Surcharge: count 2 × `1e10`
-  = `2e10`.
-- record B: `output_tokens` 500,000 at $2/Mtok (`2e12` nUSD/Mtok)
-  = `1e12`; no modifiers, no surcharges.
+Post-PR-D, each record carries the gateway's already-post-discount
+per-Mtok prices under `effective_price_ndollars`; the cost re-derivation
+multiplies `usage × effective_price / 1_000_000` per dimension. The
+three fixture records carry `miner_discount_bp = 0` so the effective
+prices equal retail and the worked example stays a clean round number.
+
+- record A: `input_tokens` 1,000,000 at `1e9` nUSD/Mtok (= $1/Mtok)
+  = `1e9`; `batch_bps` 5000 → `5e8`. Surcharge: count 2 × `1e7` = `2e7`.
+- record B: `output_tokens` 500,000 at `2e9` nUSD/Mtok (= $2/Mtok)
+  = `1e9`; no modifiers, no surcharges.
 - record C: `success: false` → contributes 0 to both totals.
 
-Totals: `earnings_ndollars = 1500000000000`,
-`surcharge_ndollars = 20000000000`.
+Totals: `earnings_ndollars = 1500000000`,
+`surcharge_ndollars = 20000000`.
 
 ## `raw_hash`
 

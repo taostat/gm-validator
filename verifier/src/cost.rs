@@ -9,13 +9,25 @@
 //! uses so the verifier can re-derive both totals from the raw records
 //! and fail the epoch on any mismatch.
 //!
+//! The miner-payout math mirrors the gateway's per-dimension
+//! settlement under the pct-discount pricing model
+//! (`docs/plans/miner-pct-discount-pricing.md` §4 + §9): the gateway
+//! materialises the post-discount per-Mtok prices onto every record as
+//! `effective_price_ndollars`, and this module simply re-derives
+//! `Σ floor(usage[dim] × effective_price[dim] / 1_000_000)` from that
+//! block. There is no separate miner-price block: the field
+//! `miner_discount_bp` is carried for transparency / audit only, while
+//! `effective_price_ndollars` is the byte-for-byte source of truth for
+//! payout.
+//!
 //! Parity requirements (see `docs/contracts/epoch-artifacts.md`,
 //! `docs/contracts/nano-dollar-denomination.md`, and
 //! `docs/contracts/validator-log-record.md`):
 //!
 //! - All amounts are nano-dollars, integers only — no floating point.
-//! - `per_token = Σ usage[dim] × price[dim] / 1_000_000`, where `/` is
-//!   floor division applied **per dimension** before summing.
+//! - `per_token = Σ usage[dim] × effective_price[dim] / 1_000_000`,
+//!   where `/` is floor division applied **per dimension** before
+//!   summing.
 //! - Modifiers are integer basis points (`10_000` == 1.0×) applied
 //!   sequentially in the fixed order `batch_bps`, `priority_bps`,
 //!   `residency_bps`, each as `value × bps / 10_000` (floor).
@@ -23,8 +35,7 @@
 //!   modifiers. Each entry is either `count × unit_ndollars` or
 //!   `container_hours_bps × per_hour_ndollars / 10_000` (floor).
 //! - `success == false` records contribute zero to both totals.
-//! - nano-dollar amounts in the JSON are decimal strings (`U64String`),
-//!   token counts are JSON numbers.
+//! - All nano-dollar amounts and token counts are JSON numbers (`U64`).
 
 use serde_json::Value;
 
@@ -32,7 +43,7 @@ use crate::errors::VerifierError;
 use crate::record::ValidatorLogRecord;
 
 /// Token dimensions tracked for earnings, paired with their nano-dollar
-/// price-per-million-token field name in `miner_price.dimensions`.
+/// price-per-million-token field name in `effective_price_ndollars`.
 ///
 /// Order mirrors `TOKEN_DIMENSIONS` in the finalizer's `aggregation.py`.
 /// Because every per-dimension term is floored independently before
@@ -96,7 +107,7 @@ pub struct RecordCost {
 ///
 /// Returns [`VerifierError::MalformedRecord`] when `success` is missing,
 /// or when a numeric field is present but cannot be parsed as a
-/// non-negative integer (token count, nano-dollar string, or basis
+/// non-negative integer (token count, nano-dollar amount, or basis
 /// points).
 pub fn compute_record_cost(record: &ValidatorLogRecord) -> Result<RecordCost, VerifierError> {
     if !record.success()? {
@@ -105,8 +116,7 @@ pub fn compute_record_cost(record: &ValidatorLogRecord) -> Result<RecordCost, Ve
 
     let value = &record.value;
     let dimensions = value
-        .get("miner_price")
-        .and_then(|p| p.get("dimensions"))
+        .get("effective_price_ndollars")
         .and_then(Value::as_object);
     let usage = value.get("usage").and_then(Value::as_object);
 
@@ -266,10 +276,10 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 1000000000,
                     "output_per_mtok_ndollars": 0
-                }},
+                },
                 "usage": {"input_tokens": 1000000, "output_tokens": 0},
                 "modifiers": {}, "surcharges": {}
             }"#,
@@ -288,10 +298,10 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 999,
                     "output_per_mtok_ndollars": 999
-                }},
+                },
                 "usage": {"input_tokens": 1, "output_tokens": 1},
                 "modifiers": {}, "surcharges": {}
             }"#,
@@ -306,9 +316,9 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 1000000
-                }},
+                },
                 "usage": {"input_tokens": 7},
                 "modifiers": {"batch_bps": 3333},
                 "surcharges": {}
@@ -324,11 +334,11 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 2800000000,
                     "output_per_mtok_ndollars": 14000000000,
                     "cache_read_per_mtok_ndollars": 280000000
-                }},
+                },
                 "usage": {
                     "input_tokens": 812,
                     "output_tokens": 1456,
@@ -346,9 +356,9 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 1000000000
-                }},
+                },
                 "usage": {"input_tokens": 1000000},
                 "modifiers": {"batch_bps": 5000},
                 "surcharges": {}
@@ -364,9 +374,9 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 1000000000
-                }},
+                },
                 "usage": {"input_tokens": 1000000},
                 "modifiers": {"priority_bps": 3333, "batch_bps": 7777},
                 "surcharges": {}
@@ -382,9 +392,9 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 1000000000
-                }},
+                },
                 "usage": {"input_tokens": 1000000},
                 "modifiers": {"batch_bps": 5000},
                 "surcharges": {"anthropic_web_search": {
@@ -402,7 +412,7 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {}},
+                "effective_price_ndollars": {},
                 "usage": {},
                 "modifiers": {},
                 "surcharges": {"container": {
@@ -419,9 +429,9 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": false,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 1000000000
-                }},
+                },
                 "usage": {"input_tokens": 999999},
                 "modifiers": {},
                 "surcharges": {"x": {"count": 9, "unit_ndollars": 0}}
@@ -435,10 +445,10 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 1000000000,
                     "long_context_input_per_mtok_ndollars": 2000000000
-                }},
+                },
                 "usage": {"input_tokens": 1000000, "long_context_tier": true},
                 "modifiers": {}, "surcharges": {}
             }"#,
@@ -451,9 +461,9 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 1000000000
-                }},
+                },
                 "usage": {"input_tokens": 1000000, "long_context_tier": true},
                 "modifiers": {}, "surcharges": {}
             }"#,
@@ -466,9 +476,9 @@ mod tests {
         let cost = cost_of(
             r#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": 1000000000
-                }},
+                },
                 "usage": {"input_tokens": 1000000, "audio_input_tokens": 5000},
                 "modifiers": {}, "surcharges": {}
             }"#,
@@ -483,9 +493,9 @@ mod tests {
         let record = parse_record(
             br#"{
                 "success": true,
-                "miner_price": {"dimensions": {
+                "effective_price_ndollars": {
                     "input_per_mtok_ndollars": "1000000000"
-                }},
+                },
                 "usage": {"input_tokens": 1000000},
                 "modifiers": {}, "surcharges": {}
             }"#,
@@ -495,5 +505,65 @@ mod tests {
             compute_record_cost(&record),
             Err(VerifierError::MalformedRecord(_))
         ));
+    }
+
+    /// At a non-round discount (777 bp = 7.77%) the per-dimension
+    /// effective prices floor independently. The verifier's earnings
+    /// re-derivation against the materialised `effective_price_ndollars`
+    /// block must equal a hand-computed
+    /// `Σ floor(T_X × floor(R_X × (10_000 − bp) / 10_000) / 1_000_000)`,
+    /// which is exactly the byte-for-byte invariant the gateway test
+    /// `miner_payout_matches_per_dimension_finalizer_recompute`
+    /// (`gateway/src/money/settle.rs`) enforces on the producer side.
+    ///
+    /// The retail block (Sonnet-class: $3/$15 input/output, $0.30/Mtok
+    /// `cache_read`, $3.75/Mtok `cache_write_5m`) and usage counts match
+    /// the gateway test exactly so any drift between the two sides
+    /// surfaces here.
+    #[test]
+    fn earnings_match_per_dimension_finalizer_recompute_at_non_round_discount() {
+        // Retail per-Mtok prices (nUSD); same numbers as the gateway's
+        // `sonnet_retail()` post-PR-D.
+        let r_in: u128 = 3_000_000_000;
+        let r_out: u128 = 15_000_000_000;
+        let r_cache_read: u128 = 300_000_000;
+        let r_cache_write_5m: u128 = 3_750_000_000;
+        let bp: u128 = 777;
+        let factor: u128 = 10_000 - bp;
+        let apply = |r: u128| r * factor / 10_000;
+        let eff_in = apply(r_in);
+        let eff_out = apply(r_out);
+        let eff_cache_read = apply(r_cache_read);
+        let eff_cache_write_5m = apply(r_cache_write_5m);
+
+        let t_in: u128 = 1357;
+        let t_out: u128 = 2468;
+        let t_cache_read: u128 = 369;
+        let t_cache_write_5m: u128 = 112;
+
+        let expected = t_in * eff_in / 1_000_000
+            + t_out * eff_out / 1_000_000
+            + t_cache_read * eff_cache_read / 1_000_000
+            + t_cache_write_5m * eff_cache_write_5m / 1_000_000;
+
+        let cost = cost_of(&format!(
+            r#"{{
+                "success": true,
+                "effective_price_ndollars": {{
+                    "input_per_mtok_ndollars": {eff_in},
+                    "output_per_mtok_ndollars": {eff_out},
+                    "cache_read_per_mtok_ndollars": {eff_cache_read},
+                    "cache_write_5m_per_mtok_ndollars": {eff_cache_write_5m}
+                }},
+                "usage": {{
+                    "input_tokens": {t_in},
+                    "output_tokens": {t_out},
+                    "cache_read_tokens": {t_cache_read},
+                    "cache_write_5m_tokens": {t_cache_write_5m}
+                }},
+                "modifiers": {{}}, "surcharges": {{}}
+            }}"#,
+        ));
+        assert_eq!(cost.earnings_ndollars, expected);
     }
 }

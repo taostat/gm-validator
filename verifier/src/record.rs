@@ -144,12 +144,10 @@ mod tests {
             "gateway_id": "gw-prod-1",
             "miner_id": "5EhmFv4P1qg6yQ3xPzGn7sJ8a1KdR2bU9N4eC0wY5T6dQJ8",
             "product": { "provider": "anthropic", "model": "claude-sonnet-4-6" },
-            "miner_price": {
-                "price_id": "mp-v1-142-0017",
-                "dimensions": {
-                    "input_per_mtok_ndollars": 2800000,
-                    "output_per_mtok_ndollars": 14000000
-                }
+            "miner_discount_bp": 0,
+            "effective_price_ndollars": {
+                "input_per_mtok_ndollars": 2800000,
+                "output_per_mtok_ndollars": 14000000
             },
             "usage": { "input_tokens": 812, "output_tokens": 1456 },
             "modifiers": {},
