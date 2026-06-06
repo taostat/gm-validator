@@ -84,8 +84,6 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "bittensor_wallet_name": None,
         "bittensor_wallet_hotkey": None,
         "bittensor_mock": True,
-        "verifier_bin": "gm-verifier",
-        "verifier_sample_per_tuple": 0,
         "poll_interval_secs": 60,
         "metrics_port": 9092,
         "subnet_owner_uid": 0,

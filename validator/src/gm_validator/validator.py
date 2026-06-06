@@ -4,16 +4,22 @@ Loop:
 
 1. Discover finalized epoch ids in S3.
 2. For each not yet processed:
-   a. Mirror artifacts locally (raw, aggregated, gateway_keys,
-      _FINALIZED, epoch_summary.json).
-   b. Invoke `gm-verifier verify`. On failure: alert + skip submission.
-   c. Compute per-miner scores from `aggregated.jsonl`.
-   d. Build a u16 weight vector via cap+burn — miner i gets
+   a. Mirror artifacts locally (`aggregated.jsonl`,
+      `epoch_summary.json`, `_FINALIZED`).
+   b. Compute per-miner scores from `aggregated.jsonl`.
+   c. Build a u16 weight vector via cap+burn — miner i gets
       ``consumed_usd_i / pool_usd``; residue routes to the subnet-owner
       uid as burn weight.
-   e. Submit via the configured `Submitter`.
-   f. Mark the epoch processed.
+   d. Submit via the configured `Submitter`.
+   e. Mark the epoch processed.
 3. Prune local mirrors older than the retention window.
+
+The validator does not re-derive cost or re-verify `raw_hash` /
+signatures. The gm-operated epoch-finalizer is the single source of
+truth for cost re-derivation, and validators are operated by external
+parties — rolling out pricing-math changes through them is expensive,
+so the artifact set (`aggregated.jsonl` + `epoch_summary.json`) is
+treated as authoritative.
 """
 
 from __future__ import annotations
@@ -38,7 +44,6 @@ from gm_validator.scoring import (
     load_aggregated,
     score,
 )
-from gm_validator.verifier import VerifierResult, verify_epoch
 
 LOGGER = logging.getLogger(__name__)
 
@@ -48,7 +53,6 @@ class EpochOutcome:
     """Per-epoch processing result, surfaced for tests + metrics."""
 
     epoch_id: int
-    verifier_ok: bool
     weights_submitted: bool
     miner_count: int
     total_ndollars: int
@@ -116,20 +120,6 @@ class Validator:
 
     def _process_epoch(self, epoch_id: int) -> EpochOutcome:
         mirror_dir = self._mirror.mirror_epoch(epoch_id)
-        verifier_result = self._verify(epoch_id, mirror_dir)
-        if not verifier_result.ok:
-            LOGGER.error(
-                "epoch %d: verifier failed (stderr=%s); skipping weight submission",
-                epoch_id,
-                verifier_result.stderr.strip(),
-            )
-            return EpochOutcome(
-                epoch_id=epoch_id,
-                verifier_ok=False,
-                weights_submitted=False,
-                miner_count=0,
-                total_ndollars=0,
-            )
 
         rows = load_aggregated(aggregated_path(mirror_dir))
         scores = score(rows)
@@ -163,16 +153,7 @@ class Validator:
 
         return EpochOutcome(
             epoch_id=epoch_id,
-            verifier_ok=True,
             weights_submitted=submitted,
             miner_count=len(scores),
             total_ndollars=total,
-        )
-
-    def _verify(self, epoch_id: int, mirror_dir: str) -> VerifierResult:
-        return verify_epoch(
-            verifier_bin=self._config.verifier_bin,
-            epoch_id=epoch_id,
-            mirror_dir=mirror_dir,
-            sample_per_tuple=self._config.verifier_sample_per_tuple,
         )

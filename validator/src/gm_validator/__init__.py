@@ -1,19 +1,18 @@
 """gm validator package.
 
-Per `workstreams.md W6` and `docs/contracts/epoch-artifacts.md`:
+Per `docs/contracts/epoch-artifacts.md`:
 
 1. Watch `s3://gm-validator-logs/v1/finalized/` for new `_FINALIZED`
    markers.
-2. On detection: fetch `aggregated.jsonl`, `gateway_keys.json`, and
-   `raw.jsonl.zst` to a local mirror.
-3. Invoke the Rust `gm-verifier` binary (subprocess) for full-epoch
-   verification: it recomputes `raw_hash` per `(miner_id, product)`
-   tuple, verifies a sample of ed25519 signatures against
-   `gateway_keys.json`. Mismatches => alert + skip weight submission.
-4. Compute per-miner score:
+2. On detection: fetch the artifact set (`aggregated.jsonl`,
+   `epoch_summary.json`, etc.) to a local mirror. The gm-operated
+   finalizer has already cost-derived each row; the validator treats
+   those numbers as authoritative.
+3. Compute per-miner score:
    sum of `earnings_ndollars + surcharge_ndollars` across products.
-5. Convert to subnet alpha at current exchange rate.
-6. Submit weights via the configured Bittensor adapter (a mock during
+4. Convert to subnet alpha at the chain-snapshot price in
+   `epoch_summary.json`.
+5. Submit weights via the configured Bittensor adapter (a mock during
    build; real `bittensor-py` `subtensor.set_weights()` in deploy).
 """
 
