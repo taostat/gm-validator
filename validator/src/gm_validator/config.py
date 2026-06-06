@@ -34,7 +34,7 @@ class ValidatorConfig:
     # available. Env: GM_VALIDATOR_S3_ANONYMOUS (default false).
     s3_anonymous: bool
 
-    # Local mirror for the gm-verifier subprocess.
+    # Local mirror for finalized epoch artifacts.
     local_mirror_dir: str
     # How many of the most-recent epoch mirrors to keep on disk; older
     # ones are pruned each tick. Env: MIRROR_RETENTION_EPOCHS.
@@ -50,10 +50,6 @@ class ValidatorConfig:
     bittensor_wallet_name: str | None
     bittensor_wallet_hotkey: str | None
     bittensor_mock: bool
-
-    # Verifier subprocess.
-    verifier_bin: str
-    verifier_sample_per_tuple: int
 
     # Polling / timing.
     poll_interval_secs: int
@@ -89,8 +85,6 @@ class ValidatorConfig:
             bittensor_wallet_name=os.environ.get("BITTENSOR_WALLET_NAME"),
             bittensor_wallet_hotkey=os.environ.get("BITTENSOR_WALLET_HOTKEY"),
             bittensor_mock=os.environ.get("BITTENSOR_MOCK", "0") in {"1", "true", "True"},
-            verifier_bin=os.environ.get("GM_VERIFIER_BIN", "gm-verifier"),
-            verifier_sample_per_tuple=_int_env("VERIFIER_SAMPLE_PER_TUPLE", 16),
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),
             subnet_owner_uid=int(_require_env("SUBNET_OWNER_UID")),

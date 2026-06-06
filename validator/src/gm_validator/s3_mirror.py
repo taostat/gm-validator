@@ -2,15 +2,10 @@
 
 The validator does not stream artifacts on every request; instead it
 materialises a local mirror of
-`s3://{bucket}/{prefix}/finalized/epoch={N}/` for each new epoch, then
-invokes the `gm-verifier` subprocess against that directory. Reasons:
-
-- The Rust verifier needs file-path inputs (zstd decompression is
-  streaming over a file handle).
-- The mirror is a cheap audit log; operators can `gm-verifier verify
-  --epoch N --dir /var/cache/gm-validator/epoch=N` on demand.
-- A second run of `verify` against the same directory is a no-op,
-  giving us a free idempotency check.
+`s3://{bucket}/{prefix}/finalized/epoch={N}/` for each new epoch and
+reads the cost-derived rows out of it. The mirror doubles as a cheap
+on-disk audit log: operators can inspect any epoch the validator has
+processed by browsing `${LOCAL_MIRROR_DIR}/epoch=N/`.
 """
 
 from __future__ import annotations
@@ -23,9 +18,7 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 
 _ARTIFACTS = (
-    "raw.jsonl.zst",
     "aggregated.jsonl",
-    "gateway_keys.json",
     "epoch_summary.json",
     "_FINALIZED",
 )
@@ -72,8 +65,8 @@ class S3Mirror:
     def mirror_epoch(self, epoch_id: int) -> str:
         """Download every artifact for the epoch to a local directory.
 
-        Returns the local directory path, suitable as the `--dir` argument
-        to `gm-verifier verify`.
+        Returns the local directory path; the validator reads
+        ``aggregated.jsonl`` and ``epoch_summary.json`` from it.
         """
         local_dir = self._epoch_dir(epoch_id)
         os.makedirs(local_dir, exist_ok=True)

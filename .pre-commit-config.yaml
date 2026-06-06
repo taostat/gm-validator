@@ -12,21 +12,6 @@ repos:
       - id: mixed-line-ending
         args: ["--fix=lf"]
 
-  - repo: local
-    hooks:
-      - id: cargo-fmt
-        name: cargo fmt --all --check
-        entry: cargo fmt --all --check
-        language: system
-        files: \.rs$
-        pass_filenames: false
-      - id: cargo-clippy
-        name: cargo clippy --all-targets --all-features
-        entry: cargo clippy --all-targets --all-features -- -D warnings
-        language: system
-        files: \.rs$
-        pass_filenames: false
-
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.12
     hooks:
