@@ -64,15 +64,19 @@ class RealSubmitter:
         """
         import bittensor
 
+        from gm_validator.subtensor_connect import connect_subtensor
+
         self._netuid = netuid
         self._endpoint = endpoint
         try:
             self._wallet: Any = bittensor.Wallet(name=wallet_name, hotkey=wallet_hotkey)
             # Touch the hotkey so a missing/locked keyfile fails here.
             hotkey_ss58 = self._wallet.hotkey.ss58_address
-            self._subtensor: Any = (
-                bittensor.Subtensor(network=endpoint) if endpoint else bittensor.Subtensor()
-            )
+            # connect_subtensor retries transient endpoint failures (HTTP
+            # 429 from public testnet RPCs in particular) so a brief
+            # rate-limit window does not crash the pod into a tight
+            # restart loop.
+            self._subtensor: Any = connect_subtensor(endpoint)
         except Exception as exc:
             raise WeightSubmissionError(
                 f"failed to initialise bittensor wallet/subtensor "
