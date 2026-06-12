@@ -1,16 +1,15 @@
 """End-to-end validator integration.
 
 Populates a moto S3 bucket with synthesized finalized-epoch artifacts,
-points the Validator at it with a real `gm-verifier` binary, and
-asserts that:
+points the Validator at them, and asserts that:
 
-- the `gm-verifier` subprocess accepts the artifacts cleanly,
 - the MockSubmitter receives one `submit()` call per epoch,
-- the weights vector sums to 1.0,
+- the weights vector sums to ``MAX_WEIGHT``,
 - per-miner earnings match the synthesized inputs.
 
-The Rust verifier binary is built once via `cargo build` in conftest
-and located in `target/debug/`.
+The validator trusts the gm-operated finalizer's cost-derived rows;
+the artifact set is treated as authoritative and no re-derivation or
+hash/signature verification is performed.
 """
 
 from __future__ import annotations
@@ -19,20 +18,30 @@ import io
 import json
 import os
 import pathlib
-import subprocess
 from typing import Any
 
 import boto3
+import pytest
 import zstandard as zstd
 from moto import mock_aws
+from pydantic import ValidationError
 
+from gm_validator.alpha_economics import MAX_WEIGHT
 from gm_validator.bittensor_adapter import MockSubmitter
 from gm_validator.config import ValidatorConfig
+from gm_validator.epoch_summary import epoch_summary_path, load_epoch_summary
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.validator import Validator
 
 BUCKET = "gm-test-bucket"
 PREFIX = "v1"
+
+# Schema-valid placeholder for the aggregated row's `raw_hash` field.
+# The validator no longer verifies this value, so the contents are
+# irrelevant — but the field is required by the artifact schema so the
+# test fixture keeps emitting something well-formed (lower-case hex,
+# 64 chars).
+_PLACEHOLDER_RAW_HASH = "0" * 64
 
 
 def _record(rid: str, miner: str, success: bool = True) -> dict[str, Any]:
@@ -52,8 +61,8 @@ def _record(rid: str, miner: str, success: bool = True) -> dict[str, Any]:
         "miner_price": {
             "price_id": "mp-v1-7-1",
             "dimensions": {
-                "input_per_mtok_pdollars": "1000000000",
-                "output_per_mtok_pdollars": "5000000000",
+                "input_per_mtok_ndollars": 1_000_000_000,
+                "output_per_mtok_ndollars": 5_000_000_000,
             },
         },
         "usage": usage,
@@ -67,13 +76,10 @@ def _record(rid: str, miner: str, success: bool = True) -> dict[str, Any]:
 def _aggregate(records: list[dict], epoch_id: int) -> list[dict]:
     """Tiny aggregator for tests.
 
-    Mirrors `gm_epoch_finalizer.aggregation.aggregate` for the subset of
-    behaviour the integration test cares about. We do not call the
-    sibling repo's package because the gm-validator CI workflow only
-    checks out this repo. The aggregation contract is exercised end-to-
-    end in the gm repo's pytest suite (`tests/test_aggregation.py`); the
-    test here just needs `raw_hash` to match what the Rust verifier
-    computes — so we use `gm-verifier hash-fixture` for that.
+    Produces aggregated rows in the same shape the gm-finalizer emits —
+    cost-derived `earnings_ndollars` per `(miner_id, product)` bucket.
+    `raw_hash` is a schema placeholder; the validator no longer
+    verifies it.
     """
     by_tuple: dict[tuple[str, str, str], list[dict]] = {}
     for r in records:
@@ -90,51 +96,47 @@ def _aggregate(records: list[dict], epoch_id: int) -> list[dict]:
         for r in success:
             dims = r["miner_price"]["dimensions"]
             earnings += (
-                r["usage"]["input_tokens"] * int(dims["input_per_mtok_pdollars"]) // 1_000_000
+                r["usage"]["input_tokens"] * int(dims["input_per_mtok_ndollars"]) // 1_000_000
             )
             earnings += (
-                r["usage"]["output_tokens"] * int(dims["output_per_mtok_pdollars"]) // 1_000_000
+                r["usage"]["output_tokens"] * int(dims["output_per_mtok_ndollars"]) // 1_000_000
             )
-        raw_hash = _compute_raw_hash_via_verifier(bucket)
         rows.append(
             {
                 "epoch_id": epoch_id,
                 "miner_id": miner_id,
                 "product": {"provider": provider, "model": model},
                 "totals": {"input_tokens": in_tokens, "output_tokens": out_tokens},
-                "earnings_pdollars": str(earnings),
-                "surcharge_pdollars": "0",
+                "earnings_ndollars": str(earnings),
+                "surcharge_ndollars": "0",
                 "successful_requests": len(success),
                 "failed_requests": len(failed),
                 "raw_record_count": len(bucket),
-                "raw_hash": raw_hash,
+                "raw_hash": _PLACEHOLDER_RAW_HASH,
             }
         )
     return rows
 
 
-def _compute_raw_hash_via_verifier(records: list[dict]) -> str:
-    """Pipe a JSONL fixture through `gm-verifier hash-fixture`."""
-    bin_path = _verifier_bin()
-    import tempfile
+def _populate_epoch(
+    s3: Any,
+    epoch_id: int,
+    records: list[dict],
+    *,
+    alpha_price_usd: str = "0.50",
+    emissions_alpha: str | None = "100",
+) -> None:
+    """Populate an epoch with the full finalizer artifact set.
 
-    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-        for r in records:
-            f.write(json.dumps(r) + "\n")
-        path = f.name
-    try:
-        out = subprocess.run(  # noqa: S603 - args fully constructed from typed inputs
-            [bin_path, "hash-fixture", "--file", path],
-            capture_output=True,
-            check=True,
-            text=True,
-        )
-        return out.stdout.strip().splitlines()[-1]
-    finally:
-        os.unlink(path)
+    The validator only reads ``aggregated.jsonl`` and
+    ``epoch_summary.json`` (+ ``_FINALIZED`` as the readiness marker),
+    but the fixture writes the same files the gm finalizer publishes
+    so the moto bucket faithfully mirrors production.
 
-
-def _populate_epoch(s3: Any, epoch_id: int, records: list[dict]) -> None:
+    ``emissions_alpha`` is the chain-read field on
+    ``epoch_summary.json``; pass ``None`` to simulate a pre-chain-read
+    artifact for the deferral path.
+    """
     finalized_prefix = f"{PREFIX}/finalized/epoch={epoch_id}/"
 
     # raw.jsonl.zst
@@ -158,22 +160,49 @@ def _populate_epoch(s3: Any, epoch_id: int, records: list[dict]) -> None:
         Body=json.dumps(manifest).encode("utf-8"),
     )
 
+    summary: dict[str, object] = {
+        "epoch_id": epoch_id,
+        "finalized_at": "2026-05-27T12:00:00Z",
+        "alpha_price_in_tao": "0.05",
+        "tao_price_usd": "10",
+        "alpha_price_usd": alpha_price_usd,
+        "price_block_height": 1,
+        "price_alpha_source": "chain",
+        "price_tao_usd_source": "taostats",
+        "finalizer_version": "test",
+    }
+    if emissions_alpha is not None:
+        summary["emissions_alpha"] = emissions_alpha
+        summary["emissions_alpha_source"] = "chain"
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"{finalized_prefix}epoch_summary.json",
+        Body=json.dumps(summary).encode("utf-8"),
+    )
+
     # _FINALIZED (last)
     s3.put_object(Bucket=BUCKET, Key=f"{finalized_prefix}_FINALIZED", Body=b"")
 
 
-def _verifier_bin() -> str:
-    """Return the path to the freshly-built `gm-verifier` binary."""
-    repo_root = pathlib.Path(__file__).resolve().parents[2]
-    candidate = repo_root / "target" / "debug" / "gm-verifier"
-    if not candidate.exists():
-        # Build it on demand for ergonomic local runs.
-        subprocess.run(
-            ["cargo", "build", "--bin", "gm-verifier"],  # noqa: S607
-            cwd=str(repo_root),
-            check=True,
-        )
-    return str(candidate)
+def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
+    return ValidatorConfig(
+        s3_bucket=BUCKET,
+        s3_prefix=PREFIX,
+        s3_endpoint_url=None,
+        aws_region="us-east-1",
+        s3_anonymous=False,
+        local_mirror_dir=str(tmp_path),
+        mirror_retention_epochs=10,
+        processed_state_path=str(tmp_path / "processed.json"),
+        bittensor_netuid=42,
+        bittensor_endpoint=None,
+        bittensor_wallet_name=None,
+        bittensor_wallet_hotkey=None,
+        bittensor_mock=True,
+        poll_interval_secs=1,
+        metrics_port=9092,
+        subnet_owner_uid=99,
+    )
 
 
 def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
@@ -189,29 +218,12 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
             _record("01CCCCCCCCCCCCCCCCCCCCCCCC", miner_a),
         ]
-        _populate_epoch(s3, epoch_id=7, records=records)
+        # Smaller pool so the tiny per-record demand is still visible in
+        # the u16 weights — otherwise floor-rounding wipes the miner
+        # slots entirely.
+        _populate_epoch(s3, epoch_id=7, records=records, emissions_alpha="0.0001")
 
-        # Sample 0 means signatures are not checked (our records have
-        # placeholder signatures); raw_hash is still verified.
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-        )
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(
@@ -226,7 +238,6 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
         assert len(outcomes) == 1
         outcome = outcomes[0]
         assert outcome.epoch_id == 7
-        assert outcome.verifier_ok
         assert outcome.weights_submitted
 
         # Verify the submission shape.
@@ -234,9 +245,11 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
         call = submitter.calls[0]
         assert call["epoch_id"] == 7
         assert call["netuid"] == 42
-        assert set(call["uids"]) == {0, 1}
-        total_weight = sum(call["weights"])
-        assert abs(total_weight - 1.0) < 1e-12
+        # u16 weight vector sums to exactly MAX_WEIGHT.
+        assert sum(call["weights"]) == MAX_WEIGHT
+        # Both miners present in the vector; demand far exceeds the
+        # tiny pool so weights renorm and burn drops to dust.
+        assert {0, 1} <= set(call["uids"])
 
         # Idempotency: a second tick should not re-process.
         more = validator.process_once()
@@ -245,7 +258,11 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
 
         # The local mirror should still contain the epoch directory.
         epoch_dir = os.path.join(str(tmp_path), "epoch=7")
-        for name in ("raw.jsonl.zst", "aggregated.jsonl", "gateway_keys.json", "_FINALIZED"):
+        for name in (
+            "aggregated.jsonl",
+            "epoch_summary.json",
+            "_FINALIZED",
+        ):
             assert os.path.exists(os.path.join(epoch_dir, name)), f"missing: {name}"
 
 
@@ -260,25 +277,7 @@ def test_validator_restart_does_not_resubmit(tmp_path: pathlib.Path) -> None:
         records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
         _populate_epoch(s3, epoch_id=7, records=records)
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
-        )
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
 
         # First process: a fresh validator submits epoch 7.
@@ -300,65 +299,215 @@ def test_validator_restart_does_not_resubmit(tmp_path: pathlib.Path) -> None:
         assert restarted_submitter.calls == []
 
 
-def test_validator_skips_submission_on_verifier_failure(tmp_path: pathlib.Path) -> None:
-    """If aggregated.jsonl claims a raw_hash that doesn't match raw.jsonl.zst,
-    the verifier exits non-zero and the validator must skip weight submission."""
+def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) -> None:
+    """Zero billing => burn_uid gets the entire MAX_WEIGHT."""
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
 
         miner_a = "5Ehm" + "A" * 44
-        records = [_record("01ZZZZZZZZZZZZZZZZZZZZZZZZ", miner_a)]
+        miner_b = "5Ehm" + "B" * 44
 
-        finalized_prefix = f"{PREFIX}/finalized/epoch=9/"
+        # success=False -> zero usage, zero earnings.
+        records = [
+            _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a, success=False),
+            _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b, success=False),
+        ]
+        _populate_epoch(s3, epoch_id=13, records=records, alpha_price_usd="0.50")
 
-        raw_bytes = b"\n".join(json.dumps(r).encode("utf-8") for r in records)
-        compressed = zstd.ZstdCompressor(level=10).compress(raw_bytes)
-        s3.put_object(Bucket=BUCKET, Key=f"{finalized_prefix}raw.jsonl.zst", Body=compressed)
-
-        rows = _aggregate(records, epoch_id=9)
-        body = io.BytesIO()
-        for row in rows:
-            row["raw_hash"] = "f" * 64  # deliberately wrong
-            body.write(json.dumps(row, separators=(",", ":")).encode("utf-8"))
-            body.write(b"\n")
-        s3.put_object(
-            Bucket=BUCKET, Key=f"{finalized_prefix}aggregated.jsonl", Body=body.getvalue()
+        config = _config(tmp_path)
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(
+            config,
+            mirror,
+            submitter,
+            miner_uid_lookup={miner_a: 0, miner_b: 1},
         )
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=f"{finalized_prefix}gateway_keys.json",
-            Body=json.dumps(
-                {"schema_version": "1", "epoch_id": 9, "gateways": {"gw-test": []}}
-            ).encode("utf-8"),
-        )
-        s3.put_object(Bucket=BUCKET, Key=f"{finalized_prefix}_FINALIZED", Body=b"")
 
-        config = ValidatorConfig(
-            s3_bucket=BUCKET,
-            s3_prefix=PREFIX,
-            s3_endpoint_url=None,
-            aws_region="us-east-1",
-            s3_anonymous=False,
-            local_mirror_dir=str(tmp_path),
-            mirror_retention_epochs=10,
-            processed_state_path=str(tmp_path / "processed.json"),
-            bittensor_netuid=42,
-            bittensor_endpoint=None,
-            bittensor_wallet_name=None,
-            bittensor_wallet_hotkey=None,
-            bittensor_mock=True,
-            verifier_bin=_verifier_bin(),
-            verifier_sample_per_tuple=0,
-            poll_interval_secs=1,
-            metrics_port=9092,
+        outcomes = validator.process_once()
+        assert len(outcomes) == 1
+        assert outcomes[0].weights_submitted
+
+        assert len(submitter.calls) == 1
+        call = submitter.calls[0]
+        assert call["uids"] == [99]
+        assert call["weights"] == [MAX_WEIGHT]
+
+        # Epoch must be marked processed AFTER submit succeeded.
+        again = validator.process_once()
+        assert again == []
+        assert len(submitter.calls) == 1
+
+
+def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
+    """Cap-path epoch where every scored miner is unknown to the uid lookup
+    must defer: no submission, no processed-state mark, retry next tick.
+
+    Simulates the metagraph refreshing between ticks by mutating the
+    Validator's uid lookup before the second process_once().
+    """
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        miner_b = "5Ehm" + "B" * 44
+
+        records = [
+            _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a),
+            _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
+        ]
+        _populate_epoch(s3, epoch_id=23, records=records, alpha_price_usd="0.50")
+
+        config = _config(tmp_path)
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(
+            config,
+            mirror,
+            submitter,
+            miner_uid_lookup={},  # stale: neither miner present
         )
+
+        # First tick: stale metagraph -> defer.
+        outcomes = validator.process_once()
+        assert outcomes == []
+        assert submitter.calls == []
+        assert 23 not in validator._processed
+
+        # Metagraph refreshes; next tick must process the same epoch.
+        validator._miner_uid_lookup = {miner_a: 0, miner_b: 1}
+        outcomes = validator.process_once()
+        assert len(outcomes) == 1
+        assert outcomes[0].epoch_id == 23
+        assert outcomes[0].weights_submitted is True
+        assert len(submitter.calls) == 1
+        assert submitter.calls[0]["epoch_id"] == 23
+        assert 23 in validator._processed
+
+
+def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A pre-chain-read epoch_summary.json must defer rather than score.
+
+    Without emissions_alpha the cap+burn pool denominator is unknown;
+    the validator must skip submission AND the processed-state mark so
+    the next tick retries once the finalizer republishes. The deferral
+    also invalidates the local cached copy of epoch_summary.json so the
+    next tick re-downloads the corrected artifact instead of rereading
+    the stale cache.
+    """
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+
+        records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
+        # Simulate a pre-chain-read finalizer by omitting emissions_alpha.
+        _populate_epoch(s3, epoch_id=31, records=records, emissions_alpha=None)
+
+        config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
         validator = Validator(config, mirror, submitter, miner_uid_lookup={miner_a: 0})
 
+        # First tick: missing emissions_alpha -> defer.
+        outcomes = validator.process_once()
+        assert outcomes == []
+        assert submitter.calls == []
+        assert 31 not in validator._processed
+
+        # Operator republishes epoch_summary.json with the chain-read field.
+        # The stale cached copy must have been invalidated so the next
+        # tick re-downloads the corrected artifact.
+        _populate_epoch(s3, epoch_id=31, records=records, emissions_alpha="100")
+
         outcomes = validator.process_once()
         assert len(outcomes) == 1
-        assert not outcomes[0].verifier_ok
-        assert not outcomes[0].weights_submitted
+        assert outcomes[0].epoch_id == 31
+        assert outcomes[0].weights_submitted is True
+        assert 31 in validator._processed
+
+
+def test_validator_submits_cap_burn_weights(tmp_path: pathlib.Path) -> None:
+    """End-to-end cap+burn: summary present -> burn slot in submission."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        miner_b = "5Ehm" + "B" * 44
+
+        records = [
+            _record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a),
+            _record("01BBBBBBBBBBBBBBBBBBBBBBBB", miner_b),
+        ]
+        _populate_epoch(s3, epoch_id=11, records=records, alpha_price_usd="0.50")
+
+        config = _config(tmp_path)
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(
+            config,
+            mirror,
+            submitter,
+            miner_uid_lookup={miner_a: 0, miner_b: 1},
+        )
+
+        outcomes = validator.process_once()
+        assert len(outcomes) == 1
+        assert outcomes[0].weights_submitted
+
+        call = submitter.calls[0]
+        assert sum(call["weights"]) == MAX_WEIGHT
+        # Big pool against tiny demand: burn slot should dominate.
+        weights_by_uid = dict(zip(call["uids"], call["weights"], strict=True))
+        assert weights_by_uid.get(99, 0) > MAX_WEIGHT // 2
+
+
+def _populate_epoch_with_malformed_summary(s3: Any, epoch_id: int, records: list[dict]) -> None:
+    """Populate an epoch but overwrite epoch_summary.json with garbage."""
+    _populate_epoch(s3, epoch_id, records)
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"{PREFIX}/finalized/epoch={epoch_id}/epoch_summary.json",
+        Body=b'{"epoch_id": "not-an-int", "finalized_at": null}',
+    )
+
+
+def test_propagates_malformed_epoch_summary(tmp_path: pathlib.Path) -> None:
+    """A malformed epoch_summary.json must raise — the cap path can't
+    proceed without a valid alpha_price_usd."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
+        _populate_epoch_with_malformed_summary(s3, epoch_id=22, records=records)
+
+        config = _config(tmp_path)
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(
+            config,
+            mirror,
+            submitter,
+            miner_uid_lookup={miner_a: 0},
+        )
+
+        # process_once() catches per-epoch exceptions internally and logs
+        # them, so assert via the side effect: no submission, no
+        # processed-state mark (epoch will retry next tick).
+        outcomes = validator.process_once()
+        assert outcomes == []
         assert submitter.calls == []
+
+        # And confirm the raw read itself raises so operators see schema
+        # errors loudly at the function boundary.
+        mirror_dir = mirror.mirror_epoch(22)
+        with pytest.raises(ValidationError):
+            load_epoch_summary(epoch_summary_path(mirror_dir))

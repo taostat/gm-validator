@@ -4,26 +4,46 @@ Loop:
 
 1. Discover finalized epoch ids in S3.
 2. For each not yet processed:
-   a. Mirror artifacts locally.
-   b. Invoke `gm-verifier verify`. On failure: alert + skip submission.
-   c. Compute per-miner scores from `aggregated.jsonl`.
-   d. Normalise weights, submit via the configured `Submitter`.
+   a. Mirror artifacts locally (`aggregated.jsonl`,
+      `epoch_summary.json`, `_FINALIZED`).
+   b. Compute per-miner scores from `aggregated.jsonl`.
+   c. Build a u16 weight vector via cap+burn — miner i gets
+      ``consumed_usd_i / pool_usd``; residue routes to the subnet-owner
+      uid as burn weight.
+   d. Submit via the configured `Submitter`.
    e. Mark the epoch processed.
 3. Prune local mirrors older than the retention window.
+
+The validator does not re-derive cost or re-verify `raw_hash` /
+signatures. The gm-operated epoch-finalizer is the single source of
+truth for cost re-derivation, and validators are operated by external
+parties — rolling out pricing-math changes through them is expensive,
+so the artifact set (`aggregated.jsonl` + `epoch_summary.json`) is
+treated as authoritative.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
 
 from gm_validator.bittensor_adapter import Submitter
 from gm_validator.config import ValidatorConfig
+from gm_validator.epoch_summary import (
+    EPOCH_SUMMARY_FILENAME,
+    epoch_summary_path,
+    load_epoch_summary,
+)
 from gm_validator.processed_state import ProcessedState
 from gm_validator.s3_mirror import S3Mirror
-from gm_validator.scoring import aggregated_path, load_aggregated, normalise_weights, score
-from gm_validator.verifier import VerifierResult, verify_epoch
+from gm_validator.scoring import (
+    StaleEpochSummaryError,
+    StaleMetagraphError,
+    aggregated_path,
+    compute_weights,
+    load_aggregated,
+    score,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,10 +53,9 @@ class EpochOutcome:
     """Per-epoch processing result, surfaced for tests + metrics."""
 
     epoch_id: int
-    verifier_ok: bool
     weights_submitted: bool
     miner_count: int
-    total_pdollars: int
+    total_ndollars: int
 
 
 class Validator:
@@ -54,8 +73,6 @@ class Validator:
         self._mirror = mirror
         self._submitter = submitter
         self._miner_uid_lookup = miner_uid_lookup or {}
-        # Durable processed-epoch state survives restarts. Defaults to
-        # the configured state-file path; tests inject an explicit one.
         self._processed = processed_state or ProcessedState(config.processed_state_path)
 
     def process_once(self) -> list[EpochOutcome]:
@@ -66,6 +83,33 @@ class Validator:
                 continue
             try:
                 outcome = self._process_epoch(epoch_id)
+            except StaleMetagraphError as exc:
+                # Transient — metagraph hotkey->uid lookup is stale. Skip
+                # marking processed so the next tick retries once the
+                # lookup has refreshed.
+                LOGGER.warning(
+                    "epoch %d deferred (stale metagraph): %s — next tick will retry",
+                    epoch_id,
+                    exc,
+                )
+                continue
+            except StaleEpochSummaryError as exc:
+                # Transient — epoch_summary.json was written by a
+                # pre-chain-read finalizer and so lacks emissions_alpha.
+                # Skip marking processed so the next tick retries once
+                # the finalizer has republished (the artifact's
+                # _FINALIZED rewrite path is the operator escalation).
+                # Invalidate the cached copy too: S3Mirror._download is a
+                # no-op when the local file exists, so without this the
+                # validator would keep rereading the stale cached summary
+                # and defer forever.
+                self._mirror.invalidate_artifact(epoch_id, EPOCH_SUMMARY_FILENAME)
+                LOGGER.warning(
+                    "epoch %d deferred (stale epoch_summary): %s — next tick will retry",
+                    epoch_id,
+                    exc,
+                )
+                continue
             except Exception:
                 LOGGER.exception("epoch %d processing failed", epoch_id)
                 continue
@@ -76,65 +120,40 @@ class Validator:
 
     def _process_epoch(self, epoch_id: int) -> EpochOutcome:
         mirror_dir = self._mirror.mirror_epoch(epoch_id)
-        verifier_result = self._verify(epoch_id, mirror_dir)
-        if not verifier_result.ok:
-            LOGGER.error(
-                "epoch %d: verifier failed (stderr=%s); skipping weight submission",
-                epoch_id,
-                verifier_result.stderr.strip(),
-            )
-            return EpochOutcome(
-                epoch_id=epoch_id,
-                verifier_ok=False,
-                weights_submitted=False,
-                miner_count=0,
-                total_pdollars=0,
-            )
 
         rows = load_aggregated(aggregated_path(mirror_dir))
-        scores = normalise_weights(score(rows))
-        total = sum(s.earnings_pdollars + s.surcharge_pdollars for s in scores.values())
+        scores = score(rows)
+        total = sum(s.earnings_ndollars + s.surcharge_ndollars for s in scores.values())
 
-        uids, weights = self._uids_and_weights(scores)
+        epoch_summary = load_epoch_summary(epoch_summary_path(mirror_dir))
+
+        vector = compute_weights(
+            scores,
+            self._miner_uid_lookup,
+            epoch_summary=epoch_summary,
+            subnet_owner_uid=self._config.subnet_owner_uid,
+        )
+
         submitted = False
-        if uids:
+        if vector.uids:
             self._submitter.submit(
                 netuid=self._config.bittensor_netuid,
-                uids=uids,
-                weights=weights,
+                uids=vector.uids,
+                weights=vector.weights,
                 epoch_id=epoch_id,
             )
             submitted = True
+            LOGGER.info(
+                "epoch %d: miners=%d pool_usd=%s consumed_usd=%s",
+                epoch_id,
+                len(scores),
+                vector.epoch_result.pool_usd_total,
+                vector.epoch_result.total_consumed_usd,
+            )
 
         return EpochOutcome(
             epoch_id=epoch_id,
-            verifier_ok=True,
             weights_submitted=submitted,
             miner_count=len(scores),
-            total_pdollars=total,
+            total_ndollars=total,
         )
-
-    def _verify(self, epoch_id: int, mirror_dir: str) -> VerifierResult:
-        return verify_epoch(
-            verifier_bin=self._config.verifier_bin,
-            epoch_id=epoch_id,
-            mirror_dir=mirror_dir,
-            sample_per_tuple=self._config.verifier_sample_per_tuple,
-        )
-
-    def _uids_and_weights(self, scores: dict[str, Any]) -> tuple[list[int], list[float]]:
-        """Translate hotkey-keyed scores to (uid, weight) lists.
-
-        Miners not in the lookup table are skipped silently; in real
-        deployment the lookup is populated from the subnet's metagraph
-        at startup.
-        """
-        uids: list[int] = []
-        weights: list[float] = []
-        for miner_id, s in scores.items():
-            uid = self._miner_uid_lookup.get(miner_id)
-            if uid is None:
-                continue
-            uids.append(uid)
-            weights.append(s.weight)
-        return uids, weights

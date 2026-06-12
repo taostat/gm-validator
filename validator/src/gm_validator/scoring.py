@@ -1,34 +1,79 @@
 """Per-miner score derivation from `aggregated.jsonl`.
 
-A miner's epoch score is the sum of `earnings_pdollars +
-surcharge_pdollars` across every product they served. Normalized
-across miners, this becomes the input to `subtensor.set_weights()`.
-
-The scoring is intentionally simple in v1 — `validator.md §15` and
-`research.md §H.3` confirm "for each (miner, product) tuple in the
-summary, the miner's earned amount is miner_price * tokens_served
-summed across all products" with no protocol-margin adjustment.
+A miner's epoch score is the sum of ``earnings_ndollars +
+surcharge_ndollars`` across every product they served. The validator
+converts those sums to u16 weights via the cap+burn pipeline in
+:mod:`gm_validator.alpha_economics`: miner i gets
+``consumed_usd_i / pool_usd``, the residue routes to the subnet-owner
+uid as burn weight, and oversubscribed demand renorms down inside
+:func:`alpha_economics.normalize_weights`.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from decimal import Decimal
+
+from gm_validator.alpha_economics import (
+    EpochWeightsResult,
+    MinerEpochData,
+    compute_epoch_weights,
+    normalize_weights,
+)
+from gm_validator.epoch_summary import EpochSummary
+
+LOGGER = logging.getLogger(__name__)
+
+NDOLLARS_PER_USD = Decimal(10**9)
+
+
+class StaleMetagraphError(Exception):
+    """All scored miners missing from miner_uid_lookup — defer this epoch.
+
+    Raised when the metagraph hotkey->uid lookup is stale (every scored
+    miner is unknown). The next process_once() tick will retry; if the
+    metagraph has refreshed by then, the epoch proceeds normally.
+    """
+
+
+class StaleEpochSummaryError(Exception):
+    """`epoch_summary.json` predates the chain-read ``emissions_alpha`` field.
+
+    Raised when the artifact was written by an older finalizer release
+    (pre gm PR #176) and so does not carry ``emissions_alpha``. The
+    validator defers the epoch — the cap+burn pool denominator cannot be
+    invented without ground-truth — and the next ``process_once`` tick
+    retries. Once every prod finalizer is at >= the chain-read release
+    this branch is unreachable; the field stays optional in the parser
+    only to surface this transient cleanly rather than fail-fast on
+    parser load.
+    """
 
 
 @dataclass
 class MinerScore:
-    """Per-miner score components plus weight."""
+    """Per-miner score components aggregated from `aggregated.jsonl`."""
 
     miner_id: str
-    earnings_pdollars: int = 0
-    surcharge_pdollars: int = 0
+    earnings_ndollars: int = 0
+    surcharge_ndollars: int = 0
     successful_requests: int = 0
     failed_requests: int = 0
-    weight: float = 0.0
     per_product: dict[tuple[str, str], int] = field(default_factory=dict)
+
+
+@dataclass
+class WeightVector:
+    """Result of the score → weights pipeline."""
+
+    uids: list[int]
+    weights: list[int]
+    burn_uid: int
+    epoch_result: EpochWeightsResult
 
 
 def load_aggregated(path: str) -> list[dict]:
@@ -43,19 +88,15 @@ def load_aggregated(path: str) -> list[dict]:
 
 
 def score(rows: Iterable[dict]) -> dict[str, MinerScore]:
-    """Aggregate `aggregated.jsonl` rows into per-miner scores.
-
-    Returns a dict keyed by miner hotkey. `weight` is populated by
-    `normalise_weights`.
-    """
+    """Aggregate `aggregated.jsonl` rows into per-miner scores."""
     scores: dict[str, MinerScore] = {}
     for row in rows:
         miner_id = row["miner_id"]
         bucket = scores.setdefault(miner_id, MinerScore(miner_id=miner_id))
-        earn = int(row.get("earnings_pdollars", "0") or 0)
-        surch = int(row.get("surcharge_pdollars", "0") or 0)
-        bucket.earnings_pdollars += earn
-        bucket.surcharge_pdollars += surch
+        earn = int(row.get("earnings_ndollars", "0") or 0)
+        surch = int(row.get("surcharge_ndollars", "0") or 0)
+        bucket.earnings_ndollars += earn
+        bucket.surcharge_ndollars += surch
         bucket.successful_requests += int(row.get("successful_requests", 0))
         bucket.failed_requests += int(row.get("failed_requests", 0))
         product = row.get("product") or {}
@@ -67,26 +108,110 @@ def score(rows: Iterable[dict]) -> dict[str, MinerScore]:
     return scores
 
 
-def normalise_weights(scores: dict[str, MinerScore]) -> dict[str, MinerScore]:
-    """Compute per-miner weight as the fraction of total earnings.
-
-    Picodollar-precision input, float weight output suitable for
-    `subtensor.set_weights()`.
-    """
-    total = sum(s.earnings_pdollars + s.surcharge_pdollars for s in scores.values())
-    if total <= 0:
-        # No earnings this epoch — every miner gets equal weight (or 0).
-        # Bittensor's set_weights requires the vector to sum to ~1.0 if
-        # we're emitting any weights at all, so we emit an all-zero vector
-        # which corresponds to "no incentive this epoch."
-        for s in scores.values():
-            s.weight = 0.0
-        return scores
-    for s in scores.values():
-        s.weight = (s.earnings_pdollars + s.surcharge_pdollars) / total
-    return scores
-
-
 def aggregated_path(mirror_dir: str) -> str:
     """Convenience: path-join helper for the canonical filename."""
     return os.path.join(mirror_dir, "aggregated.jsonl")
+
+
+def compute_weights(
+    scores: dict[str, MinerScore],
+    miner_uid_lookup: dict[str, int],
+    *,
+    epoch_summary: EpochSummary,
+    subnet_owner_uid: int,
+) -> WeightVector:
+    """Convert per-miner scores to a u16 weight vector for `set_weights`.
+
+    Args:
+        scores: Per-miner score totals (from :func:`score`).
+        miner_uid_lookup: Mapping from miner hotkey to subnet uid. Miners
+            absent here still count toward the pool denominator but are
+            dropped from the submitted vector.
+        epoch_summary: Per-epoch price + emission snapshot written by the
+            finalizer. Both ``alpha_price_usd`` and ``emissions_alpha``
+            come from the same chain read pinned to the epoch-close
+            block, so every validator sees identical pool inputs.
+        subnet_owner_uid: Uid that absorbs the burn slot + floor-rounding
+            dust.
+
+    Returns:
+        WeightVector: aligned ``uids``, ``weights`` (u16, sum =
+            ``MAX_WEIGHT``), plus the per-epoch result for audit
+            logging.
+
+    Raises:
+        StaleMetagraphError: All scored miners are absent from
+            ``miner_uid_lookup``. The caller should defer the epoch
+            rather than mark it processed.
+        StaleEpochSummaryError: ``epoch_summary.emissions_alpha`` is
+            missing — the artifact was written by a pre-chain-read
+            finalizer. The caller should defer the epoch rather than
+            invent a pool denominator.
+    """
+    if epoch_summary.emissions_alpha is None:
+        raise StaleEpochSummaryError(
+            f"epoch {epoch_summary.epoch_id}: epoch_summary.json is missing "
+            f"emissions_alpha (finalizer_version={epoch_summary.finalizer_version!r}); "
+            f"refusing to score until the finalizer republishes with chain-read emission"
+        )
+    # All scored miners contribute to the pool denominator — missing-uid
+    # miners are still real demand against it. The uid lookup only gates
+    # whether we can route them in this epoch's submission.
+    miners_data: list[MinerEpochData] = []
+    uids_by_index: list[int | None] = []
+    missing_hotkeys: list[str] = []
+    for miner_id, s in scores.items():
+        uid = miner_uid_lookup.get(miner_id)
+        total_ndollars = Decimal(s.earnings_ndollars + s.surcharge_ndollars)
+        miners_data.append(
+            MinerEpochData(
+                hotkey=miner_id,
+                consumed_usd=total_ndollars / NDOLLARS_PER_USD,
+            )
+        )
+        uids_by_index.append(uid)
+        if uid is None:
+            missing_hotkeys.append(miner_id)
+
+    # All scored miners missing from the lookup means the metagraph is
+    # stale. Raise so process_once() defers without marking the epoch
+    # processed — a bare empty-vector return would get silently marked
+    # processed and the epoch would be lost.
+    if miners_data and all(uid is None for uid in uids_by_index):
+        sample = missing_hotkeys[:10]
+        ellipsis = "..." if len(missing_hotkeys) > 10 else ""
+        raise StaleMetagraphError(
+            f"all {len(missing_hotkeys)} scored miners missing from "
+            f"miner_uid_lookup; hotkeys={sample}{ellipsis}"
+        )
+
+    if missing_hotkeys:
+        LOGGER.warning(
+            "epoch scoring: %d scored miner(s) missing from miner_uid_lookup; "
+            "their demand counts toward the pool but they miss this epoch's payout. "
+            "hotkeys=%s",
+            len(missing_hotkeys),
+            missing_hotkeys,
+        )
+
+    result = compute_epoch_weights(
+        miners_data,
+        alpha_price_usd=epoch_summary.alpha_price_usd,
+        emissions_alpha=epoch_summary.emissions_alpha,
+    )
+
+    miner_pairs: list[tuple[int, Decimal]] = []
+    for miner_weight, uid in zip(result.miners, uids_by_index, strict=True):
+        if uid is None:
+            continue
+        miner_pairs.append((uid, miner_weight.weight))
+
+    u16 = normalize_weights(miner_pairs, burn_uid=subnet_owner_uid)
+    uids = [uid for uid, _ in u16]
+    weights = [w for _, w in u16]
+    return WeightVector(
+        uids=uids,
+        weights=weights,
+        burn_uid=subnet_owner_uid,
+        epoch_result=result,
+    )

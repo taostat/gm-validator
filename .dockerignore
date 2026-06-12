@@ -3,7 +3,6 @@
 .git
 .github
 docs
-target
 **/.venv
 **/__pycache__
 **/*.pyc

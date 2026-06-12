@@ -18,6 +18,7 @@ from gm_validator.config import ValidatorConfig
 
 def test_s3_anonymous_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
     monkeypatch.delenv("GM_VALIDATOR_S3_ANONYMOUS", raising=False)
     config = ValidatorConfig.from_env()
     assert config.s3_anonymous is False
@@ -26,6 +27,7 @@ def test_s3_anonymous_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None
 @pytest.mark.parametrize("value", ["1", "true", "True"])
 def test_s3_anonymous_truthy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
     monkeypatch.setenv("GM_VALIDATOR_S3_ANONYMOUS", value)
     config = ValidatorConfig.from_env()
     assert config.s3_anonymous is True
@@ -34,9 +36,31 @@ def test_s3_anonymous_truthy_values(monkeypatch: pytest.MonkeyPatch, value: str)
 @pytest.mark.parametrize("value", ["0", "false", "False", "no", ""])
 def test_s3_anonymous_falsy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
     monkeypatch.setenv("GM_VALIDATOR_S3_ANONYMOUS", value)
     config = ValidatorConfig.from_env()
     assert config.s3_anonymous is False
+
+
+# ---------------------------------------------------------------------------
+# SUBNET_OWNER_UID is mandatory
+# ---------------------------------------------------------------------------
+
+
+def test_subnet_owner_uid_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SUBNET_OWNER_UID is the burn target; without it weight would
+    route to uid 0 (a real miner)."""
+    monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.delenv("SUBNET_OWNER_UID", raising=False)
+    with pytest.raises(ValueError, match="SUBNET_OWNER_UID"):
+        ValidatorConfig.from_env()
+
+
+def test_subnet_owner_uid_parsed_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "103")
+    config = ValidatorConfig.from_env()
+    assert config.subnet_owner_uid == 103
 
 
 # ---------------------------------------------------------------------------
@@ -60,10 +84,9 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "bittensor_wallet_name": None,
         "bittensor_wallet_hotkey": None,
         "bittensor_mock": True,
-        "verifier_bin": "gm-verifier",
-        "verifier_sample_per_tuple": 0,
         "poll_interval_secs": 60,
         "metrics_port": 9092,
+        "subnet_owner_uid": 0,
     }
     defaults.update(overrides)
     return ValidatorConfig(**defaults)  # type: ignore[arg-type]
