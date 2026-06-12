@@ -55,7 +55,8 @@ uv run python -m gm_validator.main
 | `MIRROR_RETENTION_EPOCHS` | `10` | How many recent epoch mirrors to keep on disk |
 | `PROCESSED_STATE_PATH` | `<mirror_dir>/processed.json` | Crash-safe record of submitted epochs |
 | `BITTENSOR_NETUID` | `0` | Subnet UID |
-| `BITTENSOR_WALLET_NAME` / `BITTENSOR_WALLET_HOTKEY` | — | Required for real weight submission |
+| `BITTENSOR_ENDPOINT` | — | Subtensor `wss://` URL (SDK default network when unset) |
+| `BITTENSOR_HOTKEY_SEED` | — | Validator hotkey seed — a BIP-39 mnemonic or `0x`-prefixed hex seed. The signing keypair is built in memory; no keyfile on disk. Required for real weight submission |
 | `BITTENSOR_MOCK` | `0` | Use `MockSubmitter` (records submissions in memory) |
 | `SUBNET_OWNER_UID` | required | Uid that absorbs the burn slot + floor-rounding dust. Static knob until a follow-up resolves it from `SubnetOwnerHotkey`. |
 

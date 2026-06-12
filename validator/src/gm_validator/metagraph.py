@@ -31,10 +31,14 @@ def load_miner_uid_lookup(netuid: int, endpoint: str | None) -> dict[str, int]:
     Raises:
         RuntimeError: The metagraph could not be fetched.
     """
-    import bittensor
+    from gm_validator.subtensor_connect import connect_subtensor
 
     try:
-        subtensor = bittensor.Subtensor(network=endpoint) if endpoint else bittensor.Subtensor()
+        # connect_subtensor retries transient endpoint failures (HTTP
+        # 429 from public testnet RPCs in particular) so a brief
+        # rate-limit window does not crash the pod into a tight restart
+        # loop.
+        subtensor = connect_subtensor(endpoint)
         metagraph = subtensor.metagraph(netuid)
     except Exception as exc:
         raise RuntimeError(
