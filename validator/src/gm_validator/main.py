@@ -18,18 +18,41 @@ from gm_validator.s3_mirror import S3Mirror
 from gm_validator.validator import Validator
 
 
-def _real_submission_configured(config: ValidatorConfig) -> bool:
-    """True iff a real hotkey is configured for on-chain submission."""
-    return not config.bittensor_mock and bool(config.bittensor_hotkey_seed)
+class HotkeyNotConfiguredError(RuntimeError):
+    """Real submission requested but no hotkey seed was configured."""
+
+
+def _use_mock_submitter(config: ValidatorConfig) -> bool:
+    """Decide between the mock and the real (chain-signing) submitter.
+
+    The mock submitter is selected only when ``BITTENSOR_MOCK`` is set
+    explicitly. With mock off, a real hotkey seed is mandatory: a
+    missing or blank ``BITTENSOR_HOTKEY_SEED`` raises here so a pod that
+    forgot to mount the secret crashes at startup instead of silently
+    running forever without ever submitting on-chain weights.
+
+    Raises:
+        HotkeyNotConfiguredError: Mock mode is off and the seed is
+            missing or blank.
+    """
+    if config.bittensor_mock:
+        return True
+    if not (config.bittensor_hotkey_seed and config.bittensor_hotkey_seed.strip()):
+        raise HotkeyNotConfiguredError(
+            "BITTENSOR_HOTKEY_SEED is not set; provide the validator hotkey "
+            "seed (BIP-39 mnemonic or 0x-prefixed hex), or set BITTENSOR_MOCK=1 "
+            "to run without on-chain submission"
+        )
+    return False
 
 
 def _build_submitter(config: ValidatorConfig) -> Submitter:
-    if not _real_submission_configured(config):
-        # No hotkey configured (or mock forced): record submissions in
-        # memory. Useful for build-phase smoke tests.
+    if _use_mock_submitter(config):
+        # Mock mode forced: record submissions in memory. Useful for
+        # build-phase smoke tests.
         return MockSubmitter()
-    # hotkey_seed is non-None here (guarded by _real_submission_configured),
-    # but the config type is Optional; assert to satisfy the type checker.
+    # _use_mock_submitter guarantees a non-blank seed here; the config
+    # type is Optional, so assert to satisfy the type checker.
     assert config.bittensor_hotkey_seed is not None
     # Lazy import so the test path does not require bittensor-py.
     from gm_validator.bittensor_real import RealSubmitter
@@ -44,10 +67,10 @@ def _build_submitter(config: ValidatorConfig) -> Submitter:
 def _build_miner_uid_lookup(config: ValidatorConfig) -> dict[str, int]:
     """Build the hotkey -> uid lookup from the subnet metagraph.
 
-    Returns an empty mapping when no real hotkey is configured — the
-    mock-submitter build path has no chain to query.
+    Returns an empty mapping in mock mode — the mock-submitter build
+    path has no chain to query.
     """
-    if not _real_submission_configured(config):
+    if _use_mock_submitter(config):
         return {}
     # Lazy import so the test path does not require bittensor-py.
     from gm_validator.metagraph import load_miner_uid_lookup
