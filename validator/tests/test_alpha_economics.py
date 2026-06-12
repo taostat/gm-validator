@@ -163,6 +163,71 @@ def test_underflow_with_under_one_total_pads_burn() -> None:
     assert burn_w >= 19000
 
 
+def test_tiny_positive_share_floors_to_at_least_one() -> None:
+    """A miner whose share is below 1/MAX_WEIGHT must still get weight >= 1,
+    not truncate to 0 and lose its whole emission to burn."""
+    # Testnet shape: one miner earns ~$0.000064 against a ~$2415 pool.
+    share = Decimal("0.000064") / Decimal("2415")
+    assert share * MAX_WEIGHT < Decimal(1)  # would truncate to 0 under int()
+    out = normalize_weights([(7, share)], burn_uid=99)
+    weights_by_uid = dict(out)
+    assert weights_by_uid[7] >= 1
+    assert sum(w for _, w in out) == MAX_WEIGHT
+    assert weights_by_uid[99] == MAX_WEIGHT - weights_by_uid[7]
+
+
+def test_zero_score_miner_stays_at_weight_zero() -> None:
+    """The floor applies only to strictly positive scores; a miner with a
+    zero share is dropped, not paid a courtesy unit."""
+    out = normalize_weights([(7, Decimal(0)), (8, Decimal("0.5"))], burn_uid=99)
+    weights_by_uid = dict(out)
+    assert 7 not in weights_by_uid
+    assert weights_by_uid[8] >= 1
+    assert sum(w for _, w in out) == MAX_WEIGHT
+
+
+def test_many_tiny_miners_each_floor_to_one_and_sum_holds() -> None:
+    """Many sub-threshold positive shares each get >= 1 and the vector
+    still sums to exactly MAX_WEIGHT with no burn double-count."""
+    pairs = [(uid, Decimal("0.000064") / Decimal("2415")) for uid in range(1, 21)]
+    out = normalize_weights(pairs, burn_uid=99)
+    weights_by_uid = dict(out)
+    for uid in range(1, 21):
+        assert weights_by_uid[uid] >= 1
+    assert sum(w for _, w in out) == MAX_WEIGHT
+    # Burn absorbs the rest exactly once.
+    assert weights_by_uid[99] == MAX_WEIGHT - sum(weights_by_uid[uid] for uid in range(1, 21))
+
+
+def test_oversubscribed_floor_reclaims_overflow_to_max_weight() -> None:
+    """Over-subscription that floors many tiny shares up to 1 must reclaim the
+    overflow from the heavy miners, not exceed MAX_WEIGHT."""
+    pairs = [(0, Decimal("1000"))] + [(uid, Decimal("0.0000001")) for uid in range(1, 2000)]
+    out = normalize_weights(pairs, burn_uid=99)
+    weights_by_uid = dict(out)
+    assert sum(w for _, w in out) == MAX_WEIGHT
+    for uid in range(1, 2000):
+        assert weights_by_uid[uid] >= 1
+    assert weights_by_uid[0] > 1  # heavy miner keeps the bulk after reclaim
+
+
+def test_more_positive_miners_than_max_weight_raises() -> None:
+    pairs = [(uid, Decimal(1)) for uid in range(MAX_WEIGHT + 1)]
+    with pytest.raises(ValueError, match="cannot floor"):
+        normalize_weights(pairs, burn_uid=99)
+
+
+def test_normal_magnitude_shares_unaffected_by_floor() -> None:
+    """Regression: ordinary shares quantize exactly as before the floor."""
+    pairs = [(1, Decimal("0.5")), (2, Decimal("0.3")), (3, Decimal("0.2"))]
+    out = normalize_weights(pairs, burn_uid=99)
+    weights_by_uid = dict(out)
+    assert weights_by_uid[1] == int(Decimal("0.5") * MAX_WEIGHT)
+    assert weights_by_uid[2] == int(Decimal("0.3") * MAX_WEIGHT)
+    assert weights_by_uid[3] == int(Decimal("0.2") * MAX_WEIGHT)
+    assert sum(w for _, w in out) == MAX_WEIGHT
+
+
 @given(
     consumed=st.lists(
         st.decimals(
@@ -206,3 +271,29 @@ def test_property_u16_vector_sums_to_max_weight(
         pairs = []
     u16 = normalize_weights(pairs, burn_uid=99)
     assert sum(w for _, w in u16) == MAX_WEIGHT
+
+
+@given(
+    shares=st.lists(
+        st.decimals(
+            min_value=Decimal("0"),
+            max_value=Decimal("1000"),
+            allow_nan=False,
+            allow_infinity=False,
+            places=8,
+        ),
+        min_size=1,
+        max_size=300,
+    ),
+)
+@settings(max_examples=120)
+def test_property_floor_holds_and_sum_exact(shares: list[Decimal]) -> None:
+    """Across mixed tiny/large share vectors: the u16 vector sums to exactly
+    MAX_WEIGHT and every strictly-positive share keeps at least one unit."""
+    pairs = [(i, s) for i, s in enumerate(shares)]
+    out = normalize_weights(pairs, burn_uid=99_999)
+    assert sum(w for _, w in out) == MAX_WEIGHT
+    weights_by_uid = dict(out)
+    for i, s in enumerate(shares):
+        if s > 0:
+            assert weights_by_uid.get(i, 0) >= 1

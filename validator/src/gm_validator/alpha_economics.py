@@ -120,6 +120,13 @@ def normalize_weights(
 ) -> list[tuple[int, int]]:
     """Convert float-domain weights to u16, padding the burn slot with dust.
 
+    Every miner with a strictly positive weight is floored to at least 1 u16
+    unit so a share below ``1/MAX_WEIGHT`` keeps its emission instead of
+    truncating to 0 and falling through to burn. The floored units are drawn
+    from the burn remainder; when demand over-subscribes the pool and the
+    burn remainder cannot cover them, the surplus is reclaimed from the
+    heaviest miners so the vector still sums to exactly ``MAX_WEIGHT``.
+
     Args:
         miner_weights: ``(uid, weight)`` pairs in pool units. When sum
             > 1 the inputs are renormed before u16 conversion; when sum
@@ -130,10 +137,18 @@ def normalize_weights(
 
     Returns:
         ``(uid, u16_weight)`` pairs summing to exactly ``MAX_WEIGHT``.
+
+    Raises:
+        ValueError: More than ``MAX_WEIGHT`` miners have positive weight, so
+            they cannot all be floored to >= 1 within the u16 budget.
     """
     cleaned = [(uid, w) for uid, w in miner_weights if w > 0]
     if not cleaned:
         return [(burn_uid, MAX_WEIGHT)]
+    if len(cleaned) > MAX_WEIGHT:
+        raise ValueError(
+            f"cannot floor {len(cleaned)} positive miners to >=1 within MAX_WEIGHT={MAX_WEIGHT}"
+        )
 
     total = sum((w for _, w in cleaned), _ZERO)
     if total <= 0:
@@ -141,17 +156,22 @@ def normalize_weights(
 
     renorm = total if total > Decimal(1) else Decimal(1)
 
+    # Floor: every strictly-positive share earns at least one unit so a miner
+    # below 1/MAX_WEIGHT keeps its emission instead of truncating to burn. The
+    # floored units come out of the burn remainder below; cleaned filters to
+    # w > 0, so max(1, ...) never pays a non-participant.
     result: list[tuple[int, int]] = []
     running_total = 0
     for uid, weight in cleaned:
-        u16_weight = int((weight / renorm) * MAX_WEIGHT)
-        if u16_weight <= 0:
-            continue
+        u16_weight = max(1, int((weight / renorm) * MAX_WEIGHT))
         result.append((uid, u16_weight))
         running_total += u16_weight
 
     remainder = MAX_WEIGHT - running_total
-    if remainder <= 0:
+    if remainder < 0:
+        _reclaim_overflow(result, -remainder)
+        return result
+    if remainder == 0:
         return result
 
     for i, (uid, w) in enumerate(result):
@@ -162,3 +182,22 @@ def normalize_weights(
         result.append((burn_uid, remainder))
 
     return result
+
+
+def _reclaim_overflow(result: list[tuple[int, int]], deficit: int) -> None:
+    """Trim ``deficit`` units off the heaviest entries so the vector sums to
+    exactly ``MAX_WEIGHT`` without dropping any floored miner below 1.
+
+    Over-subscription floors many sub-unit shares up to 1, which can push the
+    sum past ``MAX_WEIGHT``; the surplus is reclaimed from the largest weights
+    (those that can spare it) rather than from the floored ones.
+    """
+    order = sorted(range(len(result)), key=lambda i: result[i][1], reverse=True)
+    cursor = 0
+    while deficit > 0:
+        idx = order[cursor % len(order)]
+        uid, weight = result[idx]
+        if weight > 1:
+            result[idx] = (uid, weight - 1)
+            deficit -= 1
+        cursor += 1
