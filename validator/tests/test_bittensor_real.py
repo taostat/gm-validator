@@ -217,6 +217,11 @@ def test_submit_passes_in_memory_wallet_to_set_weights(
     assert call["uids"] == [0, 3]
     assert call["weights"] == [400, 600]
     assert call["wait_for_inclusion"] is True
+    # raise_error=True forces the SDK to re-raise substrate errors
+    # (e.g. "Transaction Already Imported") instead of returning them as
+    # a (success=False, message) ExtrinsicResponse; the already-submitted
+    # classifier only fires on the raised path.
+    assert call["raise_error"] is True
     # The wallet handed to the chain is the in-memory shim, and its
     # no-op unlock_hotkey never touches the filesystem.
     wallet = call["wallet"]
@@ -310,6 +315,49 @@ def test_submit_raises_already_submitted_on_already_imported(
     processed instead of looping."""
     subtensor = _install_fake_bittensor(monkeypatch)
     subtensor.raise_on_set = RuntimeError("Transaction Already Imported")
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    with pytest.raises(AlreadySubmittedError, match="already on chain"):
+        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
+
+
+class _RaiseErrorContractSubtensor:
+    """Models bittensor v10 ``set_weights``: it only raises substrate
+    errors when called with ``raise_error=True``; with the SDK default
+    ``raise_error=False`` the same error comes back as a
+    ``(success=False, message)`` ExtrinsicResponse instead.
+
+    The fix depends on opting into the raising contract — if the
+    submitter ever drops ``raise_error=True`` the duplicate broadcast
+    silently lands in the plain-failure path and the validator loops.
+    """
+
+    def __init__(self, network: str | None = None) -> None:
+        self.network = network
+        self.closes = 0
+
+    def set_weights(self, **kwargs: Any) -> tuple[bool, str | None]:
+        if kwargs.get("raise_error"):
+            raise RuntimeError("Transaction Already Imported")
+        return (False, "Transaction Already Imported")
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+def test_submit_opts_into_raise_error_so_already_imported_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the real SDK default (``raise_error=False``) an already-imported
+    error returns as ``(success=False, message)`` — the plain-failure path
+    the validator retries. The submitter must pass ``raise_error=True`` so
+    the chain's "Already Imported" reaches the classifier and the epoch is
+    marked submitted instead of crash-looping."""
+    contract = _RaiseErrorContractSubtensor()
+    module = types.ModuleType("bittensor")
+    module.Keypair = _FakeKeypair  # type: ignore[attr-defined]
+    module.Subtensor = lambda network=None: contract  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "bittensor", module)
+
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
     with pytest.raises(AlreadySubmittedError, match="already on chain"):
         submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)

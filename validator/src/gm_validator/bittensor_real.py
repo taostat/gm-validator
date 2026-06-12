@@ -290,6 +290,13 @@ class RealSubmitter:
             sum(weights),
         )
         try:
+            # raise_error=True makes the SDK re-raise substrate errors
+            # (notably "Transaction Already Imported" on a reconnect
+            # rebroadcast) instead of swallowing them into a
+            # (success=False, message) ExtrinsicResponse. The classifier
+            # below only treats the raised-exception path under
+            # wait_for_inclusion=True as positive evidence of inclusion;
+            # without raise_error it would never see that exception.
             success, message = self._subtensor.set_weights(
                 wallet=self._wallet,
                 netuid=netuid,
@@ -297,6 +304,7 @@ class RealSubmitter:
                 weights=weights,
                 wait_for_inclusion=True,
                 wait_for_finalization=False,
+                raise_error=True,
             )
         except Exception as exc:
             # Drop the connection so the next epoch starts fresh; the
