@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from decimal import Decimal
 
 import pytest
@@ -213,6 +214,20 @@ def test_oversubscribed_floor_reclaims_overflow_to_max_weight() -> None:
     assert weights_by_uid[0] > MAX_WEIGHT - 2000
 
 
+def test_oversubscribed_reclaim_preserves_miner_ranking() -> None:
+    """Reclaiming the overflow must not invert payout order: a larger share
+    never ends up below a smaller one after the dust floor is funded."""
+    pairs = [(0, Decimal("0.50")), (1, Decimal("0.49"))]
+    pairs += [(uid, Decimal("0.0000001")) for uid in range(2, 4000)]
+    out = dict(normalize_weights(pairs, burn_uid=99_999))
+    assert out[0] >= out[1]  # 0.50 share >= 0.49 share
+    for uid in range(2, 4000):
+        assert out[uid] >= 1
+        # Dust miners never out-earn a genuine large share.
+        assert out[uid] <= out[1]
+    assert sum(out.values()) == MAX_WEIGHT
+
+
 def test_more_positive_miners_than_max_weight_raises() -> None:
     pairs = [(uid, Decimal(1)) for uid in range(MAX_WEIGHT + 1)]
     with pytest.raises(ValueError, match="cannot floor"):
@@ -299,3 +314,29 @@ def test_property_floor_holds_and_sum_exact(shares: list[Decimal]) -> None:
     for i, s in enumerate(shares):
         if s > 0:
             assert weights_by_uid.get(i, 0) >= 1
+
+
+@given(
+    shares=st.lists(
+        st.decimals(
+            min_value=Decimal("0.00000001"),
+            max_value=Decimal("1000"),
+            allow_nan=False,
+            allow_infinity=False,
+            places=8,
+        ),
+        min_size=1,
+        max_size=400,
+    ),
+)
+@settings(max_examples=120)
+def test_property_reclaim_preserves_ranking(shares: list[Decimal]) -> None:
+    """A larger original share never receives fewer u16 units than a smaller
+    one, even when overflow reclaim shaves the heaviest weights."""
+    shares = sorted(shares, reverse=True)
+    pairs = [(i, s) for i, s in enumerate(shares)]
+    out = dict(normalize_weights(pairs, burn_uid=10_000_000))
+    weights = [out[i] for i in range(len(shares))]
+    for a, b in itertools.pairwise(weights):
+        assert a >= b
+    assert sum(out.values()) == MAX_WEIGHT

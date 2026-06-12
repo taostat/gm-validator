@@ -189,16 +189,50 @@ def _reclaim_overflow(result: list[tuple[int, int]], deficit: int) -> None:
     exactly ``MAX_WEIGHT`` without dropping any floored miner below 1.
 
     Over-subscription floors many sub-unit shares up to 1, which can push the
-    sum past ``MAX_WEIGHT``; the surplus is reclaimed from the largest weights
-    (those that can spare it) rather than from the floored ones.
+    sum past ``MAX_WEIGHT``. Reclaim by water-filling: shave the deficit off
+    the tallest weights uniformly so a larger share never falls below a smaller
+    one. Floored dust entries (weight 1) are never touched — the count guard in
+    the caller guarantees the taller entries hold enough surplus.
     """
     order = sorted(range(len(result)), key=lambda i: result[i][1], reverse=True)
+    weights = [result[i][1] for i in order]
+
+    level = _water_level(weights, deficit)
     for idx in order:
-        if deficit <= 0:
-            break
         uid, weight = result[idx]
-        take = min(deficit, weight - 1)
-        if take <= 0:
-            continue
-        result[idx] = (uid, weight - take)
-        deficit -= take
+        if weight <= level:
+            break
+        result[idx] = (uid, level)
+        deficit -= weight - level
+
+    # Residual units (deficit not divisible across the capped entries) come off
+    # the bottom of the `level` plateau upward, so an originally-larger share
+    # never drops below an originally-smaller one.
+    plateau_end = next(
+        (rank for rank, idx in enumerate(order) if result[idx][1] < level),
+        len(order),
+    )
+    cursor = plateau_end - 1
+    while deficit > 0 and cursor >= 0:
+        uid, weight = result[order[cursor]]
+        if weight > 1:
+            result[order[cursor]] = (uid, weight - 1)
+            deficit -= 1
+        cursor -= 1
+
+
+def _water_level(weights: list[int], deficit: int) -> int:
+    """Highest integer level L such that capping ``weights`` (descending) at L
+    removes at most ``deficit`` units. Capping the remainder above L is handled
+    by the caller one unit at a time.
+    """
+    reclaimed = 0
+    for rank in range(1, len(weights)):
+        # Dropping the top `rank` entries from weights[rank-1] to weights[rank]
+        # reclaims `rank * drop` units.
+        drop = weights[rank - 1] - weights[rank]
+        if reclaimed + rank * drop >= deficit:
+            return weights[rank - 1] - (deficit - reclaimed) // rank
+        reclaimed += rank * drop
+    n = len(weights)
+    return weights[-1] - (deficit - reclaimed) // n
