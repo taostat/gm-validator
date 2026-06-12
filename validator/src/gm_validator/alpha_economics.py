@@ -193,11 +193,12 @@ def _reclaim_overflow(result: list[tuple[int, int]], deficit: int) -> None:
     (those that can spare it) rather than from the floored ones.
     """
     order = sorted(range(len(result)), key=lambda i: result[i][1], reverse=True)
-    cursor = 0
-    while deficit > 0:
-        idx = order[cursor % len(order)]
+    for idx in order:
+        if deficit <= 0:
+            break
         uid, weight = result[idx]
-        if weight > 1:
-            result[idx] = (uid, weight - 1)
-            deficit -= 1
-        cursor += 1
+        take = min(deficit, weight - 1)
+        if take <= 0:
+            continue
+        result[idx] = (uid, weight - take)
+        deficit -= take

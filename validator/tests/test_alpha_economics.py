@@ -208,7 +208,9 @@ def test_oversubscribed_floor_reclaims_overflow_to_max_weight() -> None:
     assert sum(w for _, w in out) == MAX_WEIGHT
     for uid in range(1, 2000):
         assert weights_by_uid[uid] >= 1
-    assert weights_by_uid[0] > 1  # heavy miner keeps the bulk after reclaim
+    # Reclaim drains only the overflow from the heavy miner, which keeps the
+    # bulk of MAX_WEIGHT (it loses at most ~the dust count of units).
+    assert weights_by_uid[0] > MAX_WEIGHT - 2000
 
 
 def test_more_positive_miners_than_max_weight_raises() -> None:
