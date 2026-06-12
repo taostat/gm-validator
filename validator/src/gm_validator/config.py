@@ -47,8 +47,11 @@ class ValidatorConfig:
     # Bittensor.
     bittensor_netuid: int
     bittensor_endpoint: str | None
-    bittensor_wallet_name: str | None
-    bittensor_wallet_hotkey: str | None
+    # The validator hotkey's secret seed — a BIP-39 mnemonic or a
+    # `0x`-prefixed hex seed. The signing keypair is built in memory from
+    # it; no wallet keyfile is read from or written to disk. Env:
+    # BITTENSOR_HOTKEY_SEED.
+    bittensor_hotkey_seed: str | None
     bittensor_mock: bool
 
     # Polling / timing.
@@ -82,8 +85,7 @@ class ValidatorConfig:
             ),
             bittensor_netuid=_int_env("BITTENSOR_NETUID", 0),
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
-            bittensor_wallet_name=os.environ.get("BITTENSOR_WALLET_NAME"),
-            bittensor_wallet_hotkey=os.environ.get("BITTENSOR_WALLET_HOTKEY"),
+            bittensor_hotkey_seed=os.environ.get("BITTENSOR_HOTKEY_SEED"),
             bittensor_mock=os.environ.get("BITTENSOR_MOCK", "0") in {"1", "true", "True"},
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),

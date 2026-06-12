@@ -1,24 +1,29 @@
 """Real bittensor submitter — submits weights to the subtensor chain.
 
-This wraps the ``bittensor`` SDK (v10). It opens a wallet, connects to a
-subtensor endpoint, and calls ``subtensor.set_weights`` once per epoch.
-The validator's hot-path code never imports ``bittensor`` directly — it
-talks to the ``Submitter`` protocol in ``bittensor_adapter`` — so the
-test suite (which uses ``MockSubmitter``) does not pull in the heavy
-dependency.
+This wraps the ``bittensor`` SDK (v10). It builds the validator hotkey
+keypair in memory from a seed, connects to a subtensor endpoint, and
+calls ``subtensor.set_weights`` once per epoch. The validator's hot-path
+code never imports ``bittensor`` directly — it talks to the ``Submitter``
+protocol in ``bittensor_adapter`` — so the test suite (which uses
+``MockSubmitter``) does not pull in the heavy dependency.
 
 The ``bittensor`` import is deferred to the methods that need it so that
 merely importing this module is cheap; only constructing ``RealSubmitter``
 or calling ``submit`` requires the SDK to be installed.
+
+The hotkey is loaded entirely in memory — no wallet keyfile is ever read
+from or written to disk. ``BITTENSOR_HOTKEY_SEED`` carries only the
+secret seed material: either a BIP-39 mnemonic or a ``0x``-prefixed
+hex seed. No coldkey, no wallet directory, no keyfile JSON blob.
 
 Config (all env-driven via ``ValidatorConfig``):
 
 - ``BITTENSOR_NETUID`` — subnet id the validator scores.
 - ``BITTENSOR_ENDPOINT`` — subtensor websocket URL (``wss://...``). When
   unset the SDK default network ("finney" mainnet) is used.
-- ``BITTENSOR_WALLET_NAME`` — coldkey wallet name on disk.
-- ``BITTENSOR_WALLET_HOTKEY`` — hotkey within that wallet; this is the
-  validator's signing key for ``set_weights`` extrinsics.
+- ``BITTENSOR_HOTKEY_SEED`` — the validator hotkey's secret seed: a
+  BIP-39 mnemonic (space-separated words) or a ``0x``-prefixed hex seed.
+  The signing keypair is built in memory from it.
 """
 
 from __future__ import annotations
@@ -33,45 +38,97 @@ class WeightSubmissionError(RuntimeError):
     """The subtensor rejected a ``set_weights`` extrinsic."""
 
 
+class HotkeyConfigError(RuntimeError):
+    """The hotkey seed was missing or could not be parsed into a keypair."""
+
+
+def _keypair_from_seed(seed: str) -> Any:
+    """Build a ``bittensor.Keypair`` in memory from a seed.
+
+    Accepts either a BIP-39 mnemonic (space-separated words) or a
+    ``0x``-prefixed hex seed. Nothing is read from or written to disk.
+
+    Args:
+        seed: ``BITTENSOR_HOTKEY_SEED`` — a mnemonic or ``0x`` hex seed.
+
+    Returns:
+        A ``bittensor.Keypair`` carrying the signing key.
+
+    Raises:
+        HotkeyConfigError: ``seed`` is empty, or neither a valid mnemonic
+            nor a valid ``0x`` hex seed.
+    """
+    import bittensor
+
+    candidate = seed.strip()
+    if not candidate:
+        raise HotkeyConfigError(
+            "BITTENSOR_HOTKEY_SEED is empty; provide the validator hotkey "
+            "seed as a BIP-39 mnemonic or a 0x-prefixed hex seed"
+        )
+    try:
+        if candidate.startswith("0x"):
+            return bittensor.Keypair.create_from_seed(candidate)
+        return bittensor.Keypair.create_from_mnemonic(candidate)
+    except Exception as exc:
+        raise HotkeyConfigError(
+            "BITTENSOR_HOTKEY_SEED is not a valid BIP-39 mnemonic or 0x-prefixed hex seed"
+        ) from exc
+
+
+class _KeypairWallet:
+    """Shim wrapping a bare ``bittensor.Keypair`` as a wallet.
+
+    ``subtensor.set_weights`` expects a wallet object exposing ``.hotkey``
+    and (on newer bittensor versions) ``unlock_hotkey()``. The hotkey is
+    already in memory, so ``unlock_hotkey`` is a no-op and no keyfile is
+    ever read from disk.
+    """
+
+    def __init__(self, hotkey: Any) -> None:
+        self.hotkey = hotkey
+
+    def unlock_hotkey(self) -> None:
+        """No-op: the hotkey is already loaded in memory."""
+
+
 class RealSubmitter:
     """Real bittensor weight submitter.
 
-    Opens the wallet and a subtensor connection at construction time so
-    that a misconfigured wallet fails fast on startup rather than on the
-    first finalized epoch.
+    Builds the hotkey keypair in memory and opens a subtensor connection
+    at construction time so that a malformed seed or unreachable endpoint
+    fails fast on startup rather than on the first finalized epoch.
     """
 
     def __init__(
         self,
         netuid: int,
         endpoint: str | None,
-        wallet_name: str,
-        wallet_hotkey: str,
+        hotkey_seed: str,
     ) -> None:
-        """Open the wallet and connect to subtensor.
+        """Build the in-memory hotkey and connect to subtensor.
 
         Args:
             netuid: Subnet id the validator submits weights for.
             endpoint: Subtensor websocket URL; ``None`` selects the SDK
                 default network.
-            wallet_name: Coldkey wallet name on disk.
-            wallet_hotkey: Hotkey name within the wallet; the validator's
-                signing key.
+            hotkey_seed: The validator hotkey seed — a BIP-39 mnemonic or
+                a ``0x``-prefixed hex seed. The signing keypair is built
+                in memory from it; no keyfile is read from disk.
 
         Raises:
-            WeightSubmissionError: The wallet could not be opened or the
-                subtensor endpoint could not be reached.
+            HotkeyConfigError: The seed is missing or malformed.
+            WeightSubmissionError: The subtensor endpoint could not be
+                reached.
         """
-        import bittensor
-
         from gm_validator.subtensor_connect import connect_subtensor
 
         self._netuid = netuid
         self._endpoint = endpoint
+        hotkey = _keypair_from_seed(hotkey_seed)
+        self._wallet: Any = _KeypairWallet(hotkey)
+        hotkey_ss58 = hotkey.ss58_address
         try:
-            self._wallet: Any = bittensor.Wallet(name=wallet_name, hotkey=wallet_hotkey)
-            # Touch the hotkey so a missing/locked keyfile fails here.
-            hotkey_ss58 = self._wallet.hotkey.ss58_address
             # connect_subtensor retries transient endpoint failures (HTTP
             # 429 from public testnet RPCs in particular) so a brief
             # rate-limit window does not crash the pod into a tight
@@ -79,11 +136,10 @@ class RealSubmitter:
             self._subtensor: Any = connect_subtensor(endpoint)
         except Exception as exc:
             raise WeightSubmissionError(
-                f"failed to initialise bittensor wallet/subtensor "
-                f"(wallet={wallet_name}/{wallet_hotkey}, endpoint={endpoint}): {exc}"
+                f"failed to connect to subtensor (endpoint={endpoint}): {exc}"
             ) from exc
         LOGGER.info(
-            "RealSubmitter ready: netuid=%d hotkey=%s endpoint=%s",
+            "RealSubmitter ready: netuid=%d hotkey=%s endpoint=%s (in-memory keypair)",
             netuid,
             hotkey_ss58,
             endpoint or "<default>",

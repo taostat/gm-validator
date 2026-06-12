@@ -19,38 +19,32 @@ from gm_validator.validator import Validator
 
 
 def _real_submission_configured(config: ValidatorConfig) -> bool:
-    """True iff a real wallet is configured for on-chain submission."""
-    return (
-        not config.bittensor_mock
-        and bool(config.bittensor_wallet_name)
-        and bool(config.bittensor_wallet_hotkey)
-    )
+    """True iff a real hotkey is configured for on-chain submission."""
+    return not config.bittensor_mock and bool(config.bittensor_hotkey_seed)
 
 
 def _build_submitter(config: ValidatorConfig) -> Submitter:
     if not _real_submission_configured(config):
-        # No wallet configured (or mock forced): record submissions in
+        # No hotkey configured (or mock forced): record submissions in
         # memory. Useful for build-phase smoke tests.
         return MockSubmitter()
-    # Wallet/hotkey are non-None here (guarded by _real_submission_configured),
-    # but the config types are Optional; assert to satisfy the type checker.
-    assert config.bittensor_wallet_name is not None
-    assert config.bittensor_wallet_hotkey is not None
+    # hotkey_seed is non-None here (guarded by _real_submission_configured),
+    # but the config type is Optional; assert to satisfy the type checker.
+    assert config.bittensor_hotkey_seed is not None
     # Lazy import so the test path does not require bittensor-py.
     from gm_validator.bittensor_real import RealSubmitter
 
     return RealSubmitter(
         netuid=config.bittensor_netuid,
         endpoint=config.bittensor_endpoint,
-        wallet_name=config.bittensor_wallet_name,
-        wallet_hotkey=config.bittensor_wallet_hotkey,
+        hotkey_seed=config.bittensor_hotkey_seed,
     )
 
 
 def _build_miner_uid_lookup(config: ValidatorConfig) -> dict[str, int]:
     """Build the hotkey -> uid lookup from the subnet metagraph.
 
-    Returns an empty mapping when no real wallet is configured — the
+    Returns an empty mapping when no real hotkey is configured — the
     mock-submitter build path has no chain to query.
     """
     if not _real_submission_configured(config):
