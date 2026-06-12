@@ -228,6 +228,23 @@ def test_oversubscribed_reclaim_preserves_miner_ranking() -> None:
     assert sum(out.values()) == MAX_WEIGHT
 
 
+def test_reclaim_tiebreak_shaves_the_genuinely_smaller_share() -> None:
+    """Two miners that quantize to the same u16 value but differ in their
+    Decimal share: the reclaim residual must come off the smaller share, never
+    invert the pair by input order."""
+    pairs = [
+        (0, Decimal("0.5")),
+        (1, Decimal("0.500001")),
+        (2, Decimal("0.0000001")),
+        (3, Decimal("0.0000001")),
+    ]
+    out = dict(normalize_weights(pairs, burn_uid=99))
+    assert out[1] >= out[0]  # 0.500001 share never below the 0.5 share
+    assert sum(out.values()) == MAX_WEIGHT
+    assert out[2] >= 1
+    assert out[3] >= 1
+
+
 def test_more_positive_miners_than_max_weight_raises() -> None:
     pairs = [(uid, Decimal(1)) for uid in range(MAX_WEIGHT + 1)]
     with pytest.raises(ValueError, match="cannot floor"):
@@ -332,11 +349,13 @@ def test_property_floor_holds_and_sum_exact(shares: list[Decimal]) -> None:
 @settings(max_examples=120)
 def test_property_reclaim_preserves_ranking(shares: list[Decimal]) -> None:
     """A larger original share never receives fewer u16 units than a smaller
-    one, even when overflow reclaim shaves the heaviest weights."""
-    shares = sorted(shares, reverse=True)
+    one, even when overflow reclaim shaves the heaviest weights and even when
+    the inputs arrive in arbitrary order."""
     pairs = [(i, s) for i, s in enumerate(shares)]
     out = dict(normalize_weights(pairs, burn_uid=10_000_000))
-    weights = [out[i] for i in range(len(shares))]
-    for a, b in itertools.pairwise(weights):
+    # Walk uids in descending true-share order; u16 weights must not increase.
+    by_share = sorted(range(len(shares)), key=lambda i: shares[i], reverse=True)
+    ranked = [out[i] for i in by_share]
+    for a, b in itertools.pairwise(ranked):
         assert a >= b
     assert sum(out.values()) == MAX_WEIGHT

@@ -169,7 +169,8 @@ def normalize_weights(
 
     remainder = MAX_WEIGHT - running_total
     if remainder < 0:
-        _reclaim_overflow(result, -remainder)
+        shares = [w for _, w in cleaned]
+        _reclaim_overflow(result, shares, -remainder)
         return result
     if remainder == 0:
         return result
@@ -184,17 +185,28 @@ def normalize_weights(
     return result
 
 
-def _reclaim_overflow(result: list[tuple[int, int]], deficit: int) -> None:
+def _reclaim_overflow(
+    result: list[tuple[int, int]],
+    shares: list[Decimal],
+    deficit: int,
+) -> None:
     """Trim ``deficit`` units off the heaviest entries so the vector sums to
     exactly ``MAX_WEIGHT`` without dropping any floored miner below 1.
 
     Over-subscription floors many sub-unit shares up to 1, which can push the
     sum past ``MAX_WEIGHT``. Reclaim by water-filling: shave the deficit off
     the tallest weights uniformly so a larger share never falls below a smaller
-    one. Floored dust entries (weight 1) are never touched — the count guard in
-    the caller guarantees the taller entries hold enough surplus.
+    one. ``shares`` (the pre-quantization Decimal weights, index-aligned with
+    ``result``) breaks ties so the shave lands on the genuinely smaller share
+    when two miners quantize to the same u16 value. Floored dust entries
+    (weight 1) are never touched — the count guard in the caller guarantees the
+    taller entries hold enough surplus.
     """
-    order = sorted(range(len(result)), key=lambda i: result[i][1], reverse=True)
+    order = sorted(
+        range(len(result)),
+        key=lambda i: (result[i][1], shares[i]),
+        reverse=True,
+    )
     weights = [result[i][1] for i in order]
 
     level = _water_level(weights, deficit)
