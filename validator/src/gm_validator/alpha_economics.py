@@ -120,6 +120,13 @@ def normalize_weights(
 ) -> list[tuple[int, int]]:
     """Convert float-domain weights to u16, padding the burn slot with dust.
 
+    Every miner with a strictly positive weight is floored to at least 1 u16
+    unit so a share below ``1/MAX_WEIGHT`` keeps its emission instead of
+    truncating to 0 and falling through to burn. The floored units are drawn
+    from the burn remainder; when demand over-subscribes the pool and the
+    burn remainder cannot cover them, the surplus is reclaimed from the
+    heaviest miners so the vector still sums to exactly ``MAX_WEIGHT``.
+
     Args:
         miner_weights: ``(uid, weight)`` pairs in pool units. When sum
             > 1 the inputs are renormed before u16 conversion; when sum
@@ -130,10 +137,18 @@ def normalize_weights(
 
     Returns:
         ``(uid, u16_weight)`` pairs summing to exactly ``MAX_WEIGHT``.
+
+    Raises:
+        ValueError: More than ``MAX_WEIGHT`` miners have positive weight, so
+            they cannot all be floored to >= 1 within the u16 budget.
     """
     cleaned = [(uid, w) for uid, w in miner_weights if w > 0]
     if not cleaned:
         return [(burn_uid, MAX_WEIGHT)]
+    if len(cleaned) > MAX_WEIGHT:
+        raise ValueError(
+            f"cannot floor {len(cleaned)} positive miners to >=1 within MAX_WEIGHT={MAX_WEIGHT}"
+        )
 
     total = sum((w for _, w in cleaned), _ZERO)
     if total <= 0:
@@ -141,17 +156,23 @@ def normalize_weights(
 
     renorm = total if total > Decimal(1) else Decimal(1)
 
+    # Floor: every strictly-positive share earns at least one unit so a miner
+    # below 1/MAX_WEIGHT keeps its emission instead of truncating to burn. The
+    # floored units come out of the burn remainder below; cleaned filters to
+    # w > 0, so max(1, ...) never pays a non-participant.
     result: list[tuple[int, int]] = []
     running_total = 0
     for uid, weight in cleaned:
-        u16_weight = int((weight / renorm) * MAX_WEIGHT)
-        if u16_weight <= 0:
-            continue
+        u16_weight = max(1, int((weight / renorm) * MAX_WEIGHT))
         result.append((uid, u16_weight))
         running_total += u16_weight
 
     remainder = MAX_WEIGHT - running_total
-    if remainder <= 0:
+    if remainder < 0:
+        shares = [w for _, w in cleaned]
+        _reclaim_overflow(result, shares, -remainder)
+        return result
+    if remainder == 0:
         return result
 
     for i, (uid, w) in enumerate(result):
@@ -162,3 +183,68 @@ def normalize_weights(
         result.append((burn_uid, remainder))
 
     return result
+
+
+def _reclaim_overflow(
+    result: list[tuple[int, int]],
+    shares: list[Decimal],
+    deficit: int,
+) -> None:
+    """Trim ``deficit`` units off the heaviest entries so the vector sums to
+    exactly ``MAX_WEIGHT`` without dropping any floored miner below 1.
+
+    Over-subscription floors many sub-unit shares up to 1, which can push the
+    sum past ``MAX_WEIGHT``. Reclaim by water-filling: shave the deficit off
+    the tallest weights uniformly so a larger share never falls below a smaller
+    one. ``shares`` (the pre-quantization Decimal weights, index-aligned with
+    ``result``) breaks ties so the shave lands on the genuinely smaller share
+    when two miners quantize to the same u16 value. Floored dust entries
+    (weight 1) are never touched — the count guard in the caller guarantees the
+    taller entries hold enough surplus.
+    """
+    order = sorted(
+        range(len(result)),
+        key=lambda i: (result[i][1], shares[i]),
+        reverse=True,
+    )
+    weights = [result[i][1] for i in order]
+
+    level = _water_level(weights, deficit)
+    for idx in order:
+        uid, weight = result[idx]
+        if weight <= level:
+            break
+        result[idx] = (uid, level)
+        deficit -= weight - level
+
+    # Residual units (deficit not divisible across the capped entries) come off
+    # the bottom of the `level` plateau upward, so an originally-larger share
+    # never drops below an originally-smaller one.
+    plateau_end = next(
+        (rank for rank, idx in enumerate(order) if result[idx][1] < level),
+        len(order),
+    )
+    cursor = plateau_end - 1
+    while deficit > 0 and cursor >= 0:
+        uid, weight = result[order[cursor]]
+        if weight > 1:
+            result[order[cursor]] = (uid, weight - 1)
+            deficit -= 1
+        cursor -= 1
+
+
+def _water_level(weights: list[int], deficit: int) -> int:
+    """Highest integer level L such that capping ``weights`` (descending) at L
+    removes at most ``deficit`` units. Capping the remainder above L is handled
+    by the caller one unit at a time.
+    """
+    reclaimed = 0
+    for rank in range(1, len(weights)):
+        # Dropping the top `rank` entries from weights[rank-1] to weights[rank]
+        # reclaims `rank * drop` units.
+        drop = weights[rank - 1] - weights[rank]
+        if reclaimed + rank * drop >= deficit:
+            return weights[rank - 1] - (deficit - reclaimed) // rank
+        reclaimed += rank * drop
+    n = len(weights)
+    return weights[-1] - (deficit - reclaimed) // n
