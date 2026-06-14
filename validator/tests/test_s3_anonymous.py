@@ -63,6 +63,19 @@ def test_subnet_owner_uid_parsed_from_env(monkeypatch: pytest.MonkeyPatch) -> No
     assert config.subnet_owner_uid == 103
 
 
+def test_blocks_per_epoch_defaults_to_chain_epoch_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset `BLOCKS_PER_EPOCH` defaults to 361 (`tempo + 1`), not 360 —
+    must match the gm finalizer/registry divisor or the
+    `finalized/epoch=<N>/` S3 paths this validator probes desync."""
+    monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
+    monkeypatch.delenv("BLOCKS_PER_EPOCH", raising=False)
+    config = ValidatorConfig.from_env()
+    assert config.blocks_per_epoch == 361
+
+
 # ---------------------------------------------------------------------------
 # S3 client construction in _run
 # ---------------------------------------------------------------------------
