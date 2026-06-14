@@ -43,6 +43,12 @@ class ValidatorConfig:
     # does not re-submit weights for epochs already finalized in S3.
     # Env: PROCESSED_STATE_PATH.
     processed_state_path: str
+    # Upper bound on how many newly-finalized epochs one tick submits
+    # weights for. The older unprocessed backlog is retired to
+    # processed-state without a chain submit — weights are a current
+    # snapshot, so re-submitting a stale backlog only burns inclusion
+    # time and leaks websocket state. Env: MAX_EPOCHS_PER_TICK.
+    max_epochs_per_tick: int
 
     # Bittensor.
     bittensor_netuid: int
@@ -83,6 +89,7 @@ class ValidatorConfig:
             processed_state_path=os.environ.get(
                 "PROCESSED_STATE_PATH", "/var/cache/gm-validator/processed.json"
             ),
+            max_epochs_per_tick=_int_env("MAX_EPOCHS_PER_TICK", 3),
             bittensor_netuid=_int_env("BITTENSOR_NETUID", 0),
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
             bittensor_hotkey_seed=os.environ.get("BITTENSOR_HOTKEY_SEED"),

@@ -47,6 +47,19 @@ class ProcessedState:
         self._epochs.add(epoch_id)
         self._persist()
 
+    def mark_many(self, epoch_ids: set[int]) -> None:
+        """Record several epoch ids as processed in a single persist.
+
+        Retires a stale backlog of superseded epochs in one atomic write
+        rather than one fsync per epoch — the backlog can be hundreds of
+        entries on a fresh deploy.
+        """
+        new = epoch_ids - self._epochs
+        if not new:
+            return
+        self._epochs |= new
+        self._persist()
+
     def _persist(self) -> None:
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         tmp = self._path + ".part"

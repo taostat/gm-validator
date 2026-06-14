@@ -29,6 +29,7 @@ def _config(*, mock: bool, seed: str | None) -> ValidatorConfig:
         local_mirror_dir="unused-mirror-dir",
         mirror_retention_epochs=10,
         processed_state_path="unused-processed.json",
+        max_epochs_per_tick=100,
         bittensor_netuid=42,
         bittensor_endpoint=None,
         bittensor_hotkey_seed=seed,
