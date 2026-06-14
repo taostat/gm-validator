@@ -184,6 +184,123 @@ def test_partial_missing_uid_still_counted_against_pool() -> None:
     assert abs((weights_by_uid[1] / max(weights_by_uid[2], 1)) - (5 / 3)) < 0.01
 
 
+def test_multiplier_one_is_exact_no_op() -> None:
+    """Default multiplier (1) produces byte-identical weights to no knob."""
+    rows = [
+        _row("A", 5_000_000_000),
+        _row("B", 3_000_000_000),
+        _row("C", 1_000_000_000),
+    ]
+    lookup = {"A": 1, "B": 2, "C": 3}
+    summary = _summary("0.50", emissions_alpha="50")
+
+    baseline = compute_weights(
+        score(rows), miner_uid_lookup=lookup, epoch_summary=summary, subnet_owner_uid=99
+    )
+    explicit_one = compute_weights(
+        score(rows),
+        miner_uid_lookup=lookup,
+        epoch_summary=summary,
+        subnet_owner_uid=99,
+        earnings_multiplier=Decimal(1),
+    )
+    assert explicit_one.uids == baseline.uids
+    assert explicit_one.weights == baseline.weights
+
+
+def test_multiplier_one_no_op_for_large_earnings() -> None:
+    """Multiplier 1 is exact even for totals exceeding Decimal's default
+    precision — the value bypasses any Decimal-context rounding."""
+    big = 12_345_678_901_234_567_890_123_456_789  # 29 digits > default prec 28
+    rows = [_row("A", big)]
+    lookup = {"A": 1}
+    summary = _summary("0.50", emissions_alpha="50")
+
+    baseline = compute_weights(
+        score(rows), miner_uid_lookup=lookup, epoch_summary=summary, subnet_owner_uid=99
+    )
+    explicit_one = compute_weights(
+        score(rows),
+        miner_uid_lookup=lookup,
+        epoch_summary=summary,
+        subnet_owner_uid=99,
+        earnings_multiplier=Decimal(1),
+    )
+    assert explicit_one.weights == baseline.weights
+    # consumed_usd reflects the exact 29-digit total, not a rounded one.
+    assert explicit_one.epoch_result.total_consumed_usd == Decimal(big) / Decimal(10**9)
+
+
+def test_fractional_multiplier_floors_to_integer_ndollars() -> None:
+    """A fractional multiplier floors the scaled earnings to whole nano-dollars
+    with no float drift."""
+    rows = [_row("A", 1_000_000_001)]  # odd value so 1.5x has a fractional tail
+    lookup = {"A": 1}
+    summary = _summary("0.50", emissions_alpha="50")
+
+    vector = compute_weights(
+        score(rows),
+        miner_uid_lookup=lookup,
+        epoch_summary=summary,
+        subnet_owner_uid=99,
+        earnings_multiplier=Decimal("1.5"),
+    )
+    # 1_000_000_001 * 1.5 = 1_500_000_001.5 -> floored to 1_500_000_001 nd.
+    expected_usd = Decimal(1_500_000_001) / Decimal(10**9)
+    assert vector.epoch_result.total_consumed_usd == expected_usd
+
+
+def test_multiplier_scales_pre_cap_earnings_input() -> None:
+    """A multiplier of N scales the consumed_usd that feeds the pool math by N."""
+    rows = [_row("A", 50_000)]  # well under the pool — sub-floor at multiplier 1
+    lookup = {"A": 1}
+    summary = _summary("0.50", emissions_alpha="50")
+
+    base = compute_weights(
+        score(rows), miner_uid_lookup=lookup, epoch_summary=summary, subnet_owner_uid=99
+    )
+    scaled = compute_weights(
+        score(rows),
+        miner_uid_lookup=lookup,
+        epoch_summary=summary,
+        subnet_owner_uid=99,
+        earnings_multiplier=Decimal(1000),
+    )
+    base_consumed = base.epoch_result.total_consumed_usd
+    scaled_consumed = scaled.epoch_result.total_consumed_usd
+    assert scaled_consumed == base_consumed * 1000
+
+
+def test_multiplier_lifts_sub_floor_miner_to_proportional_weight() -> None:
+    """Representative testnet case: ~50k nd earnings against a large pool sits at
+    the 1-unit dust floor at multiplier 1, but a 100000x knob lifts the miner to
+    a clearly-visible proportional u16 well above the floor."""
+    rows = [_row("A", 50_000)]  # $5e-5 of demand
+    lookup = {"A": 1}
+    # emissions_alpha=10000, price=$1 -> pool = 10000*0.41*1 = $4100.
+    # share = 5e-5 / 4100 ~= 1.2e-8 -> *65535 ~= 8e-4, which the floor-to-1
+    # patch pins at a single dust unit — invisible against the 65534 burn.
+    summary = _summary("1.0", emissions_alpha="10000")
+
+    base = compute_weights(
+        score(rows), miner_uid_lookup=lookup, epoch_summary=summary, subnet_owner_uid=99
+    )
+    base_by_uid = dict(zip(base.uids, base.weights, strict=True))
+    assert base_by_uid[1] == 1  # pinned to the dust floor — effectively burns
+    assert base_by_uid[99] == MAX_WEIGHT - 1
+
+    amplified = compute_weights(
+        score(rows),
+        miner_uid_lookup=lookup,
+        epoch_summary=summary,
+        subnet_owner_uid=99,
+        earnings_multiplier=Decimal(100_000),
+    )
+    amp_by_uid = dict(zip(amplified.uids, amplified.weights, strict=True))
+    assert amp_by_uid[1] > 1  # lifted off the dust floor into a visible share
+    assert sum(amplified.weights) == MAX_WEIGHT
+
+
 def test_missing_emissions_alpha_raises_stale_epoch_summary() -> None:
     """epoch_summary.json without emissions_alpha => StaleEpochSummaryError.
 

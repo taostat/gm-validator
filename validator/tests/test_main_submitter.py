@@ -11,6 +11,7 @@ seed raises.
 from __future__ import annotations
 
 import dataclasses
+from decimal import Decimal
 
 import pytest
 
@@ -37,6 +38,7 @@ def _config(*, mock: bool, seed: str | None) -> ValidatorConfig:
         poll_interval_secs=1,
         metrics_port=9092,
         subnet_owner_uid=99,
+        weight_earnings_multiplier=Decimal(1),
     )
 
 

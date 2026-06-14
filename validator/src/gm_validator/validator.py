@@ -235,6 +235,7 @@ class Validator:
             self._miner_uid_lookup,
             epoch_summary=epoch_summary,
             subnet_owner_uid=self._config.subnet_owner_uid,
+            earnings_multiplier=self._config.weight_earnings_multiplier,
         )
 
         submitted = False

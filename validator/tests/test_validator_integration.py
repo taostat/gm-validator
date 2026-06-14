@@ -18,6 +18,7 @@ import io
 import json
 import os
 import pathlib
+from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -212,6 +213,7 @@ def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
         poll_interval_secs=1,
         metrics_port=9092,
         subnet_owner_uid=99,
+        weight_earnings_multiplier=Decimal(1),
     )
 
 
