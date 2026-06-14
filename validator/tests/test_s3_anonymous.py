@@ -98,6 +98,7 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "bittensor_endpoint": None,
         "bittensor_hotkey_seed": None,
         "bittensor_mock": True,
+        "subtensor_connect_timeout_secs": 30,
         "poll_interval_secs": 60,
         "metrics_port": 9092,
         "subnet_owner_uid": 0,
