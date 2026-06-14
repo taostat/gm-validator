@@ -39,9 +39,12 @@ class ValidatorConfig:
     # How many of the most-recent epoch mirrors to keep on disk; older
     # ones are pruned each tick. Env: MIRROR_RETENTION_EPOCHS.
     mirror_retention_epochs: int
-    # Bittensor tempo — blocks per epoch. The chain head block divided by
-    # this gives the current epoch id, the same derivation the finalizer
-    # uses (`block // blocks_per_epoch`). Env: BLOCKS_PER_EPOCH.
+    # Chain epoch length (`tempo + 1` = 361). A Bittensor subnet runs
+    # consensus/emission every `tempo + 1` blocks, so the chain head block
+    # divided by 361 gives the current epoch id — the same derivation the
+    # finalizer uses (`block // blocks_per_epoch`). Must equal the gm
+    # finalizer/registry divisor or the `finalized/epoch=<N>/` S3 paths
+    # this validator probes desync. Env: BLOCKS_PER_EPOCH.
     blocks_per_epoch: int
     # How many epochs back from the newest closed epoch to probe for a
     # `_FINALIZED` marker before giving up for this tick. Tolerates the
@@ -85,7 +88,7 @@ class ValidatorConfig:
             s3_anonymous=os.environ.get("GM_VALIDATOR_S3_ANONYMOUS", "0") in {"1", "true", "True"},
             local_mirror_dir=os.environ.get("LOCAL_MIRROR_DIR", "/var/cache/gm-validator"),
             mirror_retention_epochs=_int_env("MIRROR_RETENTION_EPOCHS", 10),
-            blocks_per_epoch=_int_env("BLOCKS_PER_EPOCH", 360),
+            blocks_per_epoch=_int_env("BLOCKS_PER_EPOCH", 361),
             finalized_lookback_epochs=_int_env("FINALIZED_LOOKBACK_EPOCHS", 3),
             bittensor_netuid=_int_env("BITTENSOR_NETUID", 0),
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
