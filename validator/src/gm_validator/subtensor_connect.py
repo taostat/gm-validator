@@ -20,6 +20,12 @@ rate-limiter — would freeze startup forever, below the retry loop. The
 construction therefore runs in a worker thread bounded by a wall-clock
 ``connect_timeout``; a thread that does not finish in time becomes a
 ``TimeoutError`` the retry loop catches like any other transient failure.
+
+The same hang affects post-startup RPCs over the already-open socket:
+after a successful ``set_weights`` the next ``get_current_block`` can
+block indefinitely on a wedged websocket. ``run_with_timeout`` is the
+shared primitive that bounds any such call; ``RealSubmitter`` wraps its
+chain RPCs with it so a hung socket raises instead of freezing the loop.
 """
 
 from __future__ import annotations
@@ -37,6 +43,11 @@ LOGGER = logging.getLogger(__name__)
 # through, this only backstops tests and direct calls.
 DEFAULT_CONNECT_TIMEOUT_SECS = 30.0
 
+# Default wall-clock budget for one chain RPC over the long-lived socket
+# (get_current_block, set_weights) when no explicit timeout is passed.
+# Bounds a wedged-socket call so it raises instead of freezing the loop.
+DEFAULT_RPC_TIMEOUT_SECS = 30.0
+
 # Bounded exponential backoff: 8 attempts, doubling from 1s, capped at
 # 60s. Total budget is ~4 minutes — long enough to ride out a brief
 # rate-limit window, short enough that a real misconfig still fails the
@@ -46,31 +57,37 @@ _INITIAL_BACKOFF_SECS = 1.0
 _MAX_BACKOFF_SECS = 60.0
 
 
-def _call_with_timeout(
-    factory: Callable[[str | None], Any],
-    endpoint: str | None,
-    timeout: float,
-) -> Any:
-    """Run ``factory(endpoint)`` in a worker thread, bounded by ``timeout``.
+def run_with_timeout(label: str, fn: Callable[[], Any], timeout: float) -> Any:
+    """Run zero-arg ``fn`` in a daemon worker thread, bounded by ``timeout``.
 
-    The SDK construction is synchronous with no connect timeout, so a hung
-    connect can only be unblocked from outside. The worker is a daemon
-    thread: a connect that never finishes is abandoned rather than joined
-    forever, and is never returned into the success path. A connect that
-    finishes after the timeout (a late success) is likewise discarded —
-    the result is only read when ``join`` proves the thread finished in
-    time.
+    The bittensor SDK's websocket calls are synchronous with no per-call
+    timeout, so a wedged socket can only be unblocked from outside. The
+    worker is a daemon thread: a call that never finishes is abandoned
+    rather than joined forever, and its result is never returned into the
+    success path. A call that finishes after the timeout (a late result)
+    is likewise discarded — the result is only read once ``join`` proves
+    the thread finished in time.
+
+    This backs both the startup connect and the per-tick chain RPCs
+    (``get_current_block``, ``set_weights``). A timeout becomes a raised
+    ``TimeoutError`` the caller counts toward reconnect, so a hung socket
+    self-heals on a later tick instead of freezing the validator loop.
+
+    Args:
+        label: Short description of the call for the timeout message.
+        fn: The zero-arg callable to run under the timeout.
+        timeout: Wall-clock budget in seconds.
 
     Raises:
-        TimeoutError: ``factory`` did not finish within ``timeout``.
-        Exception: Whatever ``factory`` raised, re-raised in this thread.
+        TimeoutError: ``fn`` did not finish within ``timeout``.
+        Exception: Whatever ``fn`` raised, re-raised in this thread.
     """
     result: list[Any] = []
     error: list[BaseException] = []
 
     def _target() -> None:
         try:
-            result.append(factory(endpoint))
+            result.append(fn())
         except BaseException as exc:  # noqa: BLE001 — re-raised below in the caller's thread; the worker must not let any failure escape unobserved.
             error.append(exc)
 
@@ -78,10 +95,7 @@ def _call_with_timeout(
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
-        raise TimeoutError(
-            f"subtensor connect did not complete within {timeout:.1f}s "
-            f"(endpoint={endpoint or '<default>'})"
-        )
+        raise TimeoutError(f"{label} did not complete within {timeout:.1f}s")
     if error:
         raise error[0]
     return result[0]
@@ -123,9 +137,10 @@ def connect_subtensor(
 
     backoff = _INITIAL_BACKOFF_SECS
     last_exc: Exception | None = None
+    label = f"subtensor connect (endpoint={endpoint or '<default>'})"
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
-            return _call_with_timeout(factory, endpoint, connect_timeout)
+            return run_with_timeout(label, lambda: factory(endpoint), connect_timeout)
         except Exception as exc:  # noqa: BLE001 — bittensor surfaces transient failures (HTTP 429, websocket close, DNS, hung-connect TimeoutError) as a varied bag of exception types; the retry loop is endpoint-construction-only so a blind catch is the correct surface here.
             last_exc = exc
             if attempt == _MAX_ATTEMPTS:

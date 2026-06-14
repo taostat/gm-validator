@@ -36,6 +36,7 @@ def _config(*, mock: bool, seed: str | None) -> ValidatorConfig:
         bittensor_hotkey_seed=seed,
         bittensor_mock=mock,
         subtensor_connect_timeout_secs=30,
+        subtensor_rpc_timeout_secs=30,
         poll_interval_secs=1,
         metrics_port=9092,
         subnet_owner_uid=99,

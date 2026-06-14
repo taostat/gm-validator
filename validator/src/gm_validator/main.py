@@ -62,6 +62,7 @@ def _build_submitter(config: ValidatorConfig) -> Submitter:
         endpoint=config.bittensor_endpoint,
         hotkey_seed=config.bittensor_hotkey_seed,
         connect_timeout=config.subtensor_connect_timeout_secs,
+        rpc_timeout=config.subtensor_rpc_timeout_secs,
     )
 
 

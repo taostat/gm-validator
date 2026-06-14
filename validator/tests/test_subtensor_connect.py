@@ -13,12 +13,36 @@ from typing import Any
 
 import pytest
 
-from gm_validator.subtensor_connect import connect_subtensor
+from gm_validator.subtensor_connect import connect_subtensor, run_with_timeout
 
 
 class _FakeSubtensor:
     def __init__(self, endpoint: str | None) -> None:
         self.endpoint = endpoint
+
+
+def test_run_with_timeout_returns_result() -> None:
+    assert run_with_timeout("noop", lambda: 7, timeout=1.0) == 7
+
+
+def test_run_with_timeout_reraises_callable_error() -> None:
+    def _boom() -> int:
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        run_with_timeout("boom", _boom, timeout=1.0)
+
+
+def test_run_with_timeout_raises_on_hang() -> None:
+    """A callable that never finishes within the budget raises TimeoutError
+    rather than blocking the caller forever. The 5s wait is a teardown
+    backstop; the 0.05s budget fires first."""
+    release = threading.Event()
+    try:
+        with pytest.raises(TimeoutError, match="wedged"):
+            run_with_timeout("wedged", lambda: release.wait(timeout=5.0), timeout=0.05)
+    finally:
+        release.set()
 
 
 def test_first_attempt_succeeds_no_sleep() -> None:

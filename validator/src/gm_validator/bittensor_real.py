@@ -68,7 +68,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from gm_validator.subtensor_connect import DEFAULT_CONNECT_TIMEOUT_SECS
+from gm_validator.subtensor_connect import (
+    DEFAULT_CONNECT_TIMEOUT_SECS,
+    DEFAULT_RPC_TIMEOUT_SECS,
+    run_with_timeout,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -154,6 +158,7 @@ class RealSubmitter:
         endpoint: str | None,
         hotkey_seed: str,
         connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECS,
+        rpc_timeout: float = DEFAULT_RPC_TIMEOUT_SECS,
     ) -> None:
         """Build the in-memory hotkey and connect to subtensor.
 
@@ -167,6 +172,10 @@ class RealSubmitter:
             connect_timeout: Per-attempt wall-clock budget for opening the
                 subtensor websocket; a hung connect becomes a retryable
                 timeout instead of freezing startup.
+            rpc_timeout: Per-call wall-clock budget for a chain RPC over
+                the open socket (head read, submit); a hung call becomes a
+                ``TimeoutError`` that counts toward reconnect instead of
+                freezing the loop.
 
         Raises:
             HotkeyConfigError: The seed is missing or malformed.
@@ -176,6 +185,7 @@ class RealSubmitter:
         self._netuid = netuid
         self._endpoint = endpoint
         self._connect_timeout = connect_timeout
+        self._rpc_timeout = rpc_timeout
         self._subtensor: Any | None = None
         self._consecutive_failures = 0
         hotkey = _keypair_from_seed(hotkey_seed)
@@ -270,15 +280,26 @@ class RealSubmitter:
         counter. The reset asymmetry keeps the leak-fix's
         reconnect-after-three-submit-failures recovery intact.
 
+        The read is bounded by ``_rpc_timeout``: after a successful
+        ``set_weights`` the SDK can leave the websocket wedged so the next
+        ``get_current_block`` blocks forever, freezing the whole loop.
+        A timeout is a raised exception like any other connection failure —
+        it counts toward reconnect so the socket self-heals on a later tick.
+
         Raises:
-            WeightSubmissionError: No connection is available, or the head
-                read failed at the connection level.
+            WeightSubmissionError: No connection is available, the head
+                read failed at the connection level, or it timed out.
         """
         self._maybe_reconnect()
-        if self._subtensor is None:
+        subtensor = self._subtensor
+        if subtensor is None:
             raise WeightSubmissionError("no subtensor connection available for head-block read")
         try:
-            block = self._subtensor.get_current_block()
+            block = run_with_timeout(
+                "subtensor get_current_block",
+                subtensor.get_current_block,
+                self._rpc_timeout,
+            )
         except Exception as exc:
             self._consecutive_failures += 1
             raise WeightSubmissionError(f"head-block read failed: {exc}") from exc
@@ -299,10 +320,15 @@ class RealSubmitter:
             WeightSubmissionError: No connection is available, or the
                 metagraph read failed.
         """
-        if self._subtensor is None:
+        subtensor = self._subtensor
+        if subtensor is None:
             raise WeightSubmissionError("no subtensor connection available for metagraph read")
         try:
-            metagraph = self._subtensor.metagraph(netuid)
+            metagraph = run_with_timeout(
+                "subtensor metagraph",
+                lambda: subtensor.metagraph(netuid),
+                self._rpc_timeout,
+            )
         except Exception as exc:
             raise WeightSubmissionError(f"metagraph read failed: {exc}") from exc
         return {hotkey: uid for uid, hotkey in enumerate(metagraph.hotkeys)}
@@ -343,7 +369,8 @@ class RealSubmitter:
             return
 
         self._maybe_reconnect()
-        if self._subtensor is None:
+        subtensor = self._subtensor
+        if subtensor is None:
             raise WeightSubmissionError(f"epoch {epoch_id}: no subtensor connection available")
 
         LOGGER.info(
@@ -353,14 +380,22 @@ class RealSubmitter:
             len(uids),
             sum(weights),
         )
-        try:
-            success, message = self._subtensor.set_weights(
+
+        def _set_weights() -> tuple[bool, str | None]:
+            return subtensor.set_weights(
                 wallet=self._wallet,
                 netuid=netuid,
                 uids=uids,
                 weights=weights,
                 wait_for_inclusion=True,
                 wait_for_finalization=True,
+            )
+
+        try:
+            success, message = run_with_timeout(
+                f"subtensor set_weights (epoch {epoch_id})",
+                _set_weights,
+                self._rpc_timeout,
             )
         except Exception as exc:
             # A raised exception is a connection-level failure (dead
