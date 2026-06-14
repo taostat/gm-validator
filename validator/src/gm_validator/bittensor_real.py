@@ -16,48 +16,51 @@ from or written to disk. ``BITTENSOR_HOTKEY_SEED`` carries only the
 secret seed material: either a BIP-39 mnemonic or a ``0x``-prefixed
 hex seed. No coldkey, no wallet directory, no keyfile JSON blob.
 
-Config (all env-driven via ``ValidatorConfig``):
+Connection lifecycle:
 
-- ``BITTENSOR_NETUID`` — subnet id the validator scores.
-- ``BITTENSOR_ENDPOINT`` — subtensor websocket URL (``wss://...``). When
-  unset the SDK default network ("finney" mainnet) is used.
-- ``BITTENSOR_HOTKEY_SEED`` — the validator hotkey's secret seed: a
-  BIP-39 mnemonic (space-separated words) or a ``0x``-prefixed hex seed.
-  The signing keypair is built in memory from it.
+The submitter holds ONE long-lived ``Subtensor`` for the life of the
+process — the same websocket the blockmachine validator runs unchanged
+for 9+ days. A submission failure does NOT drop the connection: dropping
+and reopening the websocket on every failed or rejected submit leaks
+subscriptions inside the SDK and OOMs the pod in minutes. Instead a
+``_consecutive_failures`` counter reconnects only after three consecutive
+connection-level (raised-exception) failures, mirroring the bm validator's
+``_maybe_reconnect``; a clean success resets it to zero.
 
-Reconnect handling:
+Submit contract:
 
-The bittensor SDK holds a single websocket per ``Subtensor`` instance.
-When that websocket churns (idle close, network blip, validator
-endpoint failover) the SDK's internal retry can re-broadcast the same
-signed extrinsic during a ``wait_for_inclusion=True`` call; the chain
-then raises ``Transaction Already Imported``. Because the call was
-waiting on inclusion, the raise is positive evidence that the chain
-holds the extrinsic. We surface that as ``AlreadySubmittedError`` (a
-subclass of ``WeightSubmissionError``) so the caller can mark the epoch
-processed instead of looping.
+``set_weights`` is called with ``wait_for_inclusion=True,
+wait_for_finalization=True`` and the SDK default ``raise_error=False``, so
+substrate errors come back as an ``ExtrinsicResponse`` (unpacks as
+``(success, message)``) rather than a raised exception. Two outcomes drive
+the lifecycle:
 
-Three deliberate restrictions on what counts as "already submitted":
+- A raised exception is a connection-level failure (dead websocket, RPC
+  timeout). It increments the failure counter so the connection is
+  recreated once three pile up, and surfaces as ``WeightSubmissionError``.
+- A ``(False, message)`` return is a chain answer, so the socket is
+  healthy: it neither resets nor increments the counter, and surfaces as
+  ``WeightSubmissionError`` so the validator loop retries the epoch on the
+  next tick.
 
-- Only the raised-exception path with the ``Already Imported`` message
-  classifies. The ``(success=False, message)`` return shape, even with
-  the same text, carries no inclusion receipt — it can be a transaction
-  pool that sees a still-pending duplicate which may later be dropped,
-  so we treat it as a plain failure and retry next tick.
-- ``Invalid Transaction (bad signature)`` is excluded. Substrate emits
-  it for genuine signing failures (corrupt keyfile, wrong hotkey,
-  runtime upgrade) as well as stale-nonce replays.
-- ``Stale`` / ``Transaction is outdated`` are excluded. They mean the
-  validator hotkey's nonce has been advanced by some extrinsic, not
-  necessarily this one's weights vector.
+This counts only raised exceptions toward reconnect, exactly like the bm
+validator that has run this contract for 9+ days. The SDK can also wrap a
+transport failure into a ``(False, message)`` return, and its ``.error``
+field is populated for ordinary chain rejections as well as transport
+errors — so there is no reliable way to tell the two apart from the
+response without coupling to SDK-internal exception types. We accept the
+bm trade-off rather than reintroduce that coupling: the websocket-idle
+close that actually occurs in practice raises, and a persistently dead
+endpoint still surfaces through the startup connect on the kubelet
+restart.
 
-When a duplicate broadcast trips one of the excluded shapes, the outer
-validator loop logs and retries the epoch on the next tick; the retry
-then either matches ``Already Imported`` cleanly or succeeds.
-
-After any submission error we also drop the cached ``Subtensor`` so the
-next epoch opens a fresh websocket; otherwise a dead connection would
-poison every subsequent submission for the lifetime of the pod.
+Like the bm validator, there is no "already submitted" short-circuit. A
+``(False, "...Already Imported...")`` return carries no inclusion receipt —
+it can be the transaction pool rejecting a still-pending duplicate that
+may yet be dropped — so it is treated as a plain failure and retried.
+Re-submitting the identical weight vector is idempotent, and a genuinely
+landed epoch is retired by the superseded-epoch sweep once newer epochs
+finalize, so retrying never double-submits or loops forever.
 """
 
 from __future__ import annotations
@@ -68,31 +71,14 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 
 
-# Substrate's pool-side dedup response, lower-cased for matching. This
-# is the only message that unambiguously proves the chain already holds
-# this exact extrinsic — see module docstring for what we deliberately
-# do NOT classify here.
-_ALREADY_IMPORTED_FRAGMENT = "already imported"
-
-
-def _looks_already_submitted(message: str) -> bool:
-    """True iff *message* is substrate's "extrinsic already imported" error."""
-    return _ALREADY_IMPORTED_FRAGMENT in message.lower()
+# Connection-level failures tolerated before recreating the websocket.
+# A single failure never reconnects; only sustained failure does, which
+# avoids the per-error reconnect churn that leaked subscriptions.
+_RECONNECT_AFTER_FAILURES = 3
 
 
 class WeightSubmissionError(RuntimeError):
     """The subtensor rejected a ``set_weights`` extrinsic."""
-
-
-class AlreadySubmittedError(WeightSubmissionError):
-    """The chain already has this extrinsic — submission is logically done.
-
-    Raised when a substrate runtime error indicates the signed extrinsic
-    is already known to the chain (duplicate broadcast after a websocket
-    reconnect). The caller should treat the epoch as submitted and mark
-    it processed; retrying would re-broadcast the same extrinsic and hit
-    the same error.
-    """
 
 
 class HotkeyConfigError(RuntimeError):
@@ -152,11 +138,12 @@ class _KeypairWallet:
 class RealSubmitter:
     """Real bittensor weight submitter.
 
-    Builds the hotkey keypair in memory and opens a subtensor connection
-    at construction time so that a malformed seed or unreachable endpoint
-    fails fast on startup rather than on the first finalized epoch. The
-    subtensor connection is recreated lazily after any submission error
-    so a dropped websocket does not poison subsequent epochs.
+    Builds the hotkey keypair in memory and opens a single subtensor
+    connection at construction time so that a malformed seed or
+    unreachable endpoint fails fast on startup rather than on the first
+    finalized epoch. That connection is held for the life of the process
+    and recreated only after sustained connection failures — a single
+    failed submit reuses the existing websocket.
     """
 
     def __init__(
@@ -183,6 +170,7 @@ class RealSubmitter:
         self._netuid = netuid
         self._endpoint = endpoint
         self._subtensor: Any | None = None
+        self._consecutive_failures = 0
         hotkey = _keypair_from_seed(hotkey_seed)
         self._wallet: Any = _KeypairWallet(hotkey)
         hotkey_ss58 = hotkey.ss58_address
@@ -203,28 +191,51 @@ class RealSubmitter:
         """Open a fresh subtensor connection at the configured endpoint.
 
         Routes through ``connect_subtensor`` so both the construction-time
-        connect and lazy reconnects after a submission error retry
-        transient endpoint failures (HTTP 429 from public testnet RPCs in
+        connect and the rare post-failure reconnect retry transient
+        endpoint failures (HTTP 429 from public testnet RPCs in
         particular) instead of crash-looping the pod.
         """
         from gm_validator.subtensor_connect import connect_subtensor
 
         return connect_subtensor(self._endpoint)
 
-    def _reset_subtensor(self) -> None:
-        """Close and drop the cached subtensor so the next submit opens a fresh one.
+    def _maybe_reconnect(self) -> None:
+        """Recreate the websocket after sustained connection failures.
 
-        The bittensor SDK does not expose a stable "is the websocket
-        alive" check, and replacing the connection is cheap relative to
-        an epoch (60s+). After any submission error we close the cached
-        websocket and drop the instance; the next ``submit`` calls
-        ``_open_subtensor`` again. ``close()`` errors are suppressed
-        because we are already on the failure path — leaking the
-        connection to GC would also work but the explicit close prevents
-        websocket accumulation across many failed epochs.
+        Reconnects only once ``_consecutive_failures`` reaches
+        ``_RECONNECT_AFTER_FAILURES`` — a single failed submit reuses the
+        existing connection. Dropping and reopening on every failure leaks
+        SDK subscriptions and OOMs the pod, so reconnect is the rare
+        recovery path, not the per-error default. The old connection is
+        closed before the fresh one replaces it so the recovery path does
+        not itself leak websockets. A failed reconnect keeps the last
+        connection and leaves the counter tripped so the next submit
+        retries the reconnect.
         """
-        subtensor = self._subtensor
-        self._subtensor = None
+        if self._consecutive_failures < _RECONNECT_AFTER_FAILURES:
+            return
+        LOGGER.warning(
+            "reconnecting subtensor after %d consecutive failures",
+            self._consecutive_failures,
+        )
+        try:
+            fresh = self._open_subtensor()
+        except Exception as exc:  # noqa: BLE001 — keep the last connection on a failed reconnect; the counter stays tripped so the next submit retries.
+            LOGGER.error("subtensor reconnect failed: %s", exc)
+            return
+        self._close_subtensor(self._subtensor)
+        self._subtensor = fresh
+        self._consecutive_failures = 0
+        LOGGER.info("subtensor reconnected")
+
+    @staticmethod
+    def _close_subtensor(subtensor: Any | None) -> None:
+        """Best-effort close of a retired subtensor's websocket.
+
+        Called only when a fresh connection has already replaced it, so a
+        ``close()`` failure is logged and swallowed — the connection is
+        being discarded either way.
+        """
         if subtensor is None:
             return
         close = getattr(subtensor, "close", None)
@@ -232,8 +243,39 @@ class RealSubmitter:
             return
         try:
             close()
-        except Exception as exc:  # noqa: BLE001 — best-effort cleanup; connection is discarded either way
-            LOGGER.debug("subtensor close failed during reset: %s", exc)
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup; the retired connection is discarded regardless.
+            LOGGER.debug("retired subtensor close failed: %s", exc)
+
+    def head_block(self) -> int:
+        """Return the current chain head block from the long-lived connection.
+
+        Reuses the same websocket the submitter holds — the validator's
+        per-tick epoch cursor reads the head here rather than opening a
+        second connection. A read failure counts toward reconnect exactly
+        like a failed submit (only raised exceptions drive reconnect), so a
+        dead socket is recovered on a later tick.
+
+        A clean head read deliberately does NOT reset ``_consecutive_failures``:
+        the head poll runs every tick before the submit, and a chain that
+        can still serve ``get_current_block()`` while ``set_weights`` keeps
+        raising must not have its accumulated submit failures wiped — only a
+        clean ``set_weights`` proves the submit path healthy and resets the
+        counter. The reset asymmetry keeps the leak-fix's
+        reconnect-after-three-submit-failures recovery intact.
+
+        Raises:
+            WeightSubmissionError: No connection is available, or the head
+                read failed at the connection level.
+        """
+        self._maybe_reconnect()
+        if self._subtensor is None:
+            raise WeightSubmissionError("no subtensor connection available for head-block read")
+        try:
+            block = self._subtensor.get_current_block()
+        except Exception as exc:
+            self._consecutive_failures += 1
+            raise WeightSubmissionError(f"head-block read failed: {exc}") from exc
+        return int(block)
 
     def submit(
         self,
@@ -252,12 +294,10 @@ class RealSubmitter:
             epoch_id: Finalized epoch id, for logging only.
 
         Raises:
-            AlreadySubmittedError: The chain already has this extrinsic —
-                a previous submission for this epoch (likely retried by
-                the SDK after a websocket reconnect) has been accepted.
-                Callers should treat the epoch as submitted.
-            WeightSubmissionError: ``netuid`` mismatch, malformed input,
-                or the chain rejected the extrinsic for any other reason.
+            WeightSubmissionError: ``netuid`` mismatch, malformed input, a
+                connection-level failure, or the chain rejecting the
+                extrinsic for any reason. The validator loop retries the
+                epoch on the next tick.
         """
         if netuid != self._netuid:
             raise WeightSubmissionError(
@@ -272,15 +312,9 @@ class RealSubmitter:
             LOGGER.info("epoch %d: empty weight vector, nothing to submit", epoch_id)
             return
 
+        self._maybe_reconnect()
         if self._subtensor is None:
-            # Previous submission failed and reset the connection; open
-            # a fresh one now.
-            try:
-                self._subtensor = self._open_subtensor()
-            except Exception as exc:
-                raise WeightSubmissionError(
-                    f"epoch {epoch_id}: failed to reopen subtensor: {exc}"
-                ) from exc
+            raise WeightSubmissionError(f"epoch {epoch_id}: no subtensor connection available")
 
         LOGGER.info(
             "submitting weights: netuid=%d epoch=%d n_uids=%d sum=%d",
@@ -290,52 +324,63 @@ class RealSubmitter:
             sum(weights),
         )
         try:
-            # raise_error=True makes the SDK re-raise substrate errors
-            # (notably "Transaction Already Imported" on a reconnect
-            # rebroadcast) instead of swallowing them into a
-            # (success=False, message) ExtrinsicResponse. The classifier
-            # below only treats the raised-exception path under
-            # wait_for_inclusion=True as positive evidence of inclusion;
-            # without raise_error it would never see that exception.
             success, message = self._subtensor.set_weights(
                 wallet=self._wallet,
                 netuid=netuid,
                 uids=uids,
                 weights=weights,
                 wait_for_inclusion=True,
-                wait_for_finalization=False,
-                raise_error=True,
+                wait_for_finalization=True,
             )
         except Exception as exc:
-            # Drop the connection so the next epoch starts fresh; the
-            # websocket that just errored may be dead.
-            self._reset_subtensor()
-            message = str(exc)
-            if _looks_already_submitted(message):
-                LOGGER.info(
-                    "epoch %d: chain already has this extrinsic (%s); treating as submitted",
-                    epoch_id,
-                    message,
-                )
-                raise AlreadySubmittedError(
-                    f"epoch {epoch_id}: extrinsic already on chain: {message}"
-                ) from exc
+            # A raised exception is a connection-level failure (dead
+            # websocket, RPC timeout). Count it toward reconnect but keep
+            # the connection — the next submit reconnects once the counter
+            # trips. Do NOT drop the socket here; per-error drops leak.
+            self._consecutive_failures += 1
             raise WeightSubmissionError(
                 f"epoch {epoch_id}: set_weights call failed: {exc}"
             ) from exc
 
         if not success:
-            # The ``(False, message)`` return shape carries no inclusion
-            # receipt — even an "Already Imported" payload here only
-            # means the pool sees a duplicate, which can be a still-
-            # pending tx that may later be dropped. We treat it as a
-            # plain failure so the next tick retries; the retry will
-            # either succeed cleanly or raise ``Already Imported`` from
-            # ``wait_for_inclusion=True``, which IS positive evidence.
-            # Reset the connection regardless — another epoch is a
-            # minute out.
-            self._reset_subtensor()
+            # A (False, message) return is a chain answer, so the socket is
+            # healthy: it neither resets nor increments the failure counter
+            # (only raised exceptions drive reconnect, mirroring the bm
+            # validator). The validator loop retries the epoch next tick;
+            # an "Already Imported" pool duplicate carries no inclusion
+            # receipt, so it is retried like any other rejection rather
+            # than silently marking the epoch submitted.
             raise WeightSubmissionError(
-                f"epoch {epoch_id}: subtensor rejected set_weights: {message}"
+                f"epoch {epoch_id}: subtensor rejected set_weights: {message or ''}"
             )
+
+        # A clean success proves the websocket is healthy — reset the
+        # connection-failure counter.
+        self._consecutive_failures = 0
         LOGGER.info("epoch %d: weights accepted by subtensor (%s)", epoch_id, message)
+
+
+class RealChainCursor:
+    """Derives the open epoch id from the chain head over the submitter's socket.
+
+    Reads the head block through the ``RealSubmitter``'s long-lived
+    connection so the validator holds exactly one websocket for both the
+    head poll and weight submission. ``current_epoch`` returns the open
+    epoch ``head_block // blocks_per_epoch`` — the same derivation the
+    epoch-finalizer uses — or ``None`` when the head read fails, so a
+    transient chain hiccup skips the tick instead of crashing the loop.
+    """
+
+    def __init__(self, submitter: RealSubmitter, blocks_per_epoch: int) -> None:
+        if blocks_per_epoch <= 0:
+            raise ValueError(f"blocks_per_epoch must be positive, got {blocks_per_epoch}")
+        self._submitter = submitter
+        self._blocks_per_epoch = blocks_per_epoch
+
+    def current_epoch(self) -> int | None:
+        try:
+            block = self._submitter.head_block()
+        except WeightSubmissionError as exc:
+            LOGGER.warning("chain head read failed: %s — skipping this tick", exc)
+            return None
+        return block // self._blocks_per_epoch

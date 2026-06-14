@@ -27,8 +27,8 @@ from moto import mock_aws
 from pydantic import ValidationError
 
 from gm_validator.alpha_economics import MAX_WEIGHT
-from gm_validator.bittensor_adapter import MockSubmitter
-from gm_validator.bittensor_real import AlreadySubmittedError
+from gm_validator.bittensor_adapter import MockChainCursor, MockSubmitter
+from gm_validator.bittensor_real import WeightSubmissionError
 from gm_validator.config import ValidatorConfig
 from gm_validator.epoch_summary import epoch_summary_path, load_epoch_summary
 from gm_validator.s3_mirror import S3Mirror
@@ -185,6 +185,15 @@ def _populate_epoch(
     s3.put_object(Bucket=BUCKET, Key=f"{finalized_prefix}_FINALIZED", Body=b"")
 
 
+def _cursor_targeting(epoch_id: int) -> MockChainCursor:
+    """Chain cursor whose newest *closed* epoch is *epoch_id*.
+
+    ``current_epoch`` reports the open epoch; the validator targets
+    ``open - 1``, so the open epoch is ``epoch_id + 1``.
+    """
+    return MockChainCursor(epoch=epoch_id + 1)
+
+
 def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
     return ValidatorConfig(
         s3_bucket=BUCKET,
@@ -194,8 +203,8 @@ def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
         s3_anonymous=False,
         local_mirror_dir=str(tmp_path),
         mirror_retention_epochs=10,
-        processed_state_path=str(tmp_path / "processed.json"),
-        max_epochs_per_tick=100,
+        blocks_per_epoch=360,
+        finalized_lookback_epochs=3,
         bittensor_netuid=42,
         bittensor_endpoint=None,
         bittensor_hotkey_seed=None,
@@ -231,6 +240,7 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             config,
             mirror,
             submitter,
+            _cursor_targeting(7),
             miner_uid_lookup={miner_a: 0, miner_b: 1},
         )
 
@@ -267,46 +277,106 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             assert os.path.exists(os.path.join(epoch_dir, name)), f"missing: {name}"
 
 
-def test_validator_restart_does_not_resubmit(tmp_path: pathlib.Path) -> None:
-    """A restarted validator reads the persisted processed-epoch state and
-    must not re-submit weights for an epoch still present in S3."""
+def test_validator_restart_rescores_current_epoch_at_most_once(tmp_path: pathlib.Path) -> None:
+    """A restart re-derives the cursor from the chain, so it re-scores the
+    current epoch exactly once — the submit is idempotent (same weight
+    vector) — then the in-memory guard blocks any further re-submit until
+    the epoch advances. No persisted processed-state is involved."""
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
 
         miner_a = "5Ehm" + "A" * 44
         records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
-        _populate_epoch(s3, epoch_id=7, records=records)
+        _populate_epoch(s3, epoch_id=7, records=records, emissions_alpha="0.0001")
 
         config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
 
-        # First process: a fresh validator submits epoch 7.
-        first = Validator(config, mirror, MockSubmitter(), miner_uid_lookup={miner_a: 0})
+        # First process: a fresh validator submits epoch 7, then the guard
+        # blocks a second submit within the same epoch window.
+        first = Validator(
+            config, mirror, MockSubmitter(), _cursor_targeting(7), miner_uid_lookup={miner_a: 0}
+        )
         assert len(first.process_once()) == 1
+        assert first.process_once() == []
 
-        # Restart: a brand-new Validator (fresh in-memory state) reads the
-        # persisted processed.json and discovers epoch 7 still in S3.
+        # Restart: a brand-new Validator with fresh in-memory state and the
+        # same chain head re-scores epoch 7 once (idempotent), then its own
+        # guard blocks the next submit.
         restarted_submitter = MockSubmitter()
         restarted = Validator(
             config,
             S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
             restarted_submitter,
+            _cursor_targeting(7),
             miner_uid_lookup={miner_a: 0},
         )
-        outcomes = restarted.process_once()
+        assert len(restarted.process_once()) == 1
+        assert len(restarted_submitter.calls) == 1
+        assert restarted.process_once() == []
+        assert len(restarted_submitter.calls) == 1
 
-        assert outcomes == []
-        assert restarted_submitter.calls == []
+
+def test_restart_into_rate_limit_retries_until_accepted(tmp_path: pathlib.Path) -> None:
+    """If a restart re-submits within the chain's weight-set rate-limit
+    window, the duplicate is rejected and retried each tick (the guards stay
+    unset on failure) until the chain accepts it — bounded, idempotent, and
+    self-latching once accepted. No persisted dedup is involved."""
+
+    class _RejectThenAccept:
+        """Rejects the first N submits (rate-limit window), then accepts."""
+
+        def __init__(self, reject_count: int) -> None:
+            self._remaining = reject_count
+            self.calls: list[dict] = []
+
+        def submit(
+            self, *, netuid: int, uids: list[int], weights: list[int], epoch_id: int
+        ) -> None:
+            self.calls.append({"epoch_id": epoch_id})
+            if self._remaining > 0:
+                self._remaining -= 1
+                raise WeightSubmissionError(f"epoch {epoch_id}: rate limited")
+
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
+        _populate_epoch(s3, epoch_id=7, records=records, emissions_alpha="0.0001")
+
+        config = _config(tmp_path)
+        submitter = _RejectThenAccept(reject_count=2)
+        validator = Validator(
+            config,
+            S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
+            submitter,
+            _cursor_targeting(7),
+            miner_uid_lookup={miner_a: 0},
+        )
+
+        # Two rejected ticks (guards stay unset -> retry the same epoch).
+        assert validator.process_once() == []
+        assert validator._last_submitted_epoch is None
+        assert validator.process_once() == []
+        assert validator._last_submitted_epoch is None
+
+        # Third tick: chain accepts -> guards latch, no further submits.
+        assert len(validator.process_once()) == 1
+        assert validator._last_submitted_epoch == 7
+        assert validator.process_once() == []
+        assert len(submitter.calls) == 3
 
 
-class _AlreadySubmittedOnceSubmitter:
-    """Submitter that raises ``AlreadySubmittedError`` on the first call.
+class _FailingSubmitter:
+    """Submitter that raises ``WeightSubmissionError`` on every call.
 
-    Models the reconnect race: the SDK rebroadcasts a signed extrinsic
-    after a websocket churn, the chain returns "Transaction Already
-    Imported", and the submitter surfaces ``AlreadySubmittedError``.
-    The validator must mark the epoch processed so it isn't retried.
+    Models a rejected or failed submit (chain rejection, an
+    ``Already Imported`` pool duplicate, or a connection-level failure).
+    The validator must defer the epoch — leave it unmarked so the next
+    tick retries — rather than mark it processed.
     """
 
     def __init__(self) -> None:
@@ -316,16 +386,17 @@ class _AlreadySubmittedOnceSubmitter:
         self.calls.append(
             {"netuid": netuid, "uids": list(uids), "weights": list(weights), "epoch_id": epoch_id}
         )
-        raise AlreadySubmittedError(
-            f"epoch {epoch_id}: extrinsic already on chain: Transaction Already Imported"
+        raise WeightSubmissionError(
+            f"epoch {epoch_id}: subtensor rejected set_weights: Transaction Already Imported"
         )
 
 
-def test_validator_marks_already_submitted_epoch_processed(tmp_path: pathlib.Path) -> None:
-    """When the submitter reports the extrinsic is already on chain, the
-    validator must treat the epoch as submitted and persist that — a
-    retry would re-broadcast the same extrinsic and hit the same error,
-    which is exactly the restart loop this fix targets."""
+def test_validator_defers_epoch_on_submit_failure(tmp_path: pathlib.Path) -> None:
+    """A failed submit must NOT mark the epoch processed — the validator
+    defers it so the next tick retries with the same idempotent weight
+    vector. Mirrors the bm validator: there is no already-submitted
+    short-circuit, so an ``Already Imported`` pool duplicate (which
+    carries no inclusion receipt) is retried like any rejection."""
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -336,21 +407,23 @@ def test_validator_marks_already_submitted_epoch_processed(tmp_path: pathlib.Pat
 
         config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
-        submitter = _AlreadySubmittedOnceSubmitter()
-        validator = Validator(config, mirror, submitter, miner_uid_lookup={miner_a: 0})
+        submitter = _FailingSubmitter()
+        validator = Validator(
+            config, mirror, submitter, _cursor_targeting(17), miner_uid_lookup={miner_a: 0}
+        )
 
         outcomes = validator.process_once()
 
-        assert len(outcomes) == 1
-        assert outcomes[0].epoch_id == 17
-        assert outcomes[0].weights_submitted is True
-        assert 17 in validator._processed
+        # Deferred: no outcome recorded, cursor not advanced.
+        assert outcomes == []
+        assert validator._last_submitted_open_epoch is None
         assert len(submitter.calls) == 1
 
-        # A second tick must not re-submit.
+        # The next tick retries the same epoch.
         again = validator.process_once()
         assert again == []
-        assert len(submitter.calls) == 1
+        assert validator._last_submitted_open_epoch is None
+        assert len(submitter.calls) == 2
 
 
 def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) -> None:
@@ -376,6 +449,7 @@ def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) ->
             config,
             mirror,
             submitter,
+            _cursor_targeting(13),
             miner_uid_lookup={miner_a: 0, miner_b: 1},
         )
 
@@ -388,7 +462,7 @@ def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) ->
         assert call["uids"] == [99]
         assert call["weights"] == [MAX_WEIGHT]
 
-        # Epoch must be marked processed AFTER submit succeeded.
+        # The epoch-window guard blocks a second submit within the same epoch.
         again = validator.process_once()
         assert again == []
         assert len(submitter.calls) == 1
@@ -396,7 +470,7 @@ def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) ->
 
 def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
     """Cap-path epoch where every scored miner is unknown to the uid lookup
-    must defer: no submission, no processed-state mark, retry next tick.
+    must defer: no submission, cursor unadvanced, retry next tick.
 
     Simulates the metagraph refreshing between ticks by mutating the
     Validator's uid lookup before the second process_once().
@@ -421,6 +495,7 @@ def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
             config,
             mirror,
             submitter,
+            _cursor_targeting(23),
             miner_uid_lookup={},  # stale: neither miner present
         )
 
@@ -428,7 +503,7 @@ def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
         outcomes = validator.process_once()
         assert outcomes == []
         assert submitter.calls == []
-        assert 23 not in validator._processed
+        assert validator._last_submitted_open_epoch is None
 
         # Metagraph refreshes; next tick must process the same epoch.
         validator._miner_uid_lookup = {miner_a: 0, miner_b: 1}
@@ -438,7 +513,7 @@ def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
         assert outcomes[0].weights_submitted is True
         assert len(submitter.calls) == 1
         assert submitter.calls[0]["epoch_id"] == 23
-        assert 23 in validator._processed
+        assert validator._last_submitted_open_epoch == 24
 
 
 def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
@@ -447,7 +522,7 @@ def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
     """A pre-chain-read epoch_summary.json must defer rather than score.
 
     Without emissions_alpha the cap+burn pool denominator is unknown;
-    the validator must skip submission AND the processed-state mark so
+    the validator must skip submission AND leave the cursor unadvanced so
     the next tick retries once the finalizer republishes. The deferral
     also invalidates the local cached copy of epoch_summary.json so the
     next tick re-downloads the corrected artifact instead of rereading
@@ -466,13 +541,15 @@ def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
         config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
         submitter = MockSubmitter()
-        validator = Validator(config, mirror, submitter, miner_uid_lookup={miner_a: 0})
+        validator = Validator(
+            config, mirror, submitter, _cursor_targeting(31), miner_uid_lookup={miner_a: 0}
+        )
 
         # First tick: missing emissions_alpha -> defer.
         outcomes = validator.process_once()
         assert outcomes == []
         assert submitter.calls == []
-        assert 31 not in validator._processed
+        assert validator._last_submitted_open_epoch is None
 
         # Operator republishes epoch_summary.json with the chain-read field.
         # The stale cached copy must have been invalidated so the next
@@ -483,7 +560,7 @@ def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
         assert len(outcomes) == 1
         assert outcomes[0].epoch_id == 31
         assert outcomes[0].weights_submitted is True
-        assert 31 in validator._processed
+        assert validator._last_submitted_open_epoch == 32
 
 
 def test_validator_submits_cap_burn_weights(tmp_path: pathlib.Path) -> None:
@@ -508,6 +585,7 @@ def test_validator_submits_cap_burn_weights(tmp_path: pathlib.Path) -> None:
             config,
             mirror,
             submitter,
+            _cursor_targeting(11),
             miner_uid_lookup={miner_a: 0, miner_b: 1},
         )
 
@@ -550,12 +628,13 @@ def test_propagates_malformed_epoch_summary(tmp_path: pathlib.Path) -> None:
             config,
             mirror,
             submitter,
+            _cursor_targeting(22),
             miner_uid_lookup={miner_a: 0},
         )
 
         # process_once() catches per-epoch exceptions internally and logs
-        # them, so assert via the side effect: no submission, no
-        # processed-state mark (epoch will retry next tick).
+        # them, so assert via the side effect: no submission, cursor
+        # unadvanced (epoch will retry next tick).
         outcomes = validator.process_once()
         assert outcomes == []
         assert submitter.calls == []

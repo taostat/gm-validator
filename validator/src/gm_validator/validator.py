@@ -1,12 +1,20 @@
 """Validator orchestrator.
 
-Loop:
+Loop (one ``process_once`` tick):
 
-1. Discover finalized epoch ids in S3, drop the already-processed ones.
-2. Retire all but the newest ``max_epochs_per_tick`` to processed-state
-   without a submit — weights are a current snapshot, so a stale backlog
-   does not need re-submitting on chain.
-3. For each of the newest unprocessed epochs:
+1. Read the chain head block and derive the open epoch
+   ``E = head_block // blocks_per_epoch`` — the same derivation the
+   epoch-finalizer uses. The chain head IS the discovery cursor.
+2. Target the newest *closed* epoch ``E-1``. If its ``_FINALIZED`` marker
+   is absent (the finalizer is lagging), walk back a small bounded
+   window to find the newest finalized epoch. Each probe is a single
+   targeted ``head_object`` — never a list+scan of the epoch history.
+   If none in the window is finalized yet, do nothing this tick.
+3. Epoch-window guard: skip if the target is ``<= _last_submitted_epoch``
+   (already handled this epoch). Submitting at most once per epoch
+   respects the chain's ~100-block weight-set rate limit, which is well
+   inside one epoch.
+4. Mirror the target's artifacts, score, and submit:
    a. Mirror artifacts locally (`aggregated.jsonl`,
       `epoch_summary.json`, `_FINALIZED`).
    b. Compute per-miner scores from `aggregated.jsonl`.
@@ -14,8 +22,15 @@ Loop:
       ``consumed_usd_i / pool_usd``; residue routes to the subnet-owner
       uid as burn weight.
    d. Submit via the configured `Submitter`.
-   e. Mark the epoch processed.
-4. Prune local mirrors older than the retention window.
+   e. On success, advance ``_last_submitted_epoch`` to the target.
+5. Prune local mirrors older than the retention window.
+
+On-chain weights are a current snapshot, not a per-epoch ledger: only
+the latest finalized epoch is ever scored, and older un-targeted epochs
+are simply never enumerated. The cursor is recomputed from the chain
+every tick, so no persisted processed-state is needed — a restart at
+worst re-scores the current epoch once, which is idempotent (the same
+weight vector).
 
 The validator does not re-derive cost or re-verify `raw_hash` /
 signatures. The gm-operated epoch-finalizer is the single source of
@@ -30,15 +45,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from gm_validator.bittensor_adapter import Submitter
-from gm_validator.bittensor_real import AlreadySubmittedError
+from gm_validator.bittensor_adapter import ChainCursor, Submitter
 from gm_validator.config import ValidatorConfig
 from gm_validator.epoch_summary import (
     EPOCH_SUMMARY_FILENAME,
     epoch_summary_path,
     load_epoch_summary,
 )
-from gm_validator.processed_state import ProcessedState
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import (
     StaleEpochSummaryError,
@@ -70,58 +83,115 @@ class Validator:
         config: ValidatorConfig,
         mirror: S3Mirror,
         submitter: Submitter,
+        cursor: ChainCursor,
         miner_uid_lookup: dict[str, int] | None = None,
-        processed_state: ProcessedState | None = None,
     ) -> None:
         self._config = config
         self._mirror = mirror
         self._submitter = submitter
+        self._cursor = cursor
         self._miner_uid_lookup = miner_uid_lookup or {}
-        self._processed = processed_state or ProcessedState(config.processed_state_path)
+        # Two complementary guards on the submit, both recomputed from the
+        # chain each tick. They are deliberately in-memory only: the
+        # chain-cursor design drops the persisted processed.json, so a
+        # restart resets both to None and re-scores the current target. The
+        # re-submit is the identical weight vector — idempotent, exactly the
+        # bm validator's no-persisted-dedup contract. If the restart lands
+        # inside the chain's weight-set rate-limit window the duplicate is
+        # rejected and retried each poll until the window clears (bounded by
+        # one epoch), then succeeds and the guards latch; a clean accept on
+        # the first try latches immediately. Either way the on-chain weight
+        # vector never changes.
+        #
+        # - Open-epoch rate guard: at most one submit per open chain epoch
+        #   (mirroring bm's `block // tempo` guard). When the finalizer
+        #   catches up from lag it can publish several closed epochs while
+        #   the chain head stays in one open epoch; submitting each would
+        #   trip the chain's ~100-block weight-set rate limit.
+        # - Target dedup guard: never re-submit a finalized epoch already
+        #   submitted. When the finalizer stalls but the chain advances,
+        #   the bounded walk-back keeps resolving the same older target
+        #   across successive open epochs; the rate guard alone would let
+        #   each new open epoch re-submit that stale vector.
+        #
+        # A submit needs BOTH a fresh open epoch and a newer target.
+        self._last_submitted_open_epoch: int | None = None
+        self._last_submitted_epoch: int | None = None
 
     def process_once(self) -> list[EpochOutcome]:
-        """One iteration: submit the newest epochs, retire the rest.
+        """One tick: target the newest finalized epoch and submit its weights.
 
-        On-chain weights are a current snapshot, not a per-epoch ledger,
-        so only the newest unprocessed epochs need a fresh submit. The
-        older unprocessed backlog (which a fresh deploy rediscovers in
-        full from S3) is retired to processed-state without a chain
-        round-trip. This bounds the extrinsics issued per tick to
-        ``max_epochs_per_tick`` — without it the whole backlog submits
-        serially in one tick, each ``wait_for_inclusion`` leaking
-        websocket state until the pod is OOMKilled mid-tick.
+        The chain head block is the discovery cursor — there is no S3
+        scan. Targets the newest closed epoch ``E-1``, walking back a
+        bounded window if the finalizer lags, then submits at most once
+        per open chain epoch (the ``_last_submitted_open_epoch`` guard).
+        Returns the processed epoch's outcome, or an empty list when
+        nothing was ready or this open epoch was already handled.
         """
-        unprocessed = [
-            epoch_id
-            for epoch_id in self._mirror.discover_finalized_epochs()
-            if epoch_id not in self._processed
-        ]
-        n = max(self._config.max_epochs_per_tick, 1)
-        stale, recent = unprocessed[:-n], unprocessed[-n:]
-
-        if stale:
-            LOGGER.info("retiring %d superseded epoch(s) without submit", len(stale))
-            self._processed.mark_many(set(stale))
-
         outcomes: list[EpochOutcome] = []
-        for epoch_id in recent:
-            outcome = self._process_recent_epoch(epoch_id)
+        selection = self._select_target_epoch()
+        if selection is not None:
+            open_epoch, target = selection
+            outcome = self._process_target_epoch(open_epoch, target)
             if outcome is not None:
                 outcomes.append(outcome)
         self._mirror.prune(self._config.mirror_retention_epochs)
         return outcomes
 
-    def _process_recent_epoch(self, epoch_id: int) -> EpochOutcome | None:
-        """Process one recent epoch; return its outcome, or None if deferred.
+    def _select_target_epoch(self) -> tuple[int, int] | None:
+        """Resolve ``(open_epoch, target)`` to score this tick, or None.
 
-        Deferrals (stale metagraph / stale epoch_summary / unexpected
-        error) skip the processed-state mark so the next tick retries.
+        Reads the chain head, derives the newest closed epoch ``E-1``,
+        finds the newest finalized epoch within the bounded walk-back
+        window, and applies both submit guards (one submit per open epoch,
+        never re-submit a target already submitted). Returns None when the
+        chain head is unreadable, the chain is too early to have a closed
+        epoch, no probed epoch is finalized yet, this open epoch already
+        submitted, or the target was already submitted.
+        """
+        open_epoch = self._cursor.current_epoch()
+        if open_epoch is None:
+            return None
+        newest_closed = open_epoch - 1
+        if newest_closed < 0:
+            LOGGER.info("chain at epoch %d: no closed epoch yet, nothing to do", open_epoch)
+            return None
+
+        last_open = self._last_submitted_open_epoch
+        if last_open is not None and open_epoch <= last_open:
+            LOGGER.debug("open epoch %d already submitted this window, skipping", open_epoch)
+            return None
+
+        target = self._mirror.latest_finalized_epoch(
+            newest_closed, self._config.finalized_lookback_epochs
+        )
+        if target is None:
+            LOGGER.info(
+                "no finalized epoch in [%d, %d]: finalizer still lagging, retry next tick",
+                max(newest_closed - self._config.finalized_lookback_epochs, 0),
+                newest_closed,
+            )
+            return None
+
+        last_target = self._last_submitted_epoch
+        if last_target is not None and target <= last_target:
+            LOGGER.debug("epoch %d already submitted, skipping (finalizer stalled)", target)
+            return None
+        return open_epoch, target
+
+    def _process_target_epoch(self, open_epoch: int, epoch_id: int) -> EpochOutcome | None:
+        """Process the targeted epoch; return its outcome, or None if deferred.
+
+        On success both guards advance (open-epoch to *open_epoch*, target
+        to *epoch_id*). Deferrals (stale metagraph / stale epoch_summary /
+        submit failure / unexpected error) leave the guards unchanged so
+        the next tick retries the same epoch.
         """
         try:
             outcome = self._process_epoch(epoch_id)
         except StaleMetagraphError as exc:
-            # Transient — metagraph hotkey->uid lookup is stale. Skip
-            # marking processed so the next tick retries once the lookup
+            # Transient — metagraph hotkey->uid lookup is stale. Leave the
+            # cursor unadvanced so the next tick retries once the lookup
             # has refreshed.
             LOGGER.warning(
                 "epoch %d deferred (stale metagraph): %s — next tick will retry",
@@ -131,8 +201,8 @@ class Validator:
             return None
         except StaleEpochSummaryError as exc:
             # Transient — epoch_summary.json was written by a
-            # pre-chain-read finalizer and so lacks emissions_alpha. Skip
-            # marking processed so the next tick retries once the
+            # pre-chain-read finalizer and so lacks emissions_alpha. Leave
+            # the cursor unadvanced so the next tick retries once the
             # finalizer has republished. Invalidate the cached copy too:
             # S3Mirror._download is a no-op when the local file exists, so
             # without this the validator would keep rereading the stale
@@ -147,7 +217,8 @@ class Validator:
         except Exception:
             LOGGER.exception("epoch %d processing failed", epoch_id)
             return None
-        self._processed.mark(epoch_id)
+        self._last_submitted_open_epoch = open_epoch
+        self._last_submitted_epoch = epoch_id
         return outcome
 
     def _process_epoch(self, epoch_id: int) -> EpochOutcome:
@@ -168,24 +239,16 @@ class Validator:
 
         submitted = False
         if vector.uids:
-            try:
-                self._submitter.submit(
-                    netuid=self._config.bittensor_netuid,
-                    uids=vector.uids,
-                    weights=vector.weights,
-                    epoch_id=epoch_id,
-                )
-            except AlreadySubmittedError as exc:
-                # A previous submit for this epoch is already on chain
-                # (the bittensor SDK re-broadcast after a websocket
-                # reconnect). Treat the epoch as submitted and let the
-                # outer loop mark it processed; retrying would re-emit
-                # the same extrinsic and hit the same error.
-                LOGGER.info(
-                    "epoch %d: already submitted on chain (%s); marking processed",
-                    epoch_id,
-                    exc,
-                )
+            # A submit failure raises WeightSubmissionError out of this
+            # method; _process_target_epoch defers the epoch (leaves the
+            # cursor unadvanced) so the next tick retries with the same
+            # idempotent weight vector.
+            self._submitter.submit(
+                netuid=self._config.bittensor_netuid,
+                uids=vector.uids,
+                weights=vector.weights,
+                epoch_id=epoch_id,
+            )
             submitted = True
             LOGGER.info(
                 "epoch %d: miners=%d pool_usd=%s consumed_usd=%s",

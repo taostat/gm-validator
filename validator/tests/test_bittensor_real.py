@@ -24,8 +24,8 @@ from typing import Any
 import pytest
 
 from gm_validator.bittensor_real import (
-    AlreadySubmittedError,
     HotkeyConfigError,
+    RealChainCursor,
     RealSubmitter,
     WeightSubmissionError,
     _keypair_from_seed,
@@ -68,7 +68,8 @@ class _FakeSubtensor:
         self.result: tuple[bool, str | None] = (True, "included")
         self.raise_on_set: Exception | None = None
         self.closes: int = 0
-        self.raise_on_close: Exception | None = None
+        self.block: int = 0
+        self.raise_on_block: Exception | None = None
 
     def set_weights(self, **kwargs: Any) -> tuple[bool, str | None]:
         self.calls.append(kwargs)
@@ -76,10 +77,13 @@ class _FakeSubtensor:
             raise self.raise_on_set
         return self.result
 
+    def get_current_block(self) -> int:
+        if self.raise_on_block is not None:
+            raise self.raise_on_block
+        return self.block
+
     def close(self) -> None:
         self.closes += 1
-        if self.raise_on_close is not None:
-            raise self.raise_on_close
 
 
 def _install_fake_bittensor(monkeypatch: pytest.MonkeyPatch) -> _FakeSubtensor:
@@ -217,11 +221,12 @@ def test_submit_passes_in_memory_wallet_to_set_weights(
     assert call["uids"] == [0, 3]
     assert call["weights"] == [400, 600]
     assert call["wait_for_inclusion"] is True
-    # raise_error=True forces the SDK to re-raise substrate errors
-    # (e.g. "Transaction Already Imported") instead of returning them as
-    # a (success=False, message) ExtrinsicResponse; the already-submitted
-    # classifier only fires on the raised path.
-    assert call["raise_error"] is True
+    assert call["wait_for_finalization"] is True
+    # The submitter relies on the SDK default raise_error=False so substrate
+    # errors come back as a (success, message) tuple, including the
+    # "Already Imported" receipt under wait_for_inclusion. It must not opt
+    # into the raising contract.
+    assert "raise_error" not in call
     # The wallet handed to the chain is the in-memory shim, and its
     # no-op unlock_hotkey never touches the filesystem.
     wallet = call["wallet"]
@@ -271,15 +276,13 @@ def test_submit_raises_when_chain_rejects_with_no_message(
 ) -> None:
     """``bittensor.Subtensor.set_weights`` returns ``(False, None)`` on its
     own pre-flight rejections (e.g. the SDK's rate-limit short-circuit).
-    The submitter must surface a plain ``WeightSubmissionError`` —
-    crashing on ``None.lower()`` would obscure the rejection from
-    callers that branch on exception type."""
+    The submitter must surface a plain ``WeightSubmissionError`` rather
+    than crashing on ``None`` formatting."""
     subtensor = _install_fake_bittensor(monkeypatch)
     subtensor.result = (False, None)
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    with pytest.raises(WeightSubmissionError) as exc_info:
+    with pytest.raises(WeightSubmissionError):
         submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
-    assert not isinstance(exc_info.value, AlreadySubmittedError)
 
 
 def _install_reconnecting_fake_bittensor(
@@ -287,8 +290,8 @@ def _install_reconnecting_fake_bittensor(
 ) -> list[_FakeSubtensor]:
     """Inject a fake ``bittensor`` that returns a new subtensor each call.
 
-    Records every ``Subtensor()`` construction so tests can assert the
-    submitter reopened the connection after a failure.
+    Records every ``Subtensor()`` construction so tests can assert when
+    the submitter recreated the connection.
     """
     _FakeKeypair.last_seed = None
     _FakeKeypair.last_mnemonic = None
@@ -306,144 +309,171 @@ def _install_reconnecting_fake_bittensor(
     return subtensors
 
 
-def test_submit_raises_already_submitted_on_already_imported(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Substrate's ``Transaction Already Imported`` proves the chain holds
-    this exact extrinsic. It must surface as ``AlreadySubmittedError`` (a
-    ``WeightSubmissionError`` subclass) so the validator marks the epoch
-    processed instead of looping."""
-    subtensor = _install_fake_bittensor(monkeypatch)
-    subtensor.raise_on_set = RuntimeError("Transaction Already Imported")
-    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    with pytest.raises(AlreadySubmittedError, match="already on chain"):
-        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
-
-
-class _RaiseErrorContractSubtensor:
-    """Models bittensor v10 ``set_weights``: it only raises substrate
-    errors when called with ``raise_error=True``; with the SDK default
-    ``raise_error=False`` the same error comes back as a
-    ``(success=False, message)`` ExtrinsicResponse instead.
-
-    The fix depends on opting into the raising contract — if the
-    submitter ever drops ``raise_error=True`` the duplicate broadcast
-    silently lands in the plain-failure path and the validator loops.
-    """
-
-    def __init__(self, network: str | None = None) -> None:
-        self.network = network
-        self.closes = 0
-
-    def set_weights(self, **kwargs: Any) -> tuple[bool, str | None]:
-        if kwargs.get("raise_error"):
-            raise RuntimeError("Transaction Already Imported")
-        return (False, "Transaction Already Imported")
-
-    def close(self) -> None:
-        self.closes += 1
-
-
-def test_submit_opts_into_raise_error_so_already_imported_surfaces(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With the real SDK default (``raise_error=False``) an already-imported
-    error returns as ``(success=False, message)`` — the plain-failure path
-    the validator retries. The submitter must pass ``raise_error=True`` so
-    the chain's "Already Imported" reaches the classifier and the epoch is
-    marked submitted instead of crash-looping."""
-    contract = _RaiseErrorContractSubtensor()
-    module = types.ModuleType("bittensor")
-    module.Keypair = _FakeKeypair  # type: ignore[attr-defined]
-    module.Subtensor = lambda network=None: contract  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "bittensor", module)
-
-    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    with pytest.raises(AlreadySubmittedError, match="already on chain"):
-        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
-
-
 @pytest.mark.parametrize(
     "fragment",
     [
+        "Transaction Already Imported",
         "Invalid Transaction (bad signature)",
         "Transaction is outdated",
         "Stale extrinsic",
     ],
 )
-def test_submit_does_not_treat_ambiguous_errors_as_submitted(
+def test_submit_treats_every_false_return_as_retryable_failure(
     monkeypatch: pytest.MonkeyPatch, fragment: str
 ) -> None:
-    """Substrate emits ``bad signature``, ``stale``, and ``outdated`` for
-    cases that do NOT prove this extrinsic reached the chain (genuine
-    signing failures; nonce advanced by another extrinsic). Treating them
-    as already-submitted would silently skip an epoch's weights. They
-    must propagate as plain ``WeightSubmissionError`` so the validator
-    retries on the next tick."""
+    """A ``(False, message)`` return is a plain ``WeightSubmissionError`` so
+    the validator loop retries the epoch on the next tick — including
+    ``Already Imported``, which from a non-raising return carries no
+    inclusion receipt and can be the pool rejecting a still-pending
+    duplicate. Mirrors the bm validator: no already-submitted
+    short-circuit. Re-submitting the identical vector is idempotent."""
     subtensor = _install_fake_bittensor(monkeypatch)
-    subtensor.raise_on_set = RuntimeError(fragment)
+    subtensor.result = (False, fragment)
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    with pytest.raises(WeightSubmissionError) as exc_info:
+    with pytest.raises(WeightSubmissionError, match="rejected set_weights"):
         submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
-    assert not isinstance(exc_info.value, AlreadySubmittedError)
 
 
-def test_submit_treats_explicit_failure_message_as_plain_failure(
+# --- connection lifecycle ------------------------------------------------
+
+
+def test_submit_does_not_reconnect_on_single_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The ``(False, message)`` return shape carries no inclusion receipt
-    even when *message* mentions ``Already Imported`` — it can mean the
-    transaction pool merely sees a still-pending duplicate that may later
-    be dropped. The submitter must surface it as a plain failure so the
-    next tick retries; only the raised-exception path under
-    ``wait_for_inclusion=True`` is positive evidence of inclusion."""
-    subtensor = _install_fake_bittensor(monkeypatch)
-    subtensor.result = (False, "Transaction Already Imported")
-    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    with pytest.raises(WeightSubmissionError) as exc_info:
-        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
-    assert not isinstance(exc_info.value, AlreadySubmittedError)
-
-
-def test_submit_reopens_subtensor_after_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A submission that raised must drop the cached connection so the
-    next submit opens a fresh subtensor — otherwise a dead websocket
-    would poison every subsequent epoch."""
+    """A single failed submit must reuse the SAME subtensor — dropping and
+    reopening the websocket on every failure leaks subscriptions and OOMs
+    the pod. Only sustained failure reconnects."""
     subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
     assert len(subtensors) == 1
-    subtensors[0].raise_on_set = ConnectionError("websocket closed")
+    subtensors[0].raise_on_set = ConnectionError("websocket blip")
 
-    with pytest.raises(WeightSubmissionError, match="websocket closed"):
+    with pytest.raises(WeightSubmissionError, match="websocket blip"):
         submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
 
-    # Next submit succeeds on a freshly-opened subtensor.
-    submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=6)
-    assert len(subtensors) == 2
-    assert subtensors[1].calls[0]["uids"] == [0]
+    # The next submit still uses the original connection — no reconnect yet.
+    assert submitter._subtensor is subtensors[0]
+    assert len(subtensors) == 1
 
 
-def test_submit_reopens_subtensor_after_explicit_failure(
+def test_submit_reconnects_only_after_three_consecutive_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The same reconnect path applies when set_weights returns
-    ``(False, message)`` rather than raising."""
+    """Reconnect fires once the third consecutive connection failure has
+    tripped the counter — not before. The original connection is reused
+    through failures one and two; the next submit opens a fresh one."""
+    subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    subtensors[0].raise_on_set = ConnectionError("websocket closed")
+
+    for epoch_id in (5, 6, 7):
+        with pytest.raises(WeightSubmissionError, match="websocket closed"):
+            submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=epoch_id)
+        # Still the original connection while the counter climbs to 3.
+        assert submitter._subtensor is subtensors[0]
+        assert len(subtensors) == 1
+
+    # Fourth submit: counter is at 3, so _maybe_reconnect opens a fresh
+    # connection before submitting; the fresh one succeeds by default.
+    submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=8)
+    assert len(subtensors) == 2
+    assert submitter._subtensor is subtensors[1]
+    assert subtensors[1].calls[0]["uids"] == [0]
+    # The retired connection is closed so the recovery path does not leak.
+    assert subtensors[0].closes == 1
+
+
+def test_submit_success_resets_failure_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A success between failures resets the counter, so two failures then
+    a success then two more failures never reconnects — only three
+    CONSECUTIVE failures do."""
+    subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+
+    subtensors[0].raise_on_set = ConnectionError("blip")
+    for epoch_id in (1, 2):
+        with pytest.raises(WeightSubmissionError):
+            submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=epoch_id)
+    assert submitter._consecutive_failures == 2
+
+    subtensors[0].raise_on_set = None
+    submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=3)
+    assert submitter._consecutive_failures == 0
+
+    subtensors[0].raise_on_set = ConnectionError("blip")
+    for epoch_id in (4, 5):
+        with pytest.raises(WeightSubmissionError):
+            submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=epoch_id)
+
+    # Counter only reached 2 after the reset — still the original socket.
+    assert submitter._subtensor is subtensors[0]
+    assert len(subtensors) == 1
+
+
+def test_submit_rejection_does_not_count_toward_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``(False, message)`` rejection means the chain answered, so the
+    socket is healthy — it must NOT increment the connection-failure
+    counter. Repeated rejections never reconnect."""
     subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
     subtensors[0].result = (False, "rate limited")
 
-    with pytest.raises(WeightSubmissionError, match="rate limited"):
-        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
+    for epoch_id in (1, 2, 3, 4):
+        with pytest.raises(WeightSubmissionError, match="rate limited"):
+            submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=epoch_id)
 
-    submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=6)
-    assert len(subtensors) == 2
+    assert submitter._consecutive_failures == 0
+    assert submitter._subtensor is subtensors[0]
+    assert len(subtensors) == 1
 
 
-def test_submit_does_not_reopen_subtensor_on_success(
+def test_rejection_does_not_reset_accumulated_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A successful submission must reuse the existing connection — only
-    the failure paths reset it."""
+    """With raise_error at the SDK default, bittensor can also funnel a
+    transport error into a ``(False, message)`` return. A rejection must
+    therefore NOT reset the failure counter — otherwise a poisoned
+    connection that alternates raised errors and (False, msg) returns
+    would never accumulate to the reconnect threshold. Only a clean
+    success resets the counter."""
+    subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+
+    # Two raised transport failures bring the counter to 2.
+    subtensors[0].raise_on_set = ConnectionError("websocket closed")
+    for epoch_id in (1, 2):
+        with pytest.raises(WeightSubmissionError):
+            submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=epoch_id)
+    assert submitter._consecutive_failures == 2
+
+    # A (False, message) rejection must leave the counter at 2, not reset it.
+    subtensors[0].raise_on_set = None
+    subtensors[0].result = (False, "rate limited")
+    with pytest.raises(WeightSubmissionError, match="rate limited"):
+        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=3)
+    assert submitter._consecutive_failures == 2
+
+    # The third raised failure trips the threshold; the next submit reconnects.
+    subtensors[0].result = (True, "included")
+    subtensors[0].raise_on_set = ConnectionError("websocket closed")
+    with pytest.raises(WeightSubmissionError):
+        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=4)
+    assert submitter._consecutive_failures == 3
+
+    submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
+    assert len(subtensors) == 2
+    assert submitter._subtensor is subtensors[1]
+
+
+def test_submit_reuses_connection_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Back-to-back successful submissions reuse the one long-lived
+    connection — no reconnect churn on the happy path."""
     subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
 
@@ -452,33 +482,66 @@ def test_submit_does_not_reopen_subtensor_on_success(
     assert len(subtensors) == 1
 
 
-def test_reset_closes_old_subtensor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Repeated submission failures across a long-running validator would
-    accumulate dead websockets if reset only dropped the reference. The
-    failure path must call ``close()`` on the old subtensor before
-    opening a fresh one."""
-    subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
+# --- head-block read + chain cursor --------------------------------------
+
+
+def test_head_block_reads_current_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``head_block`` returns the long-lived connection's current block."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.block = 1234
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    subtensors[0].raise_on_set = ConnectionError("websocket closed")
-
-    with pytest.raises(WeightSubmissionError, match="websocket closed"):
-        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
-
-    assert subtensors[0].closes == 1
+    assert submitter.head_block() == 1234
 
 
-def test_reset_suppresses_close_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A ``close()`` that itself raises must not mask the underlying
-    submission failure — we are already on the error path and the
-    connection is being discarded anyway."""
-    subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
+def test_head_block_wraps_read_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raised chain read surfaces as WeightSubmissionError and counts
+    toward reconnect, exactly like a failed submit."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.raise_on_block = ConnectionError("ws closed")
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    subtensors[0].raise_on_set = ConnectionError("websocket closed")
-    subtensors[0].raise_on_close = RuntimeError("close exploded")
+    with pytest.raises(WeightSubmissionError, match="head-block read failed"):
+        submitter.head_block()
+    assert submitter._consecutive_failures == 1
 
-    with pytest.raises(WeightSubmissionError, match="websocket closed"):
-        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
 
-    # Next submit still succeeds on a freshly-opened subtensor.
-    submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=6)
-    assert len(subtensors) == 2
+def test_head_block_success_does_not_reset_failure_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean head read must NOT reset the submit-failure counter — the head
+    poll runs every tick, and a chain that still serves get_current_block()
+    while set_weights keeps raising must not have accumulated submit failures
+    wiped, or the reconnect-after-three-submit-failures recovery never fires."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    submitter._consecutive_failures = 2
+    subtensor.block = 50
+    assert submitter.head_block() == 50
+    assert submitter._consecutive_failures == 2
+
+
+def test_chain_cursor_derives_open_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``current_epoch`` is ``head_block // blocks_per_epoch`` — the same
+    derivation the finalizer uses."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.block = 725  # 725 // 360 == 2
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    cursor = RealChainCursor(submitter, blocks_per_epoch=360)
+    assert cursor.current_epoch() == 2
+
+
+def test_chain_cursor_returns_none_on_read_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed head read yields None so the validator skips the tick."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.raise_on_block = ConnectionError("ws closed")
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    cursor = RealChainCursor(submitter, blocks_per_epoch=360)
+    assert cursor.current_epoch() is None
+
+
+def test_chain_cursor_rejects_nonpositive_blocks_per_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_bittensor(monkeypatch)
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    with pytest.raises(ValueError, match="blocks_per_epoch must be positive"):
+        RealChainCursor(submitter, blocks_per_epoch=0)
