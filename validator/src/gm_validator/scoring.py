@@ -113,12 +113,30 @@ def aggregated_path(mirror_dir: str) -> str:
     return os.path.join(mirror_dir, "aggregated.jsonl")
 
 
+def _apply_earnings_multiplier(ndollars: int, multiplier: Decimal) -> int:
+    """Scale integer nano-dollars by ``multiplier``, flooring to an integer.
+
+    Multiplier ``1`` returns the input untouched — an exact no-op that never
+    routes the value through Decimal-context rounding. Other values floor the
+    product so no float precision leaks into the persisted money math. Used
+    only by the TESTNET-ONLY demo knob; see :func:`compute_weights`.
+    """
+    if multiplier == 1:
+        return ndollars
+    # Multiply in exact integer arithmetic via the multiplier's numerator /
+    # denominator, then floor — independent of the active Decimal precision, so
+    # no float precision leaks into the money value.
+    numerator, denominator = multiplier.as_integer_ratio()
+    return ndollars * numerator // denominator
+
+
 def compute_weights(
     scores: dict[str, MinerScore],
     miner_uid_lookup: dict[str, int],
     *,
     epoch_summary: EpochSummary,
     subnet_owner_uid: int,
+    earnings_multiplier: Decimal = Decimal(1),
 ) -> WeightVector:
     """Convert per-miner scores to a u16 weight vector for `set_weights`.
 
@@ -133,6 +151,14 @@ def compute_weights(
             block, so every validator sees identical pool inputs.
         subnet_owner_uid: Uid that absorbs the burn slot + floor-rounding
             dust.
+        earnings_multiplier: TESTNET-ONLY demo knob. Scales every miner's
+            aggregated nano-dollar earnings in memory before the alpha
+            conversion so sub-floor test earnings can cross the
+            ``1/MAX_WEIGHT`` weight floor and light up on-chain. The
+            scaled value is floored back to an integer nano-dollar count
+            (no float drift). MUST stay ``1`` on mainnet — any other
+            value distorts real payouts. Defaults to ``1`` (exact
+            no-op).
 
     Returns:
         WeightVector: aligned ``uids``, ``weights`` (u16, sum =
@@ -162,7 +188,10 @@ def compute_weights(
     missing_hotkeys: list[str] = []
     for miner_id, s in scores.items():
         uid = miner_uid_lookup.get(miner_id)
-        total_ndollars = Decimal(s.earnings_ndollars + s.surcharge_ndollars)
+        scaled_ndollars = _apply_earnings_multiplier(
+            s.earnings_ndollars + s.surcharge_ndollars, earnings_multiplier
+        )
+        total_ndollars = Decimal(scaled_ndollars)
         miners_data.append(
             MinerEpochData(
                 hotkey=miner_id,

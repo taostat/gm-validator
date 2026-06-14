@@ -59,6 +59,7 @@ uv run python -m gm_validator.main
 | `BITTENSOR_HOTKEY_SEED` | — | Validator hotkey seed — a BIP-39 mnemonic or `0x`-prefixed hex seed. The signing keypair is built in memory; no keyfile on disk. Required for real weight submission |
 | `BITTENSOR_MOCK` | `0` | Use `MockSubmitter` (records submissions in memory) |
 | `SUBNET_OWNER_UID` | required | Uid that absorbs the burn slot + floor-rounding dust. Static knob until a follow-up resolves it from `SubnetOwnerHotkey`. |
+| `GM_WEIGHT_EARNINGS_MULTIPLIER` | `1` | **TESTNET-ONLY** demo knob. Scales each miner's aggregated earnings in memory before the alpha/weight conversion so tiny test earnings cross the `1/65535` weight floor and light up on-chain. **MUST stay `1` (unset) on mainnet** — any other value distorts real payouts. |
 
 The pool denominator's `emissions_alpha` is read from `epoch_summary.json` (chain-truth, written by the gm finalizer); see `validator/src/gm_validator/epoch_summary.py`.
 

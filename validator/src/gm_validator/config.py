@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal
 
 
 def _require_env(name: str) -> str:
@@ -18,6 +19,13 @@ def _int_env(name: str, default: int) -> int:
     if value is None:
         return default
     return int(value)
+
+
+def _decimal_env(name: str, default: str) -> Decimal:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return Decimal(default)
+    return Decimal(value)
 
 
 @dataclass
@@ -73,6 +81,15 @@ class ValidatorConfig:
     # port defers that lookup to a follow-up.
     subnet_owner_uid: int
 
+    # TESTNET-ONLY demo knob. Multiplies each miner's aggregated earnings
+    # in memory before the alpha/weight conversion so tiny test earnings
+    # can cross the 1/65535 on-chain weight floor and produce a visible
+    # non-zero miner incentive instead of burning 100% to the owner uid.
+    # MUST stay 1 (unset) on mainnet — any other value distorts real
+    # payouts. Env: GM_WEIGHT_EARNINGS_MULTIPLIER (default 1 = exact
+    # no-op). See scoring.compute_weights.
+    weight_earnings_multiplier: Decimal
+
     @classmethod
     def from_env(cls) -> ValidatorConfig:
         """Build from environment variables.
@@ -97,6 +114,7 @@ class ValidatorConfig:
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),
             subnet_owner_uid=int(_require_env("SUBNET_OWNER_UID")),
+            weight_earnings_multiplier=_decimal_env("GM_WEIGHT_EARNINGS_MULTIPLIER", "1"),
         )
 
     def finalized_prefix(self, epoch_id: int) -> str:
