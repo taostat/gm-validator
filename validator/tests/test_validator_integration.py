@@ -28,7 +28,7 @@ from pydantic import ValidationError
 
 from gm_validator.alpha_economics import MAX_WEIGHT
 from gm_validator.bittensor_adapter import MockSubmitter
-from gm_validator.bittensor_real import AlreadySubmittedError
+from gm_validator.bittensor_real import WeightSubmissionError
 from gm_validator.config import ValidatorConfig
 from gm_validator.epoch_summary import epoch_summary_path, load_epoch_summary
 from gm_validator.s3_mirror import S3Mirror
@@ -300,13 +300,13 @@ def test_validator_restart_does_not_resubmit(tmp_path: pathlib.Path) -> None:
         assert restarted_submitter.calls == []
 
 
-class _AlreadySubmittedOnceSubmitter:
-    """Submitter that raises ``AlreadySubmittedError`` on the first call.
+class _FailingSubmitter:
+    """Submitter that raises ``WeightSubmissionError`` on every call.
 
-    Models the reconnect race: the SDK rebroadcasts a signed extrinsic
-    after a websocket churn, the chain returns "Transaction Already
-    Imported", and the submitter surfaces ``AlreadySubmittedError``.
-    The validator must mark the epoch processed so it isn't retried.
+    Models a rejected or failed submit (chain rejection, an
+    ``Already Imported`` pool duplicate, or a connection-level failure).
+    The validator must defer the epoch — leave it unmarked so the next
+    tick retries — rather than mark it processed.
     """
 
     def __init__(self) -> None:
@@ -316,16 +316,17 @@ class _AlreadySubmittedOnceSubmitter:
         self.calls.append(
             {"netuid": netuid, "uids": list(uids), "weights": list(weights), "epoch_id": epoch_id}
         )
-        raise AlreadySubmittedError(
-            f"epoch {epoch_id}: extrinsic already on chain: Transaction Already Imported"
+        raise WeightSubmissionError(
+            f"epoch {epoch_id}: subtensor rejected set_weights: Transaction Already Imported"
         )
 
 
-def test_validator_marks_already_submitted_epoch_processed(tmp_path: pathlib.Path) -> None:
-    """When the submitter reports the extrinsic is already on chain, the
-    validator must treat the epoch as submitted and persist that — a
-    retry would re-broadcast the same extrinsic and hit the same error,
-    which is exactly the restart loop this fix targets."""
+def test_validator_defers_epoch_on_submit_failure(tmp_path: pathlib.Path) -> None:
+    """A failed submit must NOT mark the epoch processed — the validator
+    defers it so the next tick retries with the same idempotent weight
+    vector. Mirrors the bm validator: there is no already-submitted
+    short-circuit, so an ``Already Imported`` pool duplicate (which
+    carries no inclusion receipt) is retried like any rejection."""
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -336,21 +337,21 @@ def test_validator_marks_already_submitted_epoch_processed(tmp_path: pathlib.Pat
 
         config = _config(tmp_path)
         mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
-        submitter = _AlreadySubmittedOnceSubmitter()
+        submitter = _FailingSubmitter()
         validator = Validator(config, mirror, submitter, miner_uid_lookup={miner_a: 0})
 
         outcomes = validator.process_once()
 
-        assert len(outcomes) == 1
-        assert outcomes[0].epoch_id == 17
-        assert outcomes[0].weights_submitted is True
-        assert 17 in validator._processed
+        # Deferred: no outcome recorded, epoch not marked processed.
+        assert outcomes == []
+        assert 17 not in validator._processed
         assert len(submitter.calls) == 1
 
-        # A second tick must not re-submit.
+        # The next tick retries the same epoch.
         again = validator.process_once()
         assert again == []
-        assert len(submitter.calls) == 1
+        assert 17 not in validator._processed
+        assert len(submitter.calls) == 2
 
 
 def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) -> None:

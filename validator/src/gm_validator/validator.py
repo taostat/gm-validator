@@ -31,7 +31,6 @@ import logging
 from dataclasses import dataclass
 
 from gm_validator.bittensor_adapter import Submitter
-from gm_validator.bittensor_real import AlreadySubmittedError
 from gm_validator.config import ValidatorConfig
 from gm_validator.epoch_summary import (
     EPOCH_SUMMARY_FILENAME,
@@ -168,24 +167,16 @@ class Validator:
 
         submitted = False
         if vector.uids:
-            try:
-                self._submitter.submit(
-                    netuid=self._config.bittensor_netuid,
-                    uids=vector.uids,
-                    weights=vector.weights,
-                    epoch_id=epoch_id,
-                )
-            except AlreadySubmittedError as exc:
-                # A previous submit for this epoch is already on chain
-                # (the bittensor SDK re-broadcast after a websocket
-                # reconnect). Treat the epoch as submitted and let the
-                # outer loop mark it processed; retrying would re-emit
-                # the same extrinsic and hit the same error.
-                LOGGER.info(
-                    "epoch %d: already submitted on chain (%s); marking processed",
-                    epoch_id,
-                    exc,
-                )
+            # A submit failure raises WeightSubmissionError out of this
+            # method; _process_recent_epoch defers the epoch (skips the
+            # processed mark) so the next tick retries with the same
+            # idempotent weight vector.
+            self._submitter.submit(
+                netuid=self._config.bittensor_netuid,
+                uids=vector.uids,
+                weights=vector.weights,
+                epoch_id=epoch_id,
+            )
             submitted = True
             LOGGER.info(
                 "epoch %d: miners=%d pool_usd=%s consumed_usd=%s",
