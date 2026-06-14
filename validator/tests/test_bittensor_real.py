@@ -25,6 +25,7 @@ import pytest
 
 from gm_validator.bittensor_real import (
     HotkeyConfigError,
+    RealChainCursor,
     RealSubmitter,
     WeightSubmissionError,
     _keypair_from_seed,
@@ -67,12 +68,19 @@ class _FakeSubtensor:
         self.result: tuple[bool, str | None] = (True, "included")
         self.raise_on_set: Exception | None = None
         self.closes: int = 0
+        self.block: int = 0
+        self.raise_on_block: Exception | None = None
 
     def set_weights(self, **kwargs: Any) -> tuple[bool, str | None]:
         self.calls.append(kwargs)
         if self.raise_on_set is not None:
             raise self.raise_on_set
         return self.result
+
+    def get_current_block(self) -> int:
+        if self.raise_on_block is not None:
+            raise self.raise_on_block
+        return self.block
 
     def close(self) -> None:
         self.closes += 1
@@ -472,3 +480,68 @@ def test_submit_reuses_connection_on_success(
     submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
     submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=6)
     assert len(subtensors) == 1
+
+
+# --- head-block read + chain cursor --------------------------------------
+
+
+def test_head_block_reads_current_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``head_block`` returns the long-lived connection's current block."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.block = 1234
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    assert submitter.head_block() == 1234
+
+
+def test_head_block_wraps_read_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raised chain read surfaces as WeightSubmissionError and counts
+    toward reconnect, exactly like a failed submit."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.raise_on_block = ConnectionError("ws closed")
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    with pytest.raises(WeightSubmissionError, match="head-block read failed"):
+        submitter.head_block()
+    assert submitter._consecutive_failures == 1
+
+
+def test_head_block_success_does_not_reset_failure_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean head read must NOT reset the submit-failure counter — the head
+    poll runs every tick, and a chain that still serves get_current_block()
+    while set_weights keeps raising must not have accumulated submit failures
+    wiped, or the reconnect-after-three-submit-failures recovery never fires."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    submitter._consecutive_failures = 2
+    subtensor.block = 50
+    assert submitter.head_block() == 50
+    assert submitter._consecutive_failures == 2
+
+
+def test_chain_cursor_derives_open_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``current_epoch`` is ``head_block // blocks_per_epoch`` — the same
+    derivation the finalizer uses."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.block = 725  # 725 // 360 == 2
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    cursor = RealChainCursor(submitter, blocks_per_epoch=360)
+    assert cursor.current_epoch() == 2
+
+
+def test_chain_cursor_returns_none_on_read_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed head read yields None so the validator skips the tick."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.raise_on_block = ConnectionError("ws closed")
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    cursor = RealChainCursor(submitter, blocks_per_epoch=360)
+    assert cursor.current_epoch() is None
+
+
+def test_chain_cursor_rejects_nonpositive_blocks_per_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_bittensor(monkeypatch)
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    with pytest.raises(ValueError, match="blocks_per_epoch must be positive"):
+        RealChainCursor(submitter, blocks_per_epoch=0)

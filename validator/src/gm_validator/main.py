@@ -12,7 +12,7 @@ import botocore
 from botocore.config import Config
 from prometheus_client import start_http_server
 
-from gm_validator.bittensor_adapter import MockSubmitter, Submitter
+from gm_validator.bittensor_adapter import ChainCursor, MockChainCursor, MockSubmitter, Submitter
 from gm_validator.config import ValidatorConfig
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.validator import Validator
@@ -62,6 +62,27 @@ def _build_submitter(config: ValidatorConfig) -> Submitter:
         endpoint=config.bittensor_endpoint,
         hotkey_seed=config.bittensor_hotkey_seed,
     )
+
+
+def _build_cursor(config: ValidatorConfig, submitter: Submitter) -> ChainCursor:
+    """Build the chain-head epoch cursor.
+
+    Real mode wraps the ``RealSubmitter``'s long-lived connection so the
+    head poll and weight submission share one websocket. Mock mode has no
+    chain to read, so the cursor reports no open epoch and the validator
+    targets nothing each tick — a deliberate idle loop for a build-phase
+    smoke run, logged loudly so it is never mistaken for a stuck chain.
+    """
+    from gm_validator.bittensor_real import RealChainCursor, RealSubmitter
+
+    if isinstance(submitter, RealSubmitter):
+        return RealChainCursor(submitter, config.blocks_per_epoch)
+    logging.getLogger(__name__).warning(
+        "BITTENSOR_MOCK set: chain cursor is idle — the validator will mirror and "
+        "prune but never target an epoch or submit weights. Set BITTENSOR_MOCK=0 to "
+        "enable chain-driven epoch discovery."
+    )
+    return MockChainCursor(epoch=None)
 
 
 def _build_miner_uid_lookup(config: ValidatorConfig) -> dict[str, int]:
@@ -117,11 +138,18 @@ def _build_s3_client(config: ValidatorConfig) -> Any:
 
 def _run(config: ValidatorConfig) -> None:
     s3 = _build_s3_client(config)
-    mirror = S3Mirror(s3, config.s3_bucket, config.s3_prefix, config.local_mirror_dir)
+    mirror = S3Mirror(
+        s3,
+        config.s3_bucket,
+        config.s3_prefix,
+        config.local_mirror_dir,
+        anonymous=config.s3_anonymous,
+    )
     submitter = _build_submitter(config)
+    cursor = _build_cursor(config, submitter)
     miner_uid_lookup = _build_miner_uid_lookup(config)
 
-    validator = Validator(config, mirror, submitter, miner_uid_lookup=miner_uid_lookup)
+    validator = Validator(config, mirror, submitter, cursor, miner_uid_lookup=miner_uid_lookup)
 
     stop = False
 

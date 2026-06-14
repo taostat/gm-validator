@@ -39,16 +39,15 @@ class ValidatorConfig:
     # How many of the most-recent epoch mirrors to keep on disk; older
     # ones are pruned each tick. Env: MIRROR_RETENTION_EPOCHS.
     mirror_retention_epochs: int
-    # Path to the JSON file recording processed epoch ids, so a restart
-    # does not re-submit weights for epochs already finalized in S3.
-    # Env: PROCESSED_STATE_PATH.
-    processed_state_path: str
-    # Upper bound on how many newly-finalized epochs one tick submits
-    # weights for. The older unprocessed backlog is retired to
-    # processed-state without a chain submit — weights are a current
-    # snapshot, so re-submitting a stale backlog only burns inclusion
-    # time and leaks websocket state. Env: MAX_EPOCHS_PER_TICK.
-    max_epochs_per_tick: int
+    # Bittensor tempo — blocks per epoch. The chain head block divided by
+    # this gives the current epoch id, the same derivation the finalizer
+    # uses (`block // blocks_per_epoch`). Env: BLOCKS_PER_EPOCH.
+    blocks_per_epoch: int
+    # How many epochs back from the newest closed epoch to probe for a
+    # `_FINALIZED` marker before giving up for this tick. Tolerates the
+    # finalizer lagging the chain by a few epochs without a full S3 scan.
+    # Env: FINALIZED_LOOKBACK_EPOCHS.
+    finalized_lookback_epochs: int
 
     # Bittensor.
     bittensor_netuid: int
@@ -86,10 +85,8 @@ class ValidatorConfig:
             s3_anonymous=os.environ.get("GM_VALIDATOR_S3_ANONYMOUS", "0") in {"1", "true", "True"},
             local_mirror_dir=os.environ.get("LOCAL_MIRROR_DIR", "/var/cache/gm-validator"),
             mirror_retention_epochs=_int_env("MIRROR_RETENTION_EPOCHS", 10),
-            processed_state_path=os.environ.get(
-                "PROCESSED_STATE_PATH", "/var/cache/gm-validator/processed.json"
-            ),
-            max_epochs_per_tick=_int_env("MAX_EPOCHS_PER_TICK", 3),
+            blocks_per_epoch=_int_env("BLOCKS_PER_EPOCH", 360),
+            finalized_lookback_epochs=_int_env("FINALIZED_LOOKBACK_EPOCHS", 3),
             bittensor_netuid=_int_env("BITTENSOR_NETUID", 0),
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
             bittensor_hotkey_seed=os.environ.get("BITTENSOR_HOTKEY_SEED"),

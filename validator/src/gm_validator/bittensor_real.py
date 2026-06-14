@@ -246,6 +246,37 @@ class RealSubmitter:
         except Exception as exc:  # noqa: BLE001 — best-effort cleanup; the retired connection is discarded regardless.
             LOGGER.debug("retired subtensor close failed: %s", exc)
 
+    def head_block(self) -> int:
+        """Return the current chain head block from the long-lived connection.
+
+        Reuses the same websocket the submitter holds — the validator's
+        per-tick epoch cursor reads the head here rather than opening a
+        second connection. A read failure counts toward reconnect exactly
+        like a failed submit (only raised exceptions drive reconnect), so a
+        dead socket is recovered on a later tick.
+
+        A clean head read deliberately does NOT reset ``_consecutive_failures``:
+        the head poll runs every tick before the submit, and a chain that
+        can still serve ``get_current_block()`` while ``set_weights`` keeps
+        raising must not have its accumulated submit failures wiped — only a
+        clean ``set_weights`` proves the submit path healthy and resets the
+        counter. The reset asymmetry keeps the leak-fix's
+        reconnect-after-three-submit-failures recovery intact.
+
+        Raises:
+            WeightSubmissionError: No connection is available, or the head
+                read failed at the connection level.
+        """
+        self._maybe_reconnect()
+        if self._subtensor is None:
+            raise WeightSubmissionError("no subtensor connection available for head-block read")
+        try:
+            block = self._subtensor.get_current_block()
+        except Exception as exc:
+            self._consecutive_failures += 1
+            raise WeightSubmissionError(f"head-block read failed: {exc}") from exc
+        return int(block)
+
     def submit(
         self,
         *,
@@ -327,3 +358,29 @@ class RealSubmitter:
         # connection-failure counter.
         self._consecutive_failures = 0
         LOGGER.info("epoch %d: weights accepted by subtensor (%s)", epoch_id, message)
+
+
+class RealChainCursor:
+    """Derives the open epoch id from the chain head over the submitter's socket.
+
+    Reads the head block through the ``RealSubmitter``'s long-lived
+    connection so the validator holds exactly one websocket for both the
+    head poll and weight submission. ``current_epoch`` returns the open
+    epoch ``head_block // blocks_per_epoch`` — the same derivation the
+    epoch-finalizer uses — or ``None`` when the head read fails, so a
+    transient chain hiccup skips the tick instead of crashing the loop.
+    """
+
+    def __init__(self, submitter: RealSubmitter, blocks_per_epoch: int) -> None:
+        if blocks_per_epoch <= 0:
+            raise ValueError(f"blocks_per_epoch must be positive, got {blocks_per_epoch}")
+        self._submitter = submitter
+        self._blocks_per_epoch = blocks_per_epoch
+
+    def current_epoch(self) -> int | None:
+        try:
+            block = self._submitter.head_block()
+        except WeightSubmissionError as exc:
+            LOGGER.warning("chain head read failed: %s — skipping this tick", exc)
+            return None
+        return block // self._blocks_per_epoch

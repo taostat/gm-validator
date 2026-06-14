@@ -33,32 +33,36 @@ class S3Mirror:
         bucket: str,
         prefix: str,
         local_root: str,
+        anonymous: bool = False,
     ) -> None:
         self._s3 = s3_client
         self._bucket = bucket
         self._prefix = prefix.strip("/")
         self._local_root = local_root
+        self._anonymous = anonymous
 
     # ---- discovery ----
 
-    def discover_finalized_epochs(self) -> list[int]:
-        """Return the sorted list of epoch ids that have a `_FINALIZED` marker."""
-        prefix = f"{self._prefix}/finalized/"
-        paginator = self._s3.get_paginator("list_objects_v2")
-        epochs: set[int] = set()
-        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix, Delimiter="/"):
-            for cp in page.get("CommonPrefixes", []) or []:
-                # cp = {"Prefix": "v1/finalized/epoch=142/"}
-                segment = cp["Prefix"].rstrip("/").rsplit("/", 1)[-1]
-                if not segment.startswith("epoch="):
-                    continue
-                try:
-                    epoch_id = int(segment.removeprefix("epoch="))
-                except ValueError:
-                    continue
-                if self._marker_exists(epoch_id):
-                    epochs.add(epoch_id)
-        return sorted(epochs)
+    def latest_finalized_epoch(self, target: int, lookback: int) -> int | None:
+        """Find the newest finalized epoch at or below *target*.
+
+        Probes ``finalized/epoch={target}/_FINALIZED`` and walks back up
+        to *lookback* further epochs (``target``, ``target-1``, …) until a
+        ``_FINALIZED`` marker is found, returning that epoch id. Each probe
+        is a single targeted ``head_object`` — there is no list+scan of
+        the full epoch history. Returns ``None`` if none of the probed
+        epochs is finalized yet (the finalizer is still lagging), so the
+        caller does nothing this tick and retries on the next one.
+
+        The walk-back tolerates the finalizer trailing the chain by a few
+        epochs; *lookback* bounds it so a persistently un-finalized window
+        does not turn into an unbounded scan.
+        """
+        floor = max(target - lookback, 0)
+        for epoch_id in range(target, floor - 1, -1):
+            if self._marker_exists(epoch_id):
+                return epoch_id
+        return None
 
     # ---- mirror ----
 
@@ -105,13 +109,25 @@ class S3Mirror:
         self._s3.download_file(self._bucket, key, tmp)
         os.replace(tmp, local_path)
 
+    _NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+    # 403 means "absent" ONLY on anonymous/public-read buckets: without
+    # ListBucket, S3 returns 403 Forbidden for a HEAD on a missing key (with
+    # ListBucket it would be 404). The targeted walk-back HEADs
+    # not-yet-finalized epochs as a normal path, so on those buckets a 403
+    # is just "no marker, keep walking back". On a signed/private bucket the
+    # same 403 is a real credential/permission misconfiguration on an
+    # existing key, so it must propagate loudly rather than silently idle.
+    _FORBIDDEN_CODES = frozenset({"403", "AccessDenied", "Forbidden"})
+
     def _marker_exists(self, epoch_id: int) -> bool:
         key = f"{self._prefix}/finalized/epoch={epoch_id}/_FINALIZED"
         try:
             self._s3.head_object(Bucket=self._bucket, Key=key)
         except self._s3.exceptions.ClientError as e:
             err = e.response.get("Error", {}).get("Code", "")
-            if err in {"404", "NoSuchKey", "NotFound"}:
+            if err in self._NOT_FOUND_CODES:
+                return False
+            if self._anonymous and err in self._FORBIDDEN_CODES:
                 return False
             raise
         else:

@@ -29,6 +29,40 @@ class Submitter(Protocol):
         ...
 
 
+class ChainCursor(Protocol):
+    """Reads the chain head block and derives the current epoch id.
+
+    The validator targets the newest *closed* epoch each tick by reading
+    the chain head — `head_block // blocks_per_epoch` is the open epoch,
+    so the newest closed one is that minus one. This is the same
+    derivation the epoch-finalizer uses, and it replaces scanning S3 for
+    finalized markers: the chain head is the discovery cursor.
+    """
+
+    def current_epoch(self) -> int | None:
+        """Return the open epoch id from the chain head, or None if unreadable.
+
+        A None return is transient (the chain read failed); the validator
+        skips the tick and retries on the next one rather than crashing.
+        """
+        ...
+
+
+@dataclass
+class MockChainCursor:
+    """In-memory chain cursor for tests and the mock-submitter build.
+
+    ``epoch`` is the *open* epoch reported by the (fake) chain head; the
+    validator targets ``epoch - 1`` as the newest closed epoch. Set it to
+    ``None`` to simulate an unreadable chain head.
+    """
+
+    epoch: int | None = 0
+
+    def current_epoch(self) -> int | None:
+        return self.epoch
+
+
 @dataclass
 class MockSubmitter:
     """In-memory submitter for tests and Phase 1 build."""
