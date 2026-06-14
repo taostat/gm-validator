@@ -69,6 +69,13 @@ class ValidatorConfig:
     # BITTENSOR_HOTKEY_SEED.
     bittensor_hotkey_seed: str | None
     bittensor_mock: bool
+    # Wall-clock budget for a single subtensor connect attempt. The SDK
+    # opens its websocket synchronously with no connect timeout, so a
+    # connect that hangs (rather than raising) would freeze startup
+    # forever. connect_subtensor runs the construction in a worker thread
+    # and raises TimeoutError past this budget so the retry loop catches
+    # it. Env: SUBTENSOR_CONNECT_TIMEOUT_SECS.
+    subtensor_connect_timeout_secs: int
 
     # Polling / timing.
     poll_interval_secs: int
@@ -111,6 +118,7 @@ class ValidatorConfig:
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
             bittensor_hotkey_seed=os.environ.get("BITTENSOR_HOTKEY_SEED"),
             bittensor_mock=os.environ.get("BITTENSOR_MOCK", "0") in {"1", "true", "True"},
+            subtensor_connect_timeout_secs=_int_env("SUBTENSOR_CONNECT_TIMEOUT_SECS", 30),
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),
             subnet_owner_uid=int(_require_env("SUBNET_OWNER_UID")),

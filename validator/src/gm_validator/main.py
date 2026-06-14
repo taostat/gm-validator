@@ -61,6 +61,7 @@ def _build_submitter(config: ValidatorConfig) -> Submitter:
         netuid=config.bittensor_netuid,
         endpoint=config.bittensor_endpoint,
         hotkey_seed=config.bittensor_hotkey_seed,
+        connect_timeout=config.subtensor_connect_timeout_secs,
     )
 
 
@@ -85,18 +86,25 @@ def _build_cursor(config: ValidatorConfig, submitter: Submitter) -> ChainCursor:
     return MockChainCursor(epoch=None)
 
 
-def _build_miner_uid_lookup(config: ValidatorConfig) -> dict[str, int]:
+def _build_miner_uid_lookup(config: ValidatorConfig, submitter: Submitter) -> dict[str, int]:
     """Build the hotkey -> uid lookup from the subnet metagraph.
 
-    Returns an empty mapping in mock mode — the mock-submitter build
-    path has no chain to query.
+    Reads the metagraph over the ``RealSubmitter``'s already-open socket
+    rather than dialing a second connection — a second rapid websocket to
+    the public testnet endpoint is what stalled startup. Mock mode has no
+    chain to query, so it returns an empty mapping.
     """
-    if _use_mock_submitter(config):
-        return {}
-    # Lazy import so the test path does not require bittensor-py.
-    from gm_validator.metagraph import load_miner_uid_lookup
+    from gm_validator.bittensor_real import RealSubmitter
 
-    return load_miner_uid_lookup(config.bittensor_netuid, config.bittensor_endpoint)
+    if not isinstance(submitter, RealSubmitter):
+        return {}
+    lookup = submitter.metagraph_hotkeys(config.bittensor_netuid)
+    logging.getLogger(__name__).info(
+        "metagraph netuid=%d: loaded %d hotkey->uid entries",
+        config.bittensor_netuid,
+        len(lookup),
+    )
+    return lookup
 
 
 def _build_s3_client(config: ValidatorConfig) -> Any:
@@ -147,7 +155,7 @@ def _run(config: ValidatorConfig) -> None:
     )
     submitter = _build_submitter(config)
     cursor = _build_cursor(config, submitter)
-    miner_uid_lookup = _build_miner_uid_lookup(config)
+    miner_uid_lookup = _build_miner_uid_lookup(config, submitter)
 
     validator = Validator(config, mirror, submitter, cursor, miner_uid_lookup=miner_uid_lookup)
 

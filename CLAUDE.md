@@ -23,8 +23,8 @@ artifact set is treated as authoritative.
 - `src/gm_validator/alpha_economics.py` — `compute_epoch_weights()` (per-miner `consumed_usd / pool_usd`) + `normalize_weights()` (float→u16, renorms when sum > 1, burn slot absorbs the residue when sum < 1); ported from bm-validator
 - `src/gm_validator/epoch_summary.py` — Pydantic model + S3 reader for the finalizer's per-epoch `epoch_summary.json` (alpha USD price snapshot)
 - `src/gm_validator/bittensor_adapter.py` — `Submitter` protocol; `MockSubmitter` for testing
-- `src/gm_validator/bittensor_real.py` — `RealSubmitter`: lazily-imported to avoid loading bittensor-py in tests
-- `src/gm_validator/metagraph.py` — lazy hotkey→uid lookup from the subnet metagraph
+- `src/gm_validator/bittensor_real.py` — `RealSubmitter`: lazily-imported to avoid loading bittensor-py in tests; holds the one long-lived socket and serves the startup hotkey→uid lookup over it
+- `src/gm_validator/subtensor_connect.py` — `connect_subtensor`: retrying, timeout-bounded subtensor construction (a hung connect becomes a retryable `TimeoutError`)
 - `src/gm_validator/config.py` — `ValidatorConfig.from_env()`
 - `src/gm_validator/processed_state.py` — persisted set of already-processed epoch ids (JSON file)
 

@@ -210,6 +210,7 @@ def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
         bittensor_endpoint=None,
         bittensor_hotkey_seed=None,
         bittensor_mock=True,
+        subtensor_connect_timeout_secs=30,
         poll_interval_secs=1,
         metrics_port=9092,
         subnet_owner_uid=99,

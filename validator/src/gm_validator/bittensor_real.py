@@ -68,6 +68,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from gm_validator.subtensor_connect import DEFAULT_CONNECT_TIMEOUT_SECS
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -151,6 +153,7 @@ class RealSubmitter:
         netuid: int,
         endpoint: str | None,
         hotkey_seed: str,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECS,
     ) -> None:
         """Build the in-memory hotkey and connect to subtensor.
 
@@ -161,6 +164,9 @@ class RealSubmitter:
             hotkey_seed: The validator hotkey seed — a BIP-39 mnemonic or
                 a ``0x``-prefixed hex seed. The signing keypair is built
                 in memory from it; no keyfile is read from disk.
+            connect_timeout: Per-attempt wall-clock budget for opening the
+                subtensor websocket; a hung connect becomes a retryable
+                timeout instead of freezing startup.
 
         Raises:
             HotkeyConfigError: The seed is missing or malformed.
@@ -169,6 +175,7 @@ class RealSubmitter:
         """
         self._netuid = netuid
         self._endpoint = endpoint
+        self._connect_timeout = connect_timeout
         self._subtensor: Any | None = None
         self._consecutive_failures = 0
         hotkey = _keypair_from_seed(hotkey_seed)
@@ -197,7 +204,7 @@ class RealSubmitter:
         """
         from gm_validator.subtensor_connect import connect_subtensor
 
-        return connect_subtensor(self._endpoint)
+        return connect_subtensor(self._endpoint, connect_timeout=self._connect_timeout)
 
     def _maybe_reconnect(self) -> None:
         """Recreate the websocket after sustained connection failures.
@@ -276,6 +283,29 @@ class RealSubmitter:
             self._consecutive_failures += 1
             raise WeightSubmissionError(f"head-block read failed: {exc}") from exc
         return int(block)
+
+    def metagraph_hotkeys(self, netuid: int) -> dict[str, int]:
+        """Return the subnet's hotkey ss58 -> uid mapping over the held socket.
+
+        Reads the metagraph through the submitter's long-lived connection
+        so startup opens exactly one websocket — the submitter's connect
+        immediately precedes this call, and a second rapid connect to the
+        public testnet endpoint is what stalled startup. Unlike a submit or
+        head read, a failure here is not part of the per-tick reconnect
+        accounting: this runs once at startup, so it surfaces directly for
+        the caller to wrap.
+
+        Raises:
+            WeightSubmissionError: No connection is available, or the
+                metagraph read failed.
+        """
+        if self._subtensor is None:
+            raise WeightSubmissionError("no subtensor connection available for metagraph read")
+        try:
+            metagraph = self._subtensor.metagraph(netuid)
+        except Exception as exc:
+            raise WeightSubmissionError(f"metagraph read failed: {exc}") from exc
+        return {hotkey: uid for uid, hotkey in enumerate(metagraph.hotkeys)}
 
     def submit(
         self,

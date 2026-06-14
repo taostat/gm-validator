@@ -70,6 +70,15 @@ class _FakeSubtensor:
         self.closes: int = 0
         self.block: int = 0
         self.raise_on_block: Exception | None = None
+        self.hotkeys: list[str] = ["5HotkeyA", "5HotkeyB", "5HotkeyC"]
+        self.requested_metagraph_netuid: int | None = None
+        self.raise_on_metagraph: Exception | None = None
+
+    def metagraph(self, netuid: int) -> Any:
+        self.requested_metagraph_netuid = netuid
+        if self.raise_on_metagraph is not None:
+            raise self.raise_on_metagraph
+        return types.SimpleNamespace(hotkeys=self.hotkeys)
 
     def set_weights(self, **kwargs: Any) -> tuple[bool, str | None]:
         self.calls.append(kwargs)
@@ -202,6 +211,44 @@ def test_constructor_rejects_bad_seed(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_failing_keypair(monkeypatch)
     with pytest.raises(HotkeyConfigError):
         RealSubmitter(netuid=1, endpoint=None, hotkey_seed="not a real seed")
+
+
+# --- metagraph hotkey lookup --------------------------------------------
+
+
+def test_metagraph_hotkeys_reuses_one_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hotkey lookup reads over the submitter's existing socket.
+
+    Startup must open exactly one bittensor connection: the second rapid
+    connect to the public testnet endpoint is what stalled the validator.
+    The fake module hands out the SAME subtensor for every
+    ``bittensor.Subtensor()`` call, so a second connect would be invisible
+    here — what this asserts is that the read targets the held socket and
+    no extra ``Subtensor`` construction is needed for the lookup.
+    """
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.hotkeys = ["5HotkeyA", "5HotkeyB", "5HotkeyC"]
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+
+    lookup = submitter.metagraph_hotkeys(42)
+
+    assert lookup == {"5HotkeyA": 0, "5HotkeyB": 1, "5HotkeyC": 2}
+    assert subtensor.requested_metagraph_netuid == 42
+
+
+def test_metagraph_hotkeys_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.hotkeys = []
+    submitter = RealSubmitter(netuid=1, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    assert submitter.metagraph_hotkeys(1) == {}
+
+
+def test_metagraph_hotkeys_wraps_chain_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.raise_on_metagraph = ConnectionError("subtensor unreachable")
+    submitter = RealSubmitter(netuid=1, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    with pytest.raises(WeightSubmissionError, match="subtensor unreachable"):
+        submitter.metagraph_hotkeys(1)
 
 
 # --- submission ----------------------------------------------------------
