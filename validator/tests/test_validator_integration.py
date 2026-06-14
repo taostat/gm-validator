@@ -195,6 +195,7 @@ def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
         local_mirror_dir=str(tmp_path),
         mirror_retention_epochs=10,
         processed_state_path=str(tmp_path / "processed.json"),
+        max_epochs_per_tick=100,
         bittensor_netuid=42,
         bittensor_endpoint=None,
         bittensor_hotkey_seed=None,

@@ -79,6 +79,7 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "local_mirror_dir": "/var/cache/gm-test",
         "mirror_retention_epochs": 10,
         "processed_state_path": "/var/cache/gm-test/processed.json",
+        "max_epochs_per_tick": 100,
         "bittensor_netuid": 0,
         "bittensor_endpoint": None,
         "bittensor_hotkey_seed": None,
