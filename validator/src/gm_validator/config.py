@@ -76,6 +76,14 @@ class ValidatorConfig:
     # and raises TimeoutError past this budget so the retry loop catches
     # it. Env: SUBTENSOR_CONNECT_TIMEOUT_SECS.
     subtensor_connect_timeout_secs: int
+    # Wall-clock budget for a single chain RPC over the already-open
+    # socket (get_current_block at the top of each tick, set_weights). The
+    # SDK has no per-call timeout, so after a successful set_weights the
+    # next get_current_block can hang forever on a wedged websocket and
+    # freeze the loop. RealSubmitter bounds each RPC with this budget and
+    # raises TimeoutError past it, which counts toward reconnect so the
+    # socket self-heals. Env: SUBTENSOR_RPC_TIMEOUT_SECS.
+    subtensor_rpc_timeout_secs: int
 
     # Polling / timing.
     poll_interval_secs: int
@@ -119,6 +127,7 @@ class ValidatorConfig:
             bittensor_hotkey_seed=os.environ.get("BITTENSOR_HOTKEY_SEED"),
             bittensor_mock=os.environ.get("BITTENSOR_MOCK", "0") in {"1", "true", "True"},
             subtensor_connect_timeout_secs=_int_env("SUBTENSOR_CONNECT_TIMEOUT_SECS", 30),
+            subtensor_rpc_timeout_secs=_int_env("SUBTENSOR_RPC_TIMEOUT_SECS", 30),
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
             metrics_port=_int_env("METRICS_PORT", 9092),
             subnet_owner_uid=int(_require_env("SUBNET_OWNER_UID")),

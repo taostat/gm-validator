@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 import types
 from typing import Any
 
@@ -73,6 +74,11 @@ class _FakeSubtensor:
         self.hotkeys: list[str] = ["5HotkeyA", "5HotkeyB", "5HotkeyC"]
         self.requested_metagraph_netuid: int | None = None
         self.raise_on_metagraph: Exception | None = None
+        # When set, the named chain RPC blocks on this event until the test
+        # releases it (or the worker thread's wall-clock budget elapses),
+        # simulating a wedged websocket that hangs rather than raises.
+        self.hang_on_block: threading.Event | None = None
+        self.hang_on_set: threading.Event | None = None
 
     def metagraph(self, netuid: int) -> Any:
         self.requested_metagraph_netuid = netuid
@@ -82,11 +88,15 @@ class _FakeSubtensor:
 
     def set_weights(self, **kwargs: Any) -> tuple[bool, str | None]:
         self.calls.append(kwargs)
+        if self.hang_on_set is not None:
+            self.hang_on_set.wait(timeout=5.0)
         if self.raise_on_set is not None:
             raise self.raise_on_set
         return self.result
 
     def get_current_block(self) -> int:
+        if self.hang_on_block is not None:
+            self.hang_on_block.wait(timeout=5.0)
         if self.raise_on_block is not None:
             raise self.raise_on_block
         return self.block
@@ -566,6 +576,83 @@ def test_head_block_success_does_not_reset_failure_counter(
     assert submitter._consecutive_failures == 2
 
 
+# --- RPC timeout + reconnect (post-submit hang) --------------------------
+
+
+def test_head_block_times_out_when_socket_wedges(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``get_current_block`` that hangs must raise, not freeze the loop.
+
+    Reproduces the post-submit hang: the SDK leaves the websocket wedged
+    after a successful ``set_weights`` so the next head read blocks forever.
+    The bounded RPC timeout converts that hang into a
+    ``WeightSubmissionError`` the validator loop catches, and counts it
+    toward reconnect. Without the timeout this test would HANG rather than
+    fail — that is the bug it guards. The 5s ``Event.wait`` in the fake is
+    a teardown backstop, not the path under test (the 0.05s budget fires
+    first).
+    """
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.hang_on_block = threading.Event()
+    submitter = RealSubmitter(
+        netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX, rpc_timeout=0.05
+    )
+    try:
+        with pytest.raises(WeightSubmissionError, match="head-block read failed"):
+            submitter.head_block()
+    finally:
+        subtensor.hang_on_block.set()
+    assert submitter._consecutive_failures == 1
+
+
+def test_submit_times_out_when_socket_wedges(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``set_weights`` that hangs must raise and count toward reconnect."""
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.hang_on_set = threading.Event()
+    submitter = RealSubmitter(
+        netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX, rpc_timeout=0.05
+    )
+    try:
+        with pytest.raises(WeightSubmissionError, match="set_weights call failed"):
+            submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
+    finally:
+        subtensor.hang_on_set.set()
+    assert submitter._consecutive_failures == 1
+
+
+def test_head_block_reconnects_after_three_hung_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three consecutive hung head reads trip the reconnect threshold; the
+    fourth read opens a fresh socket and succeeds.
+
+    This is the end-to-end recovery for the post-submit hang: a wedged
+    socket times out, accumulates failures, and self-heals via reconnect
+    rather than freezing the loop forever.
+    """
+    subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
+    submitter = RealSubmitter(
+        netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX, rpc_timeout=0.05
+    )
+    hang = threading.Event()
+    subtensors[0].hang_on_block = hang
+
+    try:
+        for _ in range(3):
+            with pytest.raises(WeightSubmissionError, match="head-block read failed"):
+                submitter.head_block()
+            assert submitter._subtensor is subtensors[0]
+            assert len(subtensors) == 1
+    finally:
+        hang.set()
+
+    # Fourth read: the counter is at 3, so _maybe_reconnect opens a fresh
+    # socket (a new _FakeSubtensor with no hang set) before the read, which
+    # then returns that socket's default block instead of hanging.
+    block = submitter.head_block()
+    assert len(subtensors) == 2
+    assert submitter._subtensor is subtensors[1]
+    assert block == subtensors[1].block
+    assert subtensors[0].closes == 1
+
+
 def test_chain_cursor_derives_open_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
     """``current_epoch`` is ``head_block // blocks_per_epoch`` — the same
     derivation the finalizer uses."""
@@ -583,6 +670,36 @@ def test_chain_cursor_returns_none_on_read_failure(monkeypatch: pytest.MonkeyPat
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
     cursor = RealChainCursor(submitter, blocks_per_epoch=360)
     assert cursor.current_epoch() is None
+
+
+def test_chain_cursor_survives_hung_tick_then_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hung head read skips the tick without freezing, and the cursor
+    recovers once the wedged socket is reconnected.
+
+    This is the loop-survival contract for the post-submit hang: a wedged
+    ``get_current_block`` times out, ``current_epoch`` returns None so the
+    validator loop's tick is a clean no-op (not an infinite freeze), and
+    after the reconnect threshold trips the cursor resolves a real epoch
+    again over the fresh socket.
+    """
+    subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
+    submitter = RealSubmitter(
+        netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX, rpc_timeout=0.05
+    )
+    cursor = RealChainCursor(submitter, blocks_per_epoch=360)
+    hang = threading.Event()
+    subtensors[0].hang_on_block = hang
+
+    try:
+        for _ in range(3):
+            assert cursor.current_epoch() is None
+    finally:
+        hang.set()
+
+    subtensors_before = len(subtensors)
+    epoch = cursor.current_epoch()
+    assert len(subtensors) == subtensors_before + 1
+    assert epoch == subtensors[-1].block // 360
 
 
 def test_chain_cursor_rejects_nonpositive_blocks_per_epoch(
