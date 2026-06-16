@@ -29,19 +29,39 @@ connection-level (raised-exception) failures, mirroring the bm validator's
 
 Submit contract:
 
-``set_weights`` is called with ``wait_for_inclusion=True,
-wait_for_finalization=True`` and the SDK default ``raise_error=False``, so
-substrate errors come back as an ``ExtrinsicResponse`` (unpacks as
-``(success, message)``) rather than a raised exception. Two outcomes drive
-the lifecycle:
+``set_weights`` is called fire-and-forget — ``wait_for_inclusion=False,
+wait_for_finalization=False`` — so the SDK signs, submits to the mempool,
+and returns at once without opening a block-event subscription. Waiting
+for inclusion or finalization holds a per-submit subscription on the
+long-lived socket until the extrinsic lands; over multi-hour runs those
+accumulate and stall payouts, and a ``run_with_timeout`` that fires
+abandons (does not cancel) the worker thread, so a wedged wait keeps its
+subscription alive on the shared socket. This trades the SDK's per-submit
+inclusion receipt for a non-leaking submit: a mempool accept is not a
+chain-inclusion proof, so a submitted vector the pool later drops is not
+retried within its epoch. That loss is bounded — the validator only ever
+targets the newest finalized epoch and re-derives it from the chain head
+each tick, so a dropped vector is superseded by the next epoch's submit
+(on-chain weights are a snapshot, not a per-epoch ledger), and a
+re-submitted identical vector is idempotent so the path never
+double-submits.
+
+The submit is bounded by ``run_with_timeout`` and uses the SDK default
+``raise_error=False``, so substrate errors come back as an
+``ExtrinsicResponse`` (unpacks as ``(success, message)``) rather than a
+raised exception. Two outcomes drive the lifecycle:
 
 - A raised exception is a connection-level failure (dead websocket, RPC
-  timeout). It increments the failure counter so the connection is
-  recreated once three pile up, and surfaces as ``WeightSubmissionError``.
+  timeout, or the run_with_timeout wall-clock bound firing). It increments
+  the failure counter so the connection is recreated once three pile up,
+  and surfaces as ``WeightSubmissionError``.
 - A ``(False, message)`` return is a chain answer, so the socket is
   healthy: it neither resets nor increments the counter, and surfaces as
   ``WeightSubmissionError`` so the validator loop retries the epoch on the
-  next tick.
+  next tick. With the waits off this covers a mempool-submission rejection
+  (bad nonce, rate-limit short-circuit, hotkey not registered) as well as
+  the chain's pre-flight checks; the rate-limit gate runs before the
+  extrinsic is built, so dropping the waits does not weaken it.
 
 This counts only raised exceptions toward reconnect, exactly like the bm
 validator that has run this contract for 9+ days. The SDK can also wrap a
@@ -382,13 +402,33 @@ class RealSubmitter:
         )
 
         def _set_weights() -> tuple[bool, str | None]:
+            # Fire-and-forget into the mempool: wait_for_inclusion /
+            # wait_for_finalization each open a per-submit block-event
+            # subscription on the long-lived socket and block until the
+            # extrinsic lands. Over multi-hour runs those subscriptions
+            # accumulate and stall payouts; a run_with_timeout abandons
+            # (does not cancel) the worker thread, so a submit wedged
+            # inside the wait keeps its subscription alive on the shared
+            # socket. With both False the SDK submits and returns at once,
+            # holding no subscription. The trade is the SDK's inclusion
+            # receipt: a mempool accept is not chain-inclusion proof, but a
+            # dropped vector is superseded by the next epoch's submit and a
+            # re-submitted identical vector is idempotent — so the loss is
+            # bounded and the path never double-submits.
+            # mev_protection=False forces the plain author_submitExtrinsic
+            # path. The SDK default reads BT_MEV_PROTECTION from the env;
+            # under MEV mode the SDK rejects wait_for_revealed_execution
+            # (its own default True) combined with wait_for_inclusion=False,
+            # so pinning it off keeps the fire-and-forget submit valid
+            # regardless of a stray env var.
             return subtensor.set_weights(
                 wallet=self._wallet,
                 netuid=netuid,
                 uids=uids,
                 weights=weights,
-                wait_for_inclusion=True,
-                wait_for_finalization=True,
+                mev_protection=False,
+                wait_for_inclusion=False,
+                wait_for_finalization=False,
             )
 
         try:

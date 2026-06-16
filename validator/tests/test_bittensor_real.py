@@ -277,12 +277,21 @@ def test_submit_passes_in_memory_wallet_to_set_weights(
     assert call["netuid"] == 42
     assert call["uids"] == [0, 3]
     assert call["weights"] == [400, 600]
-    assert call["wait_for_inclusion"] is True
-    assert call["wait_for_finalization"] is True
+    # Fire-and-forget into the mempool: waiting for inclusion or
+    # finalization holds a per-submit block-event subscription on the
+    # long-lived socket that accumulates over multi-hour runs and stalls
+    # payouts. Both waits stay off; confirmation is the separate chain-head
+    # poll plus the per-epoch dedup guards.
+    assert call["wait_for_inclusion"] is False
+    assert call["wait_for_finalization"] is False
+    # Pin the plain author_submitExtrinsic path: under MEV mode the SDK
+    # rejects its default wait_for_revealed_execution combined with
+    # wait_for_inclusion=False, so the submit forces mev_protection off.
+    assert call["mev_protection"] is False
     # The submitter relies on the SDK default raise_error=False so substrate
-    # errors come back as a (success, message) tuple, including the
-    # "Already Imported" receipt under wait_for_inclusion. It must not opt
-    # into the raising contract.
+    # errors come back as a (success, message) tuple — a mempool-submission
+    # rejection (bad nonce, rate-limit, not registered) surfaces as
+    # (False, message). It must not opt into the raising contract.
     assert "raise_error" not in call
     # The wallet handed to the chain is the in-memory shim, and its
     # no-op unlock_hotkey never touches the filesystem.
