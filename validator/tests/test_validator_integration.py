@@ -281,6 +281,38 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             assert os.path.exists(os.path.join(epoch_dir, name)), f"missing: {name}"
 
 
+def test_successful_submit_advances_staleness_gauges(tmp_path: pathlib.Path) -> None:
+    """A successful submit advances the last-weight epoch + timestamp gauges."""
+    from gm_validator import metrics
+
+    metrics._highest_submitted = -1
+    metrics.LAST_WEIGHT_EPOCH.set(0)
+    metrics.LAST_WEIGHT_TIMESTAMP.set(0)
+
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        miner_a = "5Ehm" + "A" * 44
+        _populate_epoch(
+            s3,
+            epoch_id=7,
+            records=[_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)],
+            emissions_alpha="0.0001",
+        )
+        validator = Validator(
+            _config(tmp_path),
+            S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
+            MockSubmitter(),
+            _cursor_targeting(7),
+            miner_uid_lookup={miner_a: 0},
+        )
+
+        assert validator.process_once()[0].weights_submitted
+
+    assert metrics.LAST_WEIGHT_EPOCH._value.get() == 7
+    assert metrics.LAST_WEIGHT_TIMESTAMP._value.get() > 0
+
+
 def test_validator_restart_rescores_current_epoch_at_most_once(tmp_path: pathlib.Path) -> None:
     """A restart re-derives the cursor from the chain, so it re-scores the
     current epoch exactly once — the submit is idempotent (same weight

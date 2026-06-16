@@ -52,6 +52,7 @@ from gm_validator.epoch_summary import (
     epoch_summary_path,
     load_epoch_summary,
 )
+from gm_validator.metrics import record_weight_submission
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import (
     StaleEpochSummaryError,
@@ -251,6 +252,7 @@ class Validator:
                 epoch_id=epoch_id,
             )
             submitted = True
+            record_weight_submission(epoch_id)
             LOGGER.info(
                 "epoch %d: miners=%d pool_usd=%s consumed_usd=%s",
                 epoch_id,
