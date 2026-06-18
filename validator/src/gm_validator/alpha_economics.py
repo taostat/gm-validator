@@ -117,8 +117,10 @@ def compute_epoch_weights(
 def normalize_weights(
     miner_weights: list[tuple[int, Decimal]],
     burn_uid: int,
+    *,
+    renorm_total: Decimal | None = None,
 ) -> list[tuple[int, int]]:
-    """Convert float-domain weights to u16, padding the burn slot with dust.
+    """Convert Decimal-domain weights to u16, padding the burn slot with dust.
 
     Every miner with a strictly positive weight is floored to at least 1 u16
     unit so a share below ``1/MAX_WEIGHT`` keeps its emission instead of
@@ -134,6 +136,11 @@ def normalize_weights(
         burn_uid: Uid that absorbs the floor-rounding remainder. When
             ``miner_weights`` is empty or sums to zero, the burn uid gets
             the entire ``MAX_WEIGHT``.
+        renorm_total: Full demand total in pool units: the sum of every
+            scored miner's weight, including miners dropped from the
+            submitted vector. When supplied, this total is used as the
+            renormalization denominator so dropped demand still
+            suppresses the submitted shares.
 
     Returns:
         ``(uid, u16_weight)`` pairs summing to exactly ``MAX_WEIGHT``.
@@ -154,7 +161,10 @@ def normalize_weights(
     if total <= 0:
         return [(burn_uid, MAX_WEIGHT)]
 
-    renorm = total if total > Decimal(1) else Decimal(1)
+    if renorm_total is None:
+        renorm = total if total > Decimal(1) else Decimal(1)
+    else:
+        renorm = max(renorm_total, Decimal(1))
 
     # Floor: every strictly-positive share earns at least one unit so a miner
     # below 1/MAX_WEIGHT keeps its emission instead of truncating to burn. The
