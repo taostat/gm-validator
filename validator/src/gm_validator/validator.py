@@ -155,8 +155,7 @@ class Validator:
             return
         try:
             lookup = self._metagraph_source.hotkeys()
-        except Exception as exc:  # noqa: BLE001 — keep validating with the last successful metagraph read.
-            # Keep last-good so a transient metagraph read failure cannot zero all miner weights.
+        except Exception as exc:  # noqa: BLE001 — last-good keeps a transient read from zeroing all weights.
             LOGGER.warning("metagraph refresh failed: %s; keeping last-good miner uid lookup", exc)
             return
         self._miner_uid_lookup = lookup

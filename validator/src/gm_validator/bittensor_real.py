@@ -329,15 +329,18 @@ class RealSubmitter:
         """Return the subnet's hotkey ss58 -> uid mapping over the held socket.
 
         Reads the metagraph through the submitter's long-lived connection so
-        startup and per-tick refreshes use exactly one websocket. Unlike a
-        submit or head read, a failure here is not part of the reconnect
-        accounting: callers keep their last-good lookup and the following
-        head read or submit still drives socket health.
+        startup and per-tick refreshes use exactly one websocket. A pending
+        reconnect (failure threshold already tripped by prior submits/head
+        reads) is honoured first so the refresh reads from the fresh socket
+        in the same tick. Unlike a submit or head read, a failure here is not
+        part of the reconnect accounting: callers keep their last-good lookup
+        and the following head read or submit still drives socket health.
 
         Raises:
             WeightSubmissionError: No connection is available, or the
                 metagraph read failed.
         """
+        self._maybe_reconnect()
         subtensor = self._subtensor
         if subtensor is None:
             raise WeightSubmissionError("no subtensor connection available for metagraph read")
