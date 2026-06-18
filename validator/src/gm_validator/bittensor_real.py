@@ -328,13 +328,11 @@ class RealSubmitter:
     def metagraph_hotkeys(self, netuid: int) -> dict[str, int]:
         """Return the subnet's hotkey ss58 -> uid mapping over the held socket.
 
-        Reads the metagraph through the submitter's long-lived connection
-        so startup opens exactly one websocket — the submitter's connect
-        immediately precedes this call, and a second rapid connect to the
-        public testnet endpoint is what stalled startup. Unlike a submit or
-        head read, a failure here is not part of the per-tick reconnect
-        accounting: this runs once at startup, so it surfaces directly for
-        the caller to wrap.
+        Reads the metagraph through the submitter's long-lived connection so
+        startup and per-tick refreshes use exactly one websocket. Unlike a
+        submit or head read, a failure here is not part of the reconnect
+        accounting: callers keep their last-good lookup and the following
+        head read or submit still drives socket health.
 
         Raises:
             WeightSubmissionError: No connection is available, or the
@@ -489,3 +487,20 @@ class RealChainCursor:
             LOGGER.warning("chain head read failed: %s — skipping this tick", exc)
             return None
         return block // self._blocks_per_epoch
+
+
+class RealMetagraphSource:
+    """Reads subnet hotkeys through the submitter's long-lived socket.
+
+    The source is intentionally a tiny wrapper around ``RealSubmitter`` so
+    validator ticks can refresh hotkey -> uid state without opening a second
+    subtensor connection.
+    """
+
+    def __init__(self, submitter: RealSubmitter, netuid: int) -> None:
+        self._submitter = submitter
+        self._netuid = netuid
+
+    def hotkeys(self) -> dict[str, int]:
+        """Return the current hotkey ss58 -> uid mapping."""
+        return self._submitter.metagraph_hotkeys(self._netuid)
