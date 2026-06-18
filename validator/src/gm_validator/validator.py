@@ -57,6 +57,7 @@ from gm_validator.epoch_summary import (
 from gm_validator.metrics import record_weight_submission
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import (
+    MalformedArtifactError,
     StaleEpochSummaryError,
     StaleMetagraphError,
     aggregated_path,
@@ -235,6 +236,18 @@ class Validator:
                 "epoch %d deferred (stale epoch_summary): %s — next tick will retry",
                 epoch_id,
                 exc,
+            )
+            return None
+        except MalformedArtifactError:
+            # Permanent — a structurally invalid aggregated.jsonl row will not
+            # heal on the next tick. Surface it loudly with a traceback rather
+            # than let it masquerade as a transient defer, then leave the cursor
+            # unadvanced so a human investigates instead of silently zeroing a
+            # miner's earnings.
+            LOGGER.exception(
+                "epoch %d has a malformed aggregated.jsonl artifact — refusing "
+                "to score; this will not self-heal and needs investigation",
+                epoch_id,
             )
             return None
         except Exception:

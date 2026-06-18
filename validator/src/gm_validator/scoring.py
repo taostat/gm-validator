@@ -54,6 +54,17 @@ class StaleEpochSummaryError(Exception):
     """
 
 
+class MalformedArtifactError(Exception):
+    """An aggregated.jsonl row is structurally invalid — a permanent fault.
+
+    Raised when a required field is missing, null, or non-integer where an
+    integer is required. Distinct from the transient Stale* defers: a
+    malformed artifact will not fix itself on the next tick, so the caller
+    must surface it loudly rather than silently zero a miner earnings and
+    misroute incentive.
+    """
+
+
 @dataclass
 class MinerScore:
     """Per-miner score components aggregated from `aggregated.jsonl`."""
@@ -87,18 +98,71 @@ def load_aggregated(path: str) -> list[dict]:
     return rows
 
 
+def _miner_context(miner_id: object | None) -> str:
+    if miner_id is None:
+        return ""
+    return f" for miner_id={miner_id!r}"
+
+
+def _coerce_int(value: object, key: str, miner_id: object | None) -> int:
+    # bool is an int subclass; the not-bool guard keeps a JSON true/false from
+    # coercing to 1/0 money before the isinstance(int) accept.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 10)
+        except ValueError:
+            pass
+    raise MalformedArtifactError(
+        f"aggregated.jsonl row{_miner_context(miner_id)} field {key!r} "
+        f"must be an integer; got {value!r}"
+    )
+
+
+def _require_int(row: dict, key: str, miner_id: object | None) -> int:
+    if key not in row:
+        raise MalformedArtifactError(
+            f"aggregated.jsonl row{_miner_context(miner_id)} missing required field {key!r}"
+        )
+    return _coerce_int(row[key], key, miner_id)
+
+
+def _optional_int(
+    row: dict,
+    key: str,
+    miner_id: object | None,
+    default: int = 0,
+) -> int:
+    if key not in row:
+        return default
+    return _coerce_int(row[key], key, miner_id)
+
+
 def score(rows: Iterable[dict]) -> dict[str, MinerScore]:
     """Aggregate `aggregated.jsonl` rows into per-miner scores."""
     scores: dict[str, MinerScore] = {}
     for row in rows:
+        if "miner_id" not in row:
+            raise MalformedArtifactError("aggregated.jsonl row missing required field 'miner_id'")
         miner_id = row["miner_id"]
+        # Must be a non-empty hotkey string: a numeric or empty miner_id would
+        # never match the hotkey->uid lookup, so it would silently miss payout.
+        if not isinstance(miner_id, str) or not miner_id:
+            raise MalformedArtifactError(
+                f"aggregated.jsonl row field 'miner_id' must be a non-empty string; "
+                f"got {miner_id!r}"
+            )
+        earn = _require_int(row, "earnings_ndollars", miner_id)
+        surch = _require_int(row, "surcharge_ndollars", miner_id)
+        successful = _optional_int(row, "successful_requests", miner_id)
+        failed = _optional_int(row, "failed_requests", miner_id)
+
         bucket = scores.setdefault(miner_id, MinerScore(miner_id=miner_id))
-        earn = int(row.get("earnings_ndollars", "0") or 0)
-        surch = int(row.get("surcharge_ndollars", "0") or 0)
         bucket.earnings_ndollars += earn
         bucket.surcharge_ndollars += surch
-        bucket.successful_requests += int(row.get("successful_requests", 0))
-        bucket.failed_requests += int(row.get("failed_requests", 0))
+        bucket.successful_requests += successful
+        bucket.failed_requests += failed
         product = row.get("product") or {}
         provider = product.get("provider", "")
         model = product.get("model", "")
