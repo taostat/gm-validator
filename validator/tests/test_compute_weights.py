@@ -211,7 +211,8 @@ def test_oversubscribed_unknown_miner_not_redistributed_to_known() -> None:
     )
     weights_by_uid = dict(zip(vector.uids, vector.weights, strict=True))
     assert sum(vector.weights) == MAX_WEIGHT
-    assert "UNKNOWN" not in {str(u) for u in vector.uids}
+    # UNKNOWN is dropped from the submitted vector: only A's uid and burn remain.
+    assert set(vector.uids) == {1, 99}
     assert vector.epoch_result.total_consumed_usd == Decimal("7")
 
     # A gets floor(3/7) of total demand, not its full unscaled 3/5.125

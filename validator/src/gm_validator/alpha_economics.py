@@ -161,10 +161,11 @@ def normalize_weights(
     if total <= 0:
         return [(burn_uid, MAX_WEIGHT)]
 
-    if renorm_total is None:
-        renorm = total if total > Decimal(1) else Decimal(1)
-    else:
-        renorm = max(renorm_total, Decimal(1))
+    # Renorm over the full demand total when supplied so demand from miners
+    # dropped from the submitted vector still suppresses the submitted shares;
+    # absent that, the submitted total is the whole demand.
+    demand_total = total if renorm_total is None else renorm_total
+    renorm = max(demand_total, Decimal(1))
 
     # Floor: every strictly-positive share earns at least one unit so a miner
     # below 1/MAX_WEIGHT keeps its emission instead of truncating to burn. The
