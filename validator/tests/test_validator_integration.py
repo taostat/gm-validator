@@ -803,3 +803,52 @@ def test_propagates_malformed_epoch_summary(tmp_path: pathlib.Path) -> None:
         mirror_dir = mirror.mirror_epoch(22)
         with pytest.raises(ValidationError):
             load_epoch_summary(epoch_summary_path(mirror_dir))
+
+
+def test_validator_defers_malformed_aggregated_row(tmp_path: pathlib.Path) -> None:
+    """A money-field drift in aggregated.jsonl must not submit weights.
+
+    A row missing earnings_ndollars is a permanent fault: score() raises
+    MalformedArtifactError, process_once() catches it, and no weights are
+    submitted. Without the fail-fast the missing field would silently zero
+    the miner's earnings and misroute incentive.
+    """
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+
+        miner_a = "5Ehm" + "A" * 44
+        records = [_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)]
+        _populate_epoch(s3, epoch_id=44, records=records, emissions_alpha="0.0001")
+
+        finalized_prefix = f"{PREFIX}/finalized/epoch=44/"
+        bad_row = {
+            "epoch_id": 44,
+            "miner_id": miner_a,
+            "product": {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+            "totals": {"input_tokens": 100, "output_tokens": 200},
+            "surcharge_ndollars": "0",
+            "successful_requests": 1,
+            "failed_requests": 0,
+            "raw_record_count": 1,
+            "raw_hash": _PLACEHOLDER_RAW_HASH,
+        }
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=f"{finalized_prefix}aggregated.jsonl",
+            Body=(json.dumps(bad_row, separators=(",", ":")) + "\n").encode("utf-8"),
+        )
+
+        config = _config(tmp_path)
+        mirror = S3Mirror(s3, BUCKET, PREFIX, str(tmp_path))
+        submitter = MockSubmitter()
+        validator = Validator(
+            config, mirror, submitter, _cursor_targeting(44), miner_uid_lookup={miner_a: 0}
+        )
+
+        outcomes = validator.process_once()
+        assert outcomes == []
+        assert submitter.calls == []
+        # Cursor unadvanced — a malformed artifact is not silently marked
+        # processed.
+        assert validator._last_submitted_open_epoch is None
