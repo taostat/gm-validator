@@ -219,6 +219,21 @@ def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
     )
 
 
+class _SequenceMetagraphSource:
+    """Metagraph source test double that returns or raises in sequence."""
+
+    def __init__(self, results: list[dict[str, int] | Exception]) -> None:
+        self._results = list(results)
+        self.calls = 0
+
+    def hotkeys(self) -> dict[str, int]:
+        self.calls += 1
+        result = self._results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
 def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
@@ -279,6 +294,114 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             "_FINALIZED",
         ):
             assert os.path.exists(os.path.join(epoch_dir, name)), f"missing: {name}"
+
+
+def test_validator_refreshes_miner_uid_lookup_before_scoring(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A miner registered after startup is picked up before scoring the tick."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        miner_a = "5Ehm" + "A" * 44
+        _populate_epoch(
+            s3,
+            epoch_id=7,
+            records=[_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)],
+            emissions_alpha="0.0001",
+        )
+
+        submitter = MockSubmitter()
+        metagraph_source = _SequenceMetagraphSource([{miner_a: 0}])
+        validator = Validator(
+            _config(tmp_path),
+            S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
+            submitter,
+            _cursor_targeting(7),
+            miner_uid_lookup={},
+            metagraph_source=metagraph_source,
+        )
+
+        outcomes = validator.process_once()
+
+        assert [o.epoch_id for o in outcomes] == [7]
+        assert [c["epoch_id"] for c in submitter.calls] == [7]
+        assert metagraph_source.calls == 1
+
+
+def test_validator_self_heals_post_startup_registration_across_ticks(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The StaleMetagraphError self-heal fires from an automatic refresh.
+
+    Tick 1 sees an empty lookup (the miner registered after startup),
+    raises StaleMetagraphError, and defers without advancing the guards.
+    Tick 2's automatic metagraph refresh picks the miner up, so the same
+    epoch is scored and submitted — no process restart required.
+    """
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        miner_a = "5Ehm" + "A" * 44
+        _populate_epoch(
+            s3,
+            epoch_id=7,
+            records=[_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)],
+            emissions_alpha="0.0001",
+        )
+
+        submitter = MockSubmitter()
+        metagraph_source = _SequenceMetagraphSource([{}, {miner_a: 0}])
+        validator = Validator(
+            _config(tmp_path),
+            S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
+            submitter,
+            _cursor_targeting(7),
+            metagraph_source=metagraph_source,
+        )
+
+        assert validator.process_once() == []
+        assert submitter.calls == []
+        assert validator._last_submitted_open_epoch is None
+
+        outcomes = validator.process_once()
+
+        assert [o.epoch_id for o in outcomes] == [7]
+        assert [c["epoch_id"] for c in submitter.calls] == [7]
+        assert metagraph_source.calls == 2
+
+
+def test_validator_keeps_last_good_lookup_when_refresh_fails(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A transient metagraph read failure must not zero the uid lookup."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        miner_a = "5Ehm" + "A" * 44
+        _populate_epoch(
+            s3,
+            epoch_id=7,
+            records=[_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)],
+            emissions_alpha="0.0001",
+        )
+
+        submitter = MockSubmitter()
+        metagraph_source = _SequenceMetagraphSource([ConnectionError("metagraph unavailable")])
+        validator = Validator(
+            _config(tmp_path),
+            S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
+            submitter,
+            _cursor_targeting(7),
+            miner_uid_lookup={miner_a: 0},
+            metagraph_source=metagraph_source,
+        )
+
+        outcomes = validator.process_once()
+
+        assert [o.epoch_id for o in outcomes] == [7]
+        assert [c["epoch_id"] for c in submitter.calls] == [7]
+        assert metagraph_source.calls == 1
 
 
 def test_successful_submit_advances_staleness_gauges(tmp_path: pathlib.Path) -> None:

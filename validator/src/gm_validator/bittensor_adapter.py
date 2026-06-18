@@ -48,6 +48,20 @@ class ChainCursor(Protocol):
         ...
 
 
+class MetagraphSource(Protocol):
+    """Reads the subnet metagraph hotkey mapping for miner uid resolution.
+
+    The validator refreshes this lookup each tick before scoring so miners
+    that registered after startup can receive weights without a process
+    restart. Real implementations should reuse the submitter's existing
+    subtensor connection rather than opening a second socket.
+    """
+
+    def hotkeys(self) -> dict[str, int]:
+        """Return the current hotkey ss58 -> uid mapping."""
+        ...
+
+
 @dataclass
 class MockChainCursor:
     """In-memory chain cursor for tests and the mock-submitter build.

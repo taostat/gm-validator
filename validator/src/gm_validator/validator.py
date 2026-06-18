@@ -2,19 +2,21 @@
 
 Loop (one ``process_once`` tick):
 
-1. Read the chain head block and derive the open epoch
+1. Refresh the metagraph hotkey -> uid lookup when a metagraph source is
+   configured, keeping the last-good lookup on transient read failures.
+2. Read the chain head block and derive the open epoch
    ``E = head_block // blocks_per_epoch`` — the same derivation the
    epoch-finalizer uses. The chain head IS the discovery cursor.
-2. Target the newest *closed* epoch ``E-1``. If its ``_FINALIZED`` marker
+3. Target the newest *closed* epoch ``E-1``. If its ``_FINALIZED`` marker
    is absent (the finalizer is lagging), walk back a small bounded
    window to find the newest finalized epoch. Each probe is a single
    targeted ``head_object`` — never a list+scan of the epoch history.
    If none in the window is finalized yet, do nothing this tick.
-3. Epoch-window guard: skip if the target is ``<= _last_submitted_epoch``
+4. Epoch-window guard: skip if the target is ``<= _last_submitted_epoch``
    (already handled this epoch). Submitting at most once per epoch
    respects the chain's ~100-block weight-set rate limit, which is well
    inside one epoch.
-4. Mirror the target's artifacts, score, and submit:
+5. Mirror the target's artifacts, score, and submit:
    a. Mirror artifacts locally (`aggregated.jsonl`,
       `epoch_summary.json`, `_FINALIZED`).
    b. Compute per-miner scores from `aggregated.jsonl`.
@@ -23,7 +25,7 @@ Loop (one ``process_once`` tick):
       uid as burn weight.
    d. Submit via the configured `Submitter`.
    e. On success, advance ``_last_submitted_epoch`` to the target.
-5. Prune local mirrors older than the retention window.
+6. Prune local mirrors older than the retention window.
 
 On-chain weights are a current snapshot, not a per-epoch ledger: only
 the latest finalized epoch is ever scored, and older un-targeted epochs
@@ -45,7 +47,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from gm_validator.bittensor_adapter import ChainCursor, Submitter
+from gm_validator.bittensor_adapter import ChainCursor, MetagraphSource, Submitter
 from gm_validator.config import ValidatorConfig
 from gm_validator.epoch_summary import (
     EPOCH_SUMMARY_FILENAME,
@@ -77,7 +79,11 @@ class EpochOutcome:
 
 
 class Validator:
-    """Top-level validator service."""
+    """Top-level validator service.
+
+    When a ``MetagraphSource`` is configured, each tick refreshes the
+    hotkey -> uid lookup before selecting and scoring an epoch.
+    """
 
     def __init__(
         self,
@@ -86,12 +92,14 @@ class Validator:
         submitter: Submitter,
         cursor: ChainCursor,
         miner_uid_lookup: dict[str, int] | None = None,
+        metagraph_source: MetagraphSource | None = None,
     ) -> None:
         self._config = config
         self._mirror = mirror
         self._submitter = submitter
         self._cursor = cursor
         self._miner_uid_lookup = miner_uid_lookup or {}
+        self._metagraph_source = metagraph_source
         # Two complementary guards on the submit, both recomputed from the
         # chain each tick. They are deliberately in-memory only: the
         # chain-cursor design drops the persisted processed.json, so a
@@ -122,13 +130,15 @@ class Validator:
     def process_once(self) -> list[EpochOutcome]:
         """One tick: target the newest finalized epoch and submit its weights.
 
-        The chain head block is the discovery cursor — there is no S3
-        scan. Targets the newest closed epoch ``E-1``, walking back a
-        bounded window if the finalizer lags, then submits at most once
-        per open chain epoch (the ``_last_submitted_open_epoch`` guard).
-        Returns the processed epoch's outcome, or an empty list when
-        nothing was ready or this open epoch was already handled.
+        Refreshes the metagraph lookup when configured, then uses the
+        chain head block as the discovery cursor — there is no S3 scan.
+        Targets the newest closed epoch ``E-1``, walking back a bounded
+        window if the finalizer lags, then submits at most once per open
+        chain epoch (the ``_last_submitted_open_epoch`` guard). Returns
+        the processed epoch's outcome, or an empty list when nothing was
+        ready or this open epoch was already handled.
         """
+        self._refresh_miner_uid_lookup()
         outcomes: list[EpochOutcome] = []
         selection = self._select_target_epoch()
         if selection is not None:
@@ -138,6 +148,18 @@ class Validator:
                 outcomes.append(outcome)
         self._mirror.prune(self._config.mirror_retention_epochs)
         return outcomes
+
+    def _refresh_miner_uid_lookup(self) -> None:
+        """Refresh the miner hotkey -> uid lookup from the metagraph source."""
+        if self._metagraph_source is None:
+            return
+        try:
+            lookup = self._metagraph_source.hotkeys()
+        except Exception as exc:  # noqa: BLE001 — last-good keeps a transient read from zeroing all weights.
+            LOGGER.warning("metagraph refresh failed: %s; keeping last-good miner uid lookup", exc)
+            return
+        self._miner_uid_lookup = lookup
+        LOGGER.info("metagraph refresh: loaded %d hotkey->uid entries", len(lookup))
 
     def _select_target_epoch(self) -> tuple[int, int] | None:
         """Resolve ``(open_epoch, target)`` to score this tick, or None.

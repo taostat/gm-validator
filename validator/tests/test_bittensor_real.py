@@ -27,6 +27,7 @@ import pytest
 from gm_validator.bittensor_real import (
     HotkeyConfigError,
     RealChainCursor,
+    RealMetagraphSource,
     RealSubmitter,
     WeightSubmissionError,
     _keypair_from_seed,
@@ -259,6 +260,19 @@ def test_metagraph_hotkeys_wraps_chain_error(monkeypatch: pytest.MonkeyPatch) ->
     submitter = RealSubmitter(netuid=1, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
     with pytest.raises(WeightSubmissionError, match="subtensor unreachable"):
         submitter.metagraph_hotkeys(1)
+
+
+def test_real_metagraph_source_delegates_to_submitter_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.hotkeys = ["5HotkeyA", "5HotkeyB"]
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+
+    source = RealMetagraphSource(submitter, 42)
+
+    assert source.hotkeys() == {"5HotkeyA": 0, "5HotkeyB": 1}
+    assert subtensor.requested_metagraph_netuid == 42
 
 
 # --- submission ----------------------------------------------------------

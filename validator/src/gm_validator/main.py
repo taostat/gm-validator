@@ -12,7 +12,13 @@ import botocore
 from botocore.config import Config
 from prometheus_client import start_http_server
 
-from gm_validator.bittensor_adapter import ChainCursor, MockChainCursor, MockSubmitter, Submitter
+from gm_validator.bittensor_adapter import (
+    ChainCursor,
+    MetagraphSource,
+    MockChainCursor,
+    MockSubmitter,
+    Submitter,
+)
 from gm_validator.config import ValidatorConfig
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.validator import Validator
@@ -108,6 +114,22 @@ def _build_miner_uid_lookup(config: ValidatorConfig, submitter: Submitter) -> di
     return lookup
 
 
+def _build_metagraph_source(
+    config: ValidatorConfig, submitter: Submitter
+) -> MetagraphSource | None:
+    """Build the per-tick metagraph source when running against real subtensor.
+
+    Real mode wraps the ``RealSubmitter``'s already-open socket so lookup
+    refreshes do not dial a second connection. Mock mode keeps the injected
+    static lookup and skips per-tick metagraph reads.
+    """
+    from gm_validator.bittensor_real import RealMetagraphSource, RealSubmitter
+
+    if not isinstance(submitter, RealSubmitter):
+        return None
+    return RealMetagraphSource(submitter, config.bittensor_netuid)
+
+
 def _build_s3_client(config: ValidatorConfig) -> Any:
     """Build the boto3 S3 client.
 
@@ -157,8 +179,16 @@ def _run(config: ValidatorConfig) -> None:
     submitter = _build_submitter(config)
     cursor = _build_cursor(config, submitter)
     miner_uid_lookup = _build_miner_uid_lookup(config, submitter)
+    metagraph_source = _build_metagraph_source(config, submitter)
 
-    validator = Validator(config, mirror, submitter, cursor, miner_uid_lookup=miner_uid_lookup)
+    validator = Validator(
+        config,
+        mirror,
+        submitter,
+        cursor,
+        miner_uid_lookup=miner_uid_lookup,
+        metagraph_source=metagraph_source,
+    )
 
     stop = False
 
