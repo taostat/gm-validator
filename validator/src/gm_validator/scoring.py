@@ -98,13 +98,7 @@ def load_aggregated(path: str) -> list[dict]:
     return rows
 
 
-def _miner_context(miner_id: object | None) -> str:
-    if miner_id is None:
-        return ""
-    return f" for miner_id={miner_id!r}"
-
-
-def _coerce_int(value: object, key: str, miner_id: object | None) -> int:
+def _coerce_int(value: object, key: str, miner_id: str) -> int:
     # bool is an int subclass; the not-bool guard keeps a JSON true/false from
     # coercing to 1/0 money before the isinstance(int) accept.
     if isinstance(value, int) and not isinstance(value, bool):
@@ -115,27 +109,22 @@ def _coerce_int(value: object, key: str, miner_id: object | None) -> int:
         except ValueError:
             pass
     raise MalformedArtifactError(
-        f"aggregated.jsonl row{_miner_context(miner_id)} field {key!r} "
+        f"aggregated.jsonl row for miner_id={miner_id!r} field {key!r} "
         f"must be an integer; got {value!r}"
     )
 
 
-def _require_int(row: dict, key: str, miner_id: object | None) -> int:
+def _require_int(row: dict, key: str, miner_id: str) -> int:
     if key not in row:
         raise MalformedArtifactError(
-            f"aggregated.jsonl row{_miner_context(miner_id)} missing required field {key!r}"
+            f"aggregated.jsonl row for miner_id={miner_id!r} missing required field {key!r}"
         )
     return _coerce_int(row[key], key, miner_id)
 
 
-def _optional_int(
-    row: dict,
-    key: str,
-    miner_id: object | None,
-    default: int = 0,
-) -> int:
+def _optional_int(row: dict, key: str, miner_id: str) -> int:
     if key not in row:
-        return default
+        return 0
     return _coerce_int(row[key], key, miner_id)
 
 
