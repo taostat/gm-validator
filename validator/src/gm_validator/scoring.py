@@ -228,6 +228,7 @@ def compute_weights(
         alpha_price_usd=epoch_summary.alpha_price_usd,
         emissions_alpha=epoch_summary.emissions_alpha,
     )
+    full_demand_total = sum((miner_weight.weight for miner_weight in result.miners), Decimal(0))
 
     miner_pairs: list[tuple[int, Decimal]] = []
     for miner_weight, uid in zip(result.miners, uids_by_index, strict=True):
@@ -235,7 +236,11 @@ def compute_weights(
             continue
         miner_pairs.append((uid, miner_weight.weight))
 
-    u16 = normalize_weights(miner_pairs, burn_uid=subnet_owner_uid)
+    u16 = normalize_weights(
+        miner_pairs,
+        burn_uid=subnet_owner_uid,
+        renorm_total=full_demand_total,
+    )
     uids = [uid for uid, _ in u16]
     weights = [w for _, w in u16]
     return WeightVector(

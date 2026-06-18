@@ -146,15 +146,15 @@ def test_all_miners_missing_uid_raises_stale_metagraph() -> None:
 
 
 def test_partial_missing_uid_still_counted_against_pool() -> None:
-    """Unknown miners' demand still suppresses known miners' share.
+    """Unknown miners' demand suppresses known miners' submitted share.
 
     2 known miners ($5, $3) + 1 unknown ($2). Total demand = $10 against
-    a $5.125 pool (50 alpha × 0.41 × $0.25). Per-miner weight =
-    consumed / pool_usd, then normalize_weights renorms because the sum
-    > 1. The unknown's $2 is dropped from the submitted vector but its
-    weight contribution still inflates the renorm denominator, so A and
-    B's u16 weights are smaller than they would be if UNKNOWN were
-    ignored upstream.
+    a $5.125 pool (50 alpha × 0.41 × $0.25), so demand over-subscribes the
+    pool. Per-miner weight = consumed / pool_usd; the renorm denominator is
+    the full demand sum (10 / 5.125), unknown included. A and B therefore
+    receive exactly their share of total demand — A = 5/10, B = 3/10 of
+    MAX_WEIGHT — and the unknown's 2/10 is left in the burn slot rather than
+    redistributed to the known miners.
     """
     rows = [
         _row("A", 5_000_000_000),  # $5
@@ -178,10 +178,49 @@ def test_partial_missing_uid_still_counted_against_pool() -> None:
     # math.
     assert vector.epoch_result.total_consumed_usd == Decimal("10")
 
-    # A:B u16 ratio matches their consumed ratio (5:3) to within
-    # floor-rounding dust.
+    # Known miners get exactly their floored share of total demand:
+    # A = floor(5/10 * MAX_WEIGHT), B = floor(3/10 * MAX_WEIGHT). The
+    # unknown's 2/10 stays in the burn slot rather than inflating A and B.
     weights_by_uid = dict(zip(vector.uids, vector.weights, strict=True))
-    assert abs((weights_by_uid[1] / max(weights_by_uid[2], 1)) - (5 / 3)) < 0.01
+    assert weights_by_uid[1] == int(MAX_WEIGHT * Decimal(5) / Decimal(10))
+    assert weights_by_uid[2] == int(MAX_WEIGHT * Decimal(3) / Decimal(10))
+    assert weights_by_uid[99] == MAX_WEIGHT - weights_by_uid[1] - weights_by_uid[2]
+
+
+def test_oversubscribed_unknown_miner_not_redistributed_to_known() -> None:
+    """An unknown miner's share is not handed to the remaining known miners.
+
+    A ($3) is known; UNKNOWN ($4) is absent from the lookup. Total demand
+    $7 over-subscribes the $5.125 pool. A's true share is its slice of total
+    demand, 3/7 of MAX_WEIGHT. The buggy normalization renormed only over the
+    submitted miners: with A's solo weight 3/5.125 < 1 the renorm denominator
+    collapsed to 1, paying A 3/5.125 ≈ 0.585 of MAX_WEIGHT — its full
+    unscaled pool share — and silently transferring UNKNOWN's emission to A.
+    """
+    rows = [
+        _row("A", 3_000_000_000),  # $3, known
+        _row("UNKNOWN", 4_000_000_000),  # $4, absent from lookup
+    ]
+    scores = score(rows)
+    vector = compute_weights(
+        scores,
+        miner_uid_lookup={"A": 1},  # UNKNOWN absent
+        # pool = 50 * 0.41 * 0.25 = $5.125
+        epoch_summary=_summary("0.25", emissions_alpha="50"),
+        subnet_owner_uid=99,
+    )
+    weights_by_uid = dict(zip(vector.uids, vector.weights, strict=True))
+    assert sum(vector.weights) == MAX_WEIGHT
+    # UNKNOWN is dropped from the submitted vector: only A's uid and burn remain.
+    assert set(vector.uids) == {1, 99}
+    assert vector.epoch_result.total_consumed_usd == Decimal("7")
+
+    # A gets floor(3/7) of total demand, not its full unscaled 3/5.125
+    # pool share (which the buggy code paid: floor(3/5.125 * MAX_WEIGHT)).
+    assert weights_by_uid[1] == int(MAX_WEIGHT * Decimal(3) / Decimal(7))
+    assert weights_by_uid[1] < int(MAX_WEIGHT * Decimal(3) / Decimal("5.125"))
+    # The remaining 4/7 (UNKNOWN's share) lands in burn, not on A.
+    assert weights_by_uid[99] == MAX_WEIGHT - weights_by_uid[1]
 
 
 def test_multiplier_one_is_exact_no_op() -> None:
