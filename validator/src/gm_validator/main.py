@@ -215,7 +215,14 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     config = ValidatorConfig.from_env()
-    start_http_server(config.metrics_port)
+    if config.metrics_bind is not None:
+        host, port = config.metrics_bind
+        start_http_server(port, addr=host)
+        logging.getLogger(__name__).info("metrics server listening on %s:%d", host, port)
+    else:
+        logging.getLogger(__name__).info(
+            "GM_VALIDATOR_METRICS_BIND unset: no metrics server started"
+        )
     _run(config)
 
 

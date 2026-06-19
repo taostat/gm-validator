@@ -65,7 +65,7 @@ uv run python -m gm_validator.main
 | `SUBTENSOR_RPC_TIMEOUT_SECS` | `30` | Per-RPC timeout for chain-head reads, metagraph reads, and `set_weights` over the long-lived socket |
 | `SUBNET_OWNER_UID` | required | Uid that absorbs the burn slot + floor-rounding dust. Static knob until a follow-up resolves it from `SubnetOwnerHotkey`. |
 | `POLL_INTERVAL_SECS` | `60` | Seconds between `process_once` ticks |
-| `METRICS_PORT` | `9092` | Prometheus metrics HTTP port |
+| `GM_VALIDATOR_METRICS_BIND` | unset | `host:port` (or bare `port`, host defaults `0.0.0.0`) for the Prometheus metrics server. Unset means no metrics endpoint is opened — default-off so a third-party operator never exposes an unexpected listening socket. |
 | `GM_WEIGHT_EARNINGS_MULTIPLIER` | `1` | **TESTNET-ONLY** demo knob. Scales each miner's aggregated earnings in memory before the alpha/weight conversion so tiny test earnings cross the `1/65535` weight floor and light up on-chain. **MUST stay `1` (unset) on mainnet** — any other value distorts real payouts. |
 
 The pool denominator's `emissions_alpha` is read from `epoch_summary.json` (chain-truth, written by the gm finalizer); see `validator/src/gm_validator/epoch_summary.py`.
