@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import pathlib
 from decimal import Decimal
@@ -234,7 +235,9 @@ class _SequenceMetagraphSource:
         return result
 
 
-def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
+def test_validator_processes_epoch_end_to_end(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -263,12 +266,17 @@ def test_validator_processes_epoch_end_to_end(tmp_path: pathlib.Path) -> None:
             miner_uid_lookup={miner_a: 0, miner_b: 1},
         )
 
-        outcomes = validator.process_once()
+        with caplog.at_level(logging.INFO, logger="gm_validator.validator"):
+            outcomes = validator.process_once()
 
         assert len(outcomes) == 1
         outcome = outcomes[0]
         assert outcome.epoch_id == 7
         assert outcome.weights_submitted
+
+        # The per-epoch lines are observable in prod logs.
+        assert "processing epoch 7: 2 miners with usage" in caplog.text
+        assert "epoch 7 weight vector: [(" in caplog.text
 
         # Verify the submission shape.
         assert len(submitter.calls) == 1
@@ -591,7 +599,9 @@ def test_validator_defers_epoch_on_submit_failure(tmp_path: pathlib.Path) -> Non
     assert metrics.SUBMIT_FAILURES._value.get() == failures_before + 2
 
 
-def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) -> None:
+def test_validator_zero_revenue_epoch_burns_full_pool(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """Zero billing => burn_uid gets the entire MAX_WEIGHT."""
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
@@ -618,7 +628,8 @@ def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) ->
             miner_uid_lookup={miner_a: 0, miner_b: 1},
         )
 
-        outcomes = validator.process_once()
+        with caplog.at_level(logging.INFO, logger="gm_validator.validator"):
+            outcomes = validator.process_once()
         assert len(outcomes) == 1
         assert outcomes[0].weights_submitted
 
@@ -626,6 +637,10 @@ def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) ->
         call = submitter.calls[0]
         assert call["uids"] == [99]
         assert call["weights"] == [MAX_WEIGHT]
+
+        # The all-burn weight vector is logged so a 100%-burn epoch is
+        # observable in prod.
+        assert f"all-burn [(99,{MAX_WEIGHT})]" in caplog.text
 
         # The epoch-window guard blocks a second submit within the same epoch.
         again = validator.process_once()
