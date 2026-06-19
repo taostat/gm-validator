@@ -54,7 +54,4 @@ WORKDIR /app/validator
 
 USER 1000
 
-# Prometheus metrics (prometheus_client.start_http_server).
-EXPOSE 9092
-
 ENTRYPOINT ["python", "-m", "gm_validator.main"]

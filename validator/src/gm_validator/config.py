@@ -28,6 +28,36 @@ def _decimal_env(name: str, default: str) -> Decimal:
     return Decimal(value)
 
 
+def _metrics_bind_env(name: str) -> tuple[str, int] | None:
+    """Parse a ``host:port`` (or bare ``port``) metrics-bind spec.
+
+    Returns ``None`` when the variable is unset or blank so the caller opens
+    no metrics server at all. A bare port binds ``0.0.0.0``.
+
+    Raises:
+        ValueError: The value is set but is not a port or ``host:port``.
+    """
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    value = value.strip()
+    host, sep, port = value.rpartition(":")
+    # A bare port or empty host binds all interfaces — the operator opted in by
+    # setting the env var at all, matching prometheus start_http_server's own
+    # 0.0.0.0 default; PR-2 still gates the whole server behind that opt-in.
+    if not sep:
+        host, port = "0.0.0.0", value  # noqa: S104
+    if not host:
+        host = "0.0.0.0"  # noqa: S104
+    try:
+        port_num = int(port)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a port or host:port; got {value!r}") from exc
+    if not 1 <= port_num <= 65535:
+        raise ValueError(f"{name} port must be in 1..65535; got {port_num}")
+    return host, port_num
+
+
 @dataclass
 class ValidatorConfig:
     """All knobs the validator service needs at runtime."""
@@ -88,8 +118,12 @@ class ValidatorConfig:
     # Polling / timing.
     poll_interval_secs: int
 
-    # Observability.
-    metrics_port: int
+    # Observability. The Prometheus metrics server binds here only when
+    # GM_VALIDATOR_METRICS_BIND is set; unset means no metrics endpoint is
+    # opened — default-off so a third-party validator operator never exposes
+    # an unexpected listening socket. Env value is "host:port" or a bare
+    # "port" (host defaults to 0.0.0.0).
+    metrics_bind: tuple[str, int] | None
 
     # Uid that absorbs the burn slot + floor-rounding dust. bm reads the
     # subnet-owner hotkey from the chain and resolves to a uid; the gm
@@ -129,7 +163,7 @@ class ValidatorConfig:
             subtensor_connect_timeout_secs=_int_env("SUBTENSOR_CONNECT_TIMEOUT_SECS", 30),
             subtensor_rpc_timeout_secs=_int_env("SUBTENSOR_RPC_TIMEOUT_SECS", 30),
             poll_interval_secs=_int_env("POLL_INTERVAL_SECS", 60),
-            metrics_port=_int_env("METRICS_PORT", 9092),
+            metrics_bind=_metrics_bind_env("GM_VALIDATOR_METRICS_BIND"),
             subnet_owner_uid=int(_require_env("SUBNET_OWNER_UID")),
             weight_earnings_multiplier=_decimal_env("GM_WEIGHT_EARNINGS_MULTIPLIER", "1"),
         )

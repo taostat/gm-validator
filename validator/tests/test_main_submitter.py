@@ -38,7 +38,7 @@ def _config(*, mock: bool, seed: str | None) -> ValidatorConfig:
         subtensor_connect_timeout_secs=30,
         subtensor_rpc_timeout_secs=30,
         poll_interval_secs=1,
-        metrics_port=9092,
+        metrics_bind=None,
         subnet_owner_uid=99,
         weight_earnings_multiplier=Decimal(1),
     )
