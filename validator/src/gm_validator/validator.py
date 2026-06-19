@@ -54,7 +54,7 @@ from gm_validator.epoch_summary import (
     epoch_summary_path,
     load_epoch_summary,
 )
-from gm_validator.metrics import record_weight_submission
+from gm_validator.metrics import record_submit_failure, record_weight_submission
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.scoring import (
     MalformedArtifactError,
@@ -77,6 +77,14 @@ class EpochOutcome:
     weights_submitted: bool
     miner_count: int
     total_ndollars: int
+
+
+@dataclass
+class _UidRefresh:
+    """Outcome of one metagraph hotkey -> uid refresh, for the tick log."""
+
+    entries: int
+    status: str
 
 
 class Validator:
@@ -139,7 +147,7 @@ class Validator:
         the processed epoch's outcome, or an empty list when nothing was
         ready or this open epoch was already handled.
         """
-        self._refresh_miner_uid_lookup()
+        refresh = self._refresh_miner_uid_lookup()
         outcomes: list[EpochOutcome] = []
         selection = self._select_target_epoch()
         if selection is not None:
@@ -148,19 +156,48 @@ class Validator:
             if outcome is not None:
                 outcomes.append(outcome)
         self._mirror.prune(self._config.mirror_retention_epochs)
+        self._log_tick_summary(selection, outcomes, refresh)
         return outcomes
 
-    def _refresh_miner_uid_lookup(self) -> None:
-        """Refresh the miner hotkey -> uid lookup from the metagraph source."""
+    def _log_tick_summary(
+        self,
+        selection: tuple[int, int] | None,
+        outcomes: list[EpochOutcome],
+        refresh: _UidRefresh,
+    ) -> None:
+        """Emit one INFO line per tick so the loop is observable in logs."""
+        target = selection[1] if selection is not None else None
+        if outcomes:
+            outcome = outcomes[0]
+            disposition = "submitted" if outcome.weights_submitted else "scored-no-submit"
+            miners = outcome.miner_count
+        else:
+            disposition = "deferred" if selection is not None else "idle"
+            miners = 0
+        LOGGER.info(
+            "tick: target_epoch=%s miners=%d weights=%s uid_lookup=%d (%s)",
+            target if target is not None else "none",
+            miners,
+            disposition,
+            refresh.entries,
+            refresh.status,
+        )
+
+    def _refresh_miner_uid_lookup(self) -> _UidRefresh:
+        """Refresh the miner hotkey -> uid lookup from the metagraph source.
+
+        Returns the post-refresh entry count and a status word
+        (``refreshed`` / ``failed`` / ``static``) for the per-tick log.
+        """
         if self._metagraph_source is None:
-            return
+            return _UidRefresh(entries=len(self._miner_uid_lookup), status="static")
         try:
             lookup = self._metagraph_source.hotkeys()
         except Exception as exc:  # noqa: BLE001 — last-good keeps a transient read from zeroing all weights.
             LOGGER.warning("metagraph refresh failed: %s; keeping last-good miner uid lookup", exc)
-            return
+            return _UidRefresh(entries=len(self._miner_uid_lookup), status="failed")
         self._miner_uid_lookup = lookup
-        LOGGER.info("metagraph refresh: loaded %d hotkey->uid entries", len(lookup))
+        return _UidRefresh(entries=len(lookup), status="refreshed")
 
     def _select_target_epoch(self) -> tuple[int, int] | None:
         """Resolve ``(open_epoch, target)`` to score this tick, or None.
@@ -280,12 +317,16 @@ class Validator:
             # method; _process_target_epoch defers the epoch (leaves the
             # cursor unadvanced) so the next tick retries with the same
             # idempotent weight vector.
-            self._submitter.submit(
-                netuid=self._config.bittensor_netuid,
-                uids=vector.uids,
-                weights=vector.weights,
-                epoch_id=epoch_id,
-            )
+            try:
+                self._submitter.submit(
+                    netuid=self._config.bittensor_netuid,
+                    uids=vector.uids,
+                    weights=vector.weights,
+                    epoch_id=epoch_id,
+                )
+            except Exception:
+                record_submit_failure()
+                raise
             submitted = True
             record_weight_submission(epoch_id)
             LOGGER.info(

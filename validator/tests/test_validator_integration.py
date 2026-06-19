@@ -556,6 +556,9 @@ def test_validator_defers_epoch_on_submit_failure(tmp_path: pathlib.Path) -> Non
     vector. Mirrors the bm validator: there is no already-submitted
     short-circuit, so an ``Already Imported`` pool duplicate (which
     carries no inclusion receipt) is retried like any rejection."""
+    from gm_validator import metrics
+
+    failures_before = metrics.SUBMIT_FAILURES._value.get()
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -583,6 +586,9 @@ def test_validator_defers_epoch_on_submit_failure(tmp_path: pathlib.Path) -> Non
         assert again == []
         assert validator._last_submitted_open_epoch is None
         assert len(submitter.calls) == 2
+
+    # Both failed submits bumped the submit-failure counter.
+    assert metrics.SUBMIT_FAILURES._value.get() == failures_before + 2
 
 
 def test_validator_zero_revenue_epoch_burns_full_pool(tmp_path: pathlib.Path) -> None:
