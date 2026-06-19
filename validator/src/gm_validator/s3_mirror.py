@@ -78,11 +78,6 @@ class S3Mirror:
             self._download(epoch_id, name, os.path.join(local_dir, name))
         return local_dir
 
-    def epoch_already_mirrored(self, epoch_id: int) -> bool:
-        """True iff every artifact is already on local disk."""
-        local_dir = self._epoch_dir(epoch_id)
-        return all(os.path.exists(os.path.join(local_dir, name)) for name in _ARTIFACTS)
-
     def invalidate_artifact(self, epoch_id: int, name: str) -> None:
         """Drop the cached copy of *name* so the next ``mirror_epoch`` refetches it.
 

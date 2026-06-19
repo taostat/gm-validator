@@ -49,10 +49,7 @@ class EpochWeightsResult:
     """Epoch-level summary plus the per-miner weight rows."""
 
     pool_usd_total: Decimal
-    pool_alpha_total: Decimal
     total_consumed_usd: Decimal
-    alpha_price_usd: Decimal
-    emissions_alpha: Decimal
     miners: list[MinerWeight] = field(default_factory=list)
 
 
@@ -106,10 +103,7 @@ def compute_epoch_weights(
 
     return EpochWeightsResult(
         pool_usd_total=pool_usd,
-        pool_alpha_total=pool_alpha,
         total_consumed_usd=total_consumed_usd,
-        alpha_price_usd=alpha_price_usd,
-        emissions_alpha=pool_alpha,
         miners=results,
     )
 
