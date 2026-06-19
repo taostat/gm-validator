@@ -209,11 +209,26 @@ def _run(config: ValidatorConfig) -> None:
         time.sleep(config.poll_interval_secs)
 
 
-def main() -> None:
+def _configure_logging() -> None:
+    """Install root handlers and pin the app logger to INFO.
+
+    ``logging.basicConfig`` is a no-op once any handler exists, and the
+    bittensor SDK installs its own at import time ("Enabling default
+    logging (Warning level)") — so relying on basicConfig alone would
+    leave the validator's INFO lines suppressed. Setting the
+    ``gm_validator`` logger level explicitly keeps the per-tick and
+    per-epoch lines visible regardless of what the SDK does to the root
+    logger.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    logging.getLogger("gm_validator").setLevel(logging.INFO)
+
+
+def main() -> None:
+    _configure_logging()
     config = ValidatorConfig.from_env()
     if config.metrics_bind is not None:
         host, port = config.metrics_bind

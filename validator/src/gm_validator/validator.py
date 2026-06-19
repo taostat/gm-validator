@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from gm_validator.alpha_economics import MAX_WEIGHT
 from gm_validator.bittensor_adapter import ChainCursor, MetagraphSource, Submitter
 from gm_validator.config import ValidatorConfig
 from gm_validator.epoch_summary import (
@@ -60,6 +61,7 @@ from gm_validator.scoring import (
     MalformedArtifactError,
     StaleEpochSummaryError,
     StaleMetagraphError,
+    WeightVector,
     aggregated_path,
     compute_weights,
     load_aggregated,
@@ -85,6 +87,20 @@ class _UidRefresh:
 
     entries: int
     status: str
+
+
+def _format_weight_vector(vector: WeightVector) -> str:
+    """Render a u16 weight vector as ``[(uid,w),…]`` for the per-epoch log.
+
+    Flags the all-burn shape — the whole vector on the subnet-owner
+    (burn) uid — so a 100%-burn epoch reads as ``all-burn [(99,65535)]``
+    rather than an undifferentiated pair list.
+    """
+    pairs = list(zip(vector.uids, vector.weights, strict=True))
+    body = "[" + ", ".join(f"({uid},{w})" for uid, w in pairs) + "]"
+    if pairs == [(vector.burn_uid, MAX_WEIGHT)]:
+        return f"all-burn {body}"
+    return body
 
 
 class Validator:
@@ -220,7 +236,10 @@ class Validator:
 
         last_open = self._last_submitted_open_epoch
         if last_open is not None and open_epoch <= last_open:
-            LOGGER.debug("open epoch %d already submitted this window, skipping", open_epoch)
+            LOGGER.info(
+                "open epoch %d already submitted this window — deferring until it advances",
+                open_epoch,
+            )
             return None
 
         target = self._mirror.latest_finalized_epoch(
@@ -236,8 +255,17 @@ class Validator:
 
         last_target = self._last_submitted_epoch
         if last_target is not None and target <= last_target:
-            LOGGER.debug("epoch %d already submitted, skipping (finalizer stalled)", target)
+            LOGGER.info(
+                "epoch %d already submitted — deferring (finalizer stalled at this epoch)",
+                target,
+            )
             return None
+        LOGGER.info(
+            "weight window: open_epoch=%d target_epoch=%d last_submitted=%s",
+            open_epoch,
+            target,
+            last_target if last_target is not None else "none",
+        )
         return open_epoch, target
 
     def _process_target_epoch(self, open_epoch: int, epoch_id: int) -> EpochOutcome | None:
@@ -301,6 +329,11 @@ class Validator:
         scores = score(rows)
         total = sum(s.earnings_ndollars + s.surcharge_ndollars for s in scores.values())
 
+        if scores:
+            LOGGER.info("processing epoch %d: %d miners with usage", epoch_id, len(scores))
+        else:
+            LOGGER.info("processing epoch %d: no miner usage — all-burn", epoch_id)
+
         epoch_summary = load_epoch_summary(epoch_summary_path(mirror_dir))
 
         vector = compute_weights(
@@ -311,12 +344,21 @@ class Validator:
             earnings_multiplier=self._config.weight_earnings_multiplier,
         )
 
+        LOGGER.info(
+            "epoch %d weight vector: %s (pool_usd=%s consumed_usd=%s)",
+            epoch_id,
+            _format_weight_vector(vector),
+            vector.epoch_result.pool_usd_total,
+            vector.epoch_result.total_consumed_usd,
+        )
+
         submitted = False
         if vector.uids:
             # A submit failure raises WeightSubmissionError out of this
             # method; _process_target_epoch defers the epoch (leaves the
             # cursor unadvanced) so the next tick retries with the same
-            # idempotent weight vector.
+            # idempotent weight vector. The submitter logs the chain's
+            # accept/reject outcome.
             try:
                 self._submitter.submit(
                     netuid=self._config.bittensor_netuid,
@@ -329,13 +371,8 @@ class Validator:
                 raise
             submitted = True
             record_weight_submission(epoch_id)
-            LOGGER.info(
-                "epoch %d: miners=%d pool_usd=%s consumed_usd=%s",
-                epoch_id,
-                len(scores),
-                vector.epoch_result.pool_usd_total,
-                vector.epoch_result.total_consumed_usd,
-            )
+        else:
+            LOGGER.info("epoch %d: empty weight vector — nothing to submit", epoch_id)
 
         return EpochOutcome(
             epoch_id=epoch_id,
