@@ -19,10 +19,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from gm_validator import metrics
+
 MAX_WEIGHT = 65535
 MINER_EMISSION_PCT = Decimal("0.41")
 
 _ZERO = Decimal(0)
+_QUANTUM = Decimal(1) / MAX_WEIGHT
 
 
 @dataclass
@@ -108,6 +111,43 @@ def compute_epoch_weights(
     )
 
 
+def _report_payment_accuracy(
+    renorm: Decimal,
+    cleaned: list[tuple[int, Decimal]],
+    miner_u16: list[int],
+) -> None:
+    """Compute and publish the observation-only payment-accuracy gauges.
+
+    Compares each scored miner's intended pool share (``weight / renorm``)
+    against its submitted share (``u16 / MAX_WEIGHT``). Pure observation: it
+    derives nothing the caller reads back, so the returned weight vector is
+    identical whether or not this runs.
+
+    Args:
+        renorm: The renormalization denominator applied to intended shares.
+            Unused when ``cleaned`` is empty (the all-burn epoch).
+        cleaned: ``(uid, weight)`` pairs with strictly-positive weight, in
+            submission order.
+        miner_u16: Submitted u16 weight per cleaned miner, index-aligned with
+            ``cleaned``. Excludes the burn slot.
+    """
+    residual = _ZERO
+    below_quantum = 0
+    floored_total = _ZERO
+    for (_, weight), u16 in zip(cleaned, miner_u16, strict=True):
+        intended = weight / renorm
+        submitted = Decimal(u16) / MAX_WEIGHT
+        residual += abs(intended - submitted)
+        if intended < _QUANTUM:
+            below_quantum += 1
+            floored_total += Decimal(u16) - intended * MAX_WEIGHT
+    metrics.record_payment_accuracy(
+        quantization_residual=float(residual),
+        miners_below_quantum=below_quantum,
+        floored_weight_total=float(floored_total),
+    )
+
+
 def normalize_weights(
     miner_weights: list[tuple[int, Decimal]],
     burn_uid: int,
@@ -145,6 +185,7 @@ def normalize_weights(
     """
     cleaned = [(uid, w) for uid, w in miner_weights if w > 0]
     if not cleaned:
+        _report_payment_accuracy(_ZERO, [], [])
         return [(burn_uid, MAX_WEIGHT)]
     if len(cleaned) > MAX_WEIGHT:
         raise ValueError(
@@ -153,6 +194,7 @@ def normalize_weights(
 
     total = sum((w for _, w in cleaned), _ZERO)
     if total <= 0:
+        _report_payment_accuracy(_ZERO, [], [])
         return [(burn_uid, MAX_WEIGHT)]
 
     # Renorm over the full demand total when supplied so demand from miners
@@ -174,18 +216,21 @@ def normalize_weights(
 
     remainder = MAX_WEIGHT - running_total
     if remainder < 0:
-        shares = [w for _, w in cleaned]
-        _reclaim_overflow(result, shares, -remainder)
-        return result
-    if remainder == 0:
-        return result
+        _reclaim_overflow(result, [w for _, w in cleaned], -remainder)
 
-    for i, (uid, w) in enumerate(result):
-        if uid == burn_uid:
-            result[i] = (uid, w + remainder)
-            break
-    else:
-        result.append((burn_uid, remainder))
+    miner_count = len(cleaned)
+    if remainder > 0:
+        for i, (uid, w) in enumerate(result):
+            if uid == burn_uid:
+                result[i] = (uid, w + remainder)
+                break
+        else:
+            result.append((burn_uid, remainder))
+
+    # Report against the final submitted u16 of each miner — the first
+    # ``miner_count`` entries stay index-aligned with ``cleaned`` even when the
+    # burn dust was merged into a colliding miner uid above.
+    _report_payment_accuracy(renorm, cleaned, [w for _, w in result[:miner_count]])
 
     return result
 

@@ -9,6 +9,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from gm_validator import alpha_economics
 from gm_validator.alpha_economics import (
     MAX_WEIGHT,
     MINER_EMISSION_PCT,
@@ -16,6 +17,17 @@ from gm_validator.alpha_economics import (
     compute_epoch_weights,
     normalize_weights,
 )
+
+
+def _capture_accuracy(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
+    """Capture the next ``record_payment_accuracy`` call's kwargs."""
+    captured: dict[str, float] = {}
+
+    def _record(**kwargs: float) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(alpha_economics.metrics, "record_payment_accuracy", _record)
+    return captured
 
 
 def _miners(values: list[tuple[str, str]]) -> list[MinerEpochData]:
@@ -359,3 +371,107 @@ def test_property_reclaim_preserves_ranking(shares: list[Decimal]) -> None:
     for a, b in itertools.pairwise(ranked):
         assert a >= b
     assert sum(out.values()) == MAX_WEIGHT
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        [(1, Decimal("0.5")), (2, Decimal("0.2")), (3, Decimal("0.0000001"))],
+        # Over-subscribed: drives the reclaim path with many sub-quantum miners.
+        [(i, Decimal("1") / Decimal("7")) for i in range(1, 8)],
+        [(i, Decimal("0.0000001")) for i in range(1, 50)],
+        [],
+        [(1, Decimal(0)), (2, Decimal(0))],
+    ],
+)
+def test_payment_accuracy_gauges_do_not_alter_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    pairs: list[tuple[int, Decimal]],
+) -> None:
+    """The submitted vector is byte-identical whether the live gauge recorder
+    runs or is stubbed to a no-op — observation must never feed back."""
+    live = normalize_weights(list(pairs), burn_uid=99_999)
+
+    monkeypatch.setattr(alpha_economics.metrics, "record_payment_accuracy", lambda **_: None)
+    stubbed = normalize_weights(list(pairs), burn_uid=99_999)
+
+    assert live == stubbed
+
+
+def test_payment_accuracy_values_on_crafted_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Residual, below-quantum count, and signed floored weight match the
+    intended-vs-submitted comparison on a hand-built share vector."""
+    captured = _capture_accuracy(monkeypatch)
+    # total < 1 so renorm == 1 and intended_i == weight_i directly.
+    pairs = [
+        (1, Decimal("0.5")),
+        (2, Decimal("0.2")),
+        (3, Decimal("0.0000001")),  # below the 1/65535 quantum
+    ]
+    out = dict(normalize_weights(list(pairs), burn_uid=99_999))
+
+    # Only miner 3 is sub-quantum; it is floored up to one u16 unit.
+    assert captured["miners_below_quantum"] == 1
+    assert out[3] == 1
+
+    quantum = Decimal(1) / MAX_WEIGHT
+    expected_floored = float(Decimal(1) - Decimal("0.0000001") * MAX_WEIGHT)
+    assert captured["floored_weight_total"] == pytest.approx(expected_floored)
+    assert captured["floored_weight_total"] > 0  # floored up == overpay
+
+    expected_residual = float(
+        sum(abs(intended - Decimal(out[uid]) / MAX_WEIGHT) for uid, intended in pairs)
+    )
+    assert captured["quantization_residual"] == pytest.approx(expected_residual)
+    assert Decimal("0.0000001") < quantum  # sanity on the crafted sub-quantum miner
+
+
+def test_payment_accuracy_measures_final_u16_when_burn_collides_with_miner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When burn_uid is also a scored miner, the under-subscribed burn dust is
+    merged into that miner's u16. The gauge must observe the final (post-merge)
+    submitted weight, not the pre-merge miner share."""
+    captured = _capture_accuracy(monkeypatch)
+    # Under-subscribed (total 0.7 < 1): burn dust merges into uid 1.
+    pairs = [(1, Decimal("0.4")), (2, Decimal("0.3"))]
+    out = dict(normalize_weights(list(pairs), burn_uid=1))
+
+    # uid 1 carries its own share plus the whole burn remainder.
+    assert out[1] > int(Decimal("0.4") * MAX_WEIGHT)
+    expected_residual = float(
+        sum(abs(intended - Decimal(out[uid]) / MAX_WEIGHT) for uid, intended in pairs)
+    )
+    assert captured["quantization_residual"] == pytest.approx(expected_residual)
+
+
+def test_payment_accuracy_empty_epoch_is_zero_no_nan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The all-burn empty epoch reports residual 0 and no NaN."""
+    import math
+
+    captured = _capture_accuracy(monkeypatch)
+    out = normalize_weights([], burn_uid=42)
+
+    assert out == [(42, MAX_WEIGHT)]
+    assert captured["quantization_residual"] == 0.0
+    assert captured["miners_below_quantum"] == 0
+    assert captured["floored_weight_total"] == 0.0
+    assert not math.isnan(captured["quantization_residual"])
+
+
+def test_payment_accuracy_all_zero_weight_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vector of only zero-weight miners burns the full pool and reports
+    zero accuracy gauges without dividing by an empty denominator."""
+    captured = _capture_accuracy(monkeypatch)
+    out = normalize_weights([(1, Decimal(0)), (2, Decimal(0))], burn_uid=7)
+
+    assert out == [(7, MAX_WEIGHT)]
+    assert captured["quantization_residual"] == 0.0
+    assert captured["miners_below_quantum"] == 0
+    assert captured["floored_weight_total"] == 0.0

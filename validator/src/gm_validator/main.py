@@ -20,6 +20,7 @@ from gm_validator.bittensor_adapter import (
     Submitter,
 )
 from gm_validator.config import ValidatorConfig
+from gm_validator.metrics import record_loop_error
 from gm_validator.s3_mirror import S3Mirror
 from gm_validator.validator import Validator
 
@@ -203,6 +204,7 @@ def _run(config: ValidatorConfig) -> None:
         try:
             validator.process_once()
         except Exception:
+            record_loop_error()
             logging.getLogger(__name__).exception("validator loop tick failed")
         time.sleep(config.poll_interval_secs)
 
