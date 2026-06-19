@@ -1,7 +1,7 @@
 [project]
 name = "gm-validator"
 version = "0.1.0"
-description = "gm validator software. Watches S3 for _FINALIZED markers, re-verifies aggregation raw_hash, samples signatures, computes weights, submits to bittensor."
+description = "gm validator software. Watches S3 for finalized epoch artifacts, scores miners from the cost-derived rows, and submits weights to bittensor."
 requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "gm contributors" }]
