@@ -7,11 +7,8 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "gm contributors" }]
 dependencies = [
     "boto3>=1.35,<2",
-    "httpx>=0.28,<0.29",
-    "zstandard>=0.23,<0.24",
     "pydantic>=2.10,<3",
     "prometheus-client>=0.21,<0.23",
-    "cryptography>=43,<46",
     # Real on-chain weight submission + metagraph uid lookup. Imported
     # lazily (inside functions) so the test path, which uses
     # MockSubmitter, never loads it; declared here because production
@@ -27,6 +24,8 @@ dev = [
     "ruff>=0.15",
     "boto3-stubs[s3]>=1.35",
     "moto[s3]>=5.0",
+    # Test-only: the integration test compresses a raw.jsonl fixture.
+    "zstandard>=0.23,<0.24",
 ]
 
 [build-system]
