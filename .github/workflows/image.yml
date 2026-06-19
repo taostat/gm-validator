@@ -2,19 +2,8 @@ name: image
 
 on:
   push:
-    branches: [main]
-    paths:
-      - "validator/**"
-      - "Dockerfile"
-      - ".dockerignore"
-      - ".github/workflows/image.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "validator/**"
-      - "Dockerfile"
-      - ".dockerignore"
-      - ".github/workflows/image.yml"
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -25,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build gm-validator image
+    name: Build, push, and deploy gm-validator image
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -33,75 +22,58 @@ jobs:
         with:
           persist-credentials: false
 
+      # A -dev suffix (vX.Y.Z-dev) releases to testnet; a plain tag
+      # (vX.Y.Z) releases to mainnet. Mirrors taostat/auth-gateway.
+      - name: Determine overlay from tag
+        id: env
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$REF" == *-dev ]]; then
+            echo "overlay=testnet" >> "$GITHUB_OUTPUT"
+          else
+            echo "overlay=mainnet" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
 
       - name: Log in to Quay
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
         with:
           registry: quay.io
           username: ${{ secrets.QUAY_USERNAME }}
           password: ${{ secrets.QUAY_PASSWORD }}
 
-      - name: Build (and push on main)
+      - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
           context: .
           file: Dockerfile
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: quay.io/taostats/gm-validator:${{ github.sha }}
+          push: true
+          tags: quay.io/taostats/gm-validator:${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # On merge to main, after the image is pushed, bump the gm-validator tag in
-  # the ci-cd repo's testnet overlay so ArgoCD rolls the new image out. The
-  # mainnet overlay is promoted by hand, as a separate release step.
-  update-deployment:
-    name: Bump gm-validator tag in ci-cd testnet overlay
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    steps:
-      # persist-credentials stays on: the GH_PAT must remain in the local git
-      # config so the "Commit and push" step can push the tag bump back to
-      # ci-cd-repo. This is the whole point of the job, so the artipacked
-      # audit is a deliberate false positive here.
-      - name: Clone ci-cd-repo
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2  # zizmor: ignore[artipacked]
+      # Fire a repository_dispatch at ci-cd-repo so it bumps the gm-validator
+      # tag in the selected overlay and ArgoCD rolls the new image out.
+      - name: Trigger deployment
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0  # v3.0.0
         with:
-          repository: taostat/ci-cd-repo
           token: ${{ secrets.GH_PAT }}
-          path: ci-cd-repo
-
-      - name: Install kustomize
-        run: |
-          set -euo pipefail
-          KUSTOMIZE_VERSION=v5.8.1
-          curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz
-          sudo mv kustomize /usr/local/bin/
-
-      - name: Bump gm-validator image tag
-        env:
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          cd ci-cd-repo/gm-validator/kustomize/overlays/testnet
-          kustomize edit set image "quay.io/taostats/gm-validator=quay.io/taostats/gm-validator:${SHA}"
-
-      - name: Commit and push
-        env:
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          cd ci-cd-repo
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add gm-validator/kustomize/overlays/testnet/kustomization.yaml
-          if git diff --staged --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-          git commit -m "gm-validator: bump testnet gm-validator to ${SHA}"
-          git pull --rebase
-          git push
+          repository: taostat/ci-cd-repo
+          event-type: update-image
+          client-payload: >-
+            {
+              "shared-secret": "${{ secrets.GH_PAT }}",
+              "project-name": "gm-validator",
+              "paths": "${{ steps.env.outputs.overlay }}",
+              "images": [
+                {
+                  "name": "quay.io/taostats/gm-validator",
+                  "newName": "quay.io/taostats/gm-validator",
+                  "version": "${{ github.ref_name }}"
+                }
+              ]
+            }
