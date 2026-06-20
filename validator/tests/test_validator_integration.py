@@ -29,7 +29,11 @@ from moto import mock_aws
 from pydantic import ValidationError
 
 from gm_validator.alpha_economics import MAX_WEIGHT
-from gm_validator.bittensor_adapter import MockChainCursor, MockSubmitter
+from gm_validator.bittensor_adapter import (
+    MockChainCursor,
+    MockSubmitter,
+    ValidatorWeightStatus,
+)
 from gm_validator.bittensor_real import WeightSubmissionError
 from gm_validator.config import ValidatorConfig
 from gm_validator.epoch_summary import epoch_summary_path, load_epoch_summary
@@ -498,6 +502,9 @@ def test_restart_into_rate_limit_retries_until_accepted(tmp_path: pathlib.Path) 
             self._remaining = reject_count
             self.calls: list[dict] = []
 
+        def weight_status(self) -> None:
+            return None
+
         def submit(
             self, *, netuid: int, uids: list[int], weights: list[int], epoch_id: int
         ) -> None:
@@ -537,6 +544,102 @@ def test_restart_into_rate_limit_retries_until_accepted(tmp_path: pathlib.Path) 
         assert len(submitter.calls) == 3
 
 
+def test_validator_skips_submit_inside_rate_limit_window(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the validator is still inside the chain's weight-set rate-limit
+    window (e.g. just registered or just revealed), the submit is skipped
+    rather than fired and rejected. The guards stay unset so the next tick
+    retries once the window clears."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        miner_a = "5Ehm" + "A" * 44
+        _populate_epoch(
+            s3,
+            epoch_id=7,
+            records=[_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)],
+            emissions_alpha="0.0001",
+        )
+
+        # 40 blocks since last update, limit 100 -> inside the window.
+        submitter = MockSubmitter(
+            status=ValidatorWeightStatus(
+                registered=True,
+                last_update_block=1000,
+                current_block=1040,
+                weights_rate_limit=100,
+            )
+        )
+        validator = Validator(
+            _config(tmp_path),
+            S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
+            submitter,
+            _cursor_targeting(7),
+            miner_uid_lookup={miner_a: 0},
+        )
+
+        with caplog.at_level(logging.INFO, logger="gm_validator.validator"):
+            outcomes = validator.process_once()
+
+        # Deferred: no submit, guards unset, retried next tick.
+        assert outcomes == []
+        assert submitter.calls == []
+        assert validator._last_submitted_epoch is None
+        assert "rate-limit window" in caplog.text
+
+        # Window clears (200 > 100) -> the same epoch now submits.
+        submitter.status = ValidatorWeightStatus(
+            registered=True,
+            last_update_block=1000,
+            current_block=1201,
+            weights_rate_limit=100,
+        )
+        assert len(validator.process_once()) == 1
+        assert len(submitter.calls) == 1
+        assert validator._last_submitted_epoch == 7
+
+
+def test_validator_logs_reveal_when_last_update_advances(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An advance in the on-chain ``last_update`` block — weights applied,
+    i.e. a commit-reveal reveal landing — is detected and logged."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        # No finalized epoch ready -> the tick only observes chain status.
+        submitter = MockSubmitter(
+            status=ValidatorWeightStatus(
+                registered=True,
+                last_update_block=1000,
+                current_block=1500,
+                weights_rate_limit=100,
+            )
+        )
+        validator = Validator(
+            _config(tmp_path),
+            S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
+            submitter,
+            MockChainCursor(epoch=None),
+            miner_uid_lookup={},
+        )
+
+        validator.process_once()  # establishes baseline last_update=1000
+
+        submitter.status = ValidatorWeightStatus(
+            registered=True,
+            last_update_block=1450,  # advanced -> a reveal landed
+            current_block=1500,
+            weights_rate_limit=100,
+        )
+        with caplog.at_level(logging.INFO, logger="gm_validator.validator"):
+            validator.process_once()
+
+        assert "last_update advanced 1000 -> 1450" in caplog.text
+        assert "reveal landed" in caplog.text
+
+
 class _FailingSubmitter:
     """Submitter that raises ``WeightSubmissionError`` on every call.
 
@@ -548,6 +651,9 @@ class _FailingSubmitter:
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+
+    def weight_status(self) -> None:
+        return None
 
     def submit(self, *, netuid: int, uids: list[int], weights: list[int], epoch_id: int) -> None:
         self.calls.append(
