@@ -215,15 +215,21 @@ def _configure_logging() -> None:
     ``logging.basicConfig`` is a no-op once any handler exists, and the
     bittensor SDK installs its own at import time ("Enabling default
     logging (Warning level)") — so relying on basicConfig alone would
-    leave the validator's INFO lines suppressed. Setting the
-    ``gm_validator`` logger level explicitly keeps the per-tick and
-    per-epoch lines visible regardless of what the SDK does to the root
-    logger.
+    leave the validator's INFO lines suppressed.
+
+    bittensor's import also reaches into the ``gm_validator`` logger and
+    raises its level to CRITICAL. bittensor is otherwise imported lazily
+    (inside ``_build_submitter``), so a setLevel pin done before that
+    import is silently clobbered and every per-tick / per-epoch INFO line
+    is dropped. Force the import here so the clobber happens first, then
+    pin — our level wins and the lines stay visible.
     """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    import bittensor as _  # noqa: F401
+
     logging.getLogger("gm_validator").setLevel(logging.INFO)
 
 
