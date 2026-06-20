@@ -223,6 +223,17 @@ def _configure_logging() -> None:
     import is silently clobbered and every per-tick / per-epoch INFO line
     is dropped. Force the import here so the clobber happens first, then
     pin — our level wins and the lines stay visible.
+
+    Crucially, bittensor sets that CRITICAL level on *every* ``gm_validator``
+    logger that already exists at import time — including child loggers such
+    as ``gm_validator.validator``, which main.py imports (``from
+    gm_validator.validator import Validator``) before this runs. A child's
+    explicit level overrides its parent, so pinning only the ``gm_validator``
+    parent leaves ``gm_validator.validator`` stuck at CRITICAL and silences
+    the entire per-tick / per-epoch / submit-failure stream while
+    ``gm_validator.bittensor_real`` (imported lazily, *after* the clobber, so
+    never explicitly set) still logs. Reset every gm_validator child back to
+    NOTSET so it inherits the parent, then pin the parent to INFO.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -230,6 +241,9 @@ def _configure_logging() -> None:
     )
     import bittensor as _  # noqa: F401
 
+    for name in list(logging.root.manager.loggerDict):
+        if name == "gm_validator" or name.startswith("gm_validator."):
+            logging.getLogger(name).setLevel(logging.NOTSET)
     logging.getLogger("gm_validator").setLevel(logging.INFO)
 
 

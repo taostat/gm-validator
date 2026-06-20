@@ -22,3 +22,21 @@ def test_configure_logging_pins_info_after_bittensor_clobber() -> None:
     _configure_logging()
 
     assert logging.getLogger("gm_validator").level == logging.INFO
+
+
+def test_configure_logging_unmutes_child_loggers() -> None:
+    """bittensor clobbers child loggers (e.g. ``gm_validator.validator``,
+    imported before bittensor) to CRITICAL too. A child's explicit level
+    overrides the parent, so pinning only the parent leaves the child muted
+    and drops every per-tick / per-epoch / submit-failure line. The child
+    must end up effectively at INFO.
+    """
+    child = logging.getLogger("gm_validator.validator")
+    child.setLevel(logging.CRITICAL)
+
+    _configure_logging()
+
+    # NOTSET on the child + INFO on the parent => INFO inherited.
+    assert child.getEffectiveLevel() == logging.INFO
+    assert child.isEnabledFor(logging.INFO)
+    assert child.isEnabledFor(logging.ERROR)
