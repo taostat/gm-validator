@@ -71,7 +71,6 @@ jobs:
           event-type: update-image
           client-payload: >-
             {
-              "shared-secret": "${{ secrets.GH_PAT }}",
               "project-name": "gm-validator",
               "paths": "${{ steps.env.outputs.overlay }}",
               "images": [
