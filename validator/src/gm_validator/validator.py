@@ -48,7 +48,12 @@ import logging
 from dataclasses import dataclass
 
 from gm_validator.alpha_economics import MAX_WEIGHT
-from gm_validator.bittensor_adapter import ChainCursor, MetagraphSource, Submitter
+from gm_validator.bittensor_adapter import (
+    ChainCursor,
+    MetagraphSource,
+    Submitter,
+    ValidatorWeightStatus,
+)
 from gm_validator.config import ValidatorConfig
 from gm_validator.epoch_summary import (
     EPOCH_SUMMARY_FILENAME,
@@ -151,6 +156,10 @@ class Validator:
         # A submit needs BOTH a fresh open epoch and a newer target.
         self._last_submitted_open_epoch: int | None = None
         self._last_submitted_epoch: int | None = None
+        # Last on-chain ``last_update`` block we observed for this validator.
+        # Tracked across ticks so an advance — weights actually applied, i.e.
+        # a commit-reveal *reveal* landing — is detectable and logged.
+        self._last_update_block: int | None = None
 
     def process_once(self) -> list[EpochOutcome]:
         """One tick: target the newest finalized epoch and submit its weights.
@@ -164,16 +173,65 @@ class Validator:
         ready or this open epoch was already handled.
         """
         refresh = self._refresh_miner_uid_lookup()
+        status = self._submitter.weight_status()
+        self._observe_weight_status(status)
         outcomes: list[EpochOutcome] = []
         selection = self._select_target_epoch()
         if selection is not None:
             open_epoch, target = selection
-            outcome = self._process_target_epoch(open_epoch, target)
-            if outcome is not None:
-                outcomes.append(outcome)
+            if status is not None and status.within_rate_limit_window:
+                # The chain's weight-set rate limit gates the commit too, so a
+                # submit now would be rejected. Skip it (rather than fire a
+                # doomed commit that bumps submit_failures); the guards stay
+                # unadvanced so the next tick retries once the window clears.
+                LOGGER.info(
+                    "epoch %d ready but only %d/%d blocks since last on-chain "
+                    "update — inside weight-set rate-limit window, deferring submit",
+                    target,
+                    status.blocks_since_last_update,
+                    status.weights_rate_limit,
+                )
+            else:
+                outcome = self._process_target_epoch(open_epoch, target)
+                if outcome is not None:
+                    outcomes.append(outcome)
         self._mirror.prune(self._config.mirror_retention_epochs)
         self._log_tick_summary(selection, outcomes, refresh)
         return outcomes
+
+    def _observe_weight_status(self, status: ValidatorWeightStatus | None) -> None:
+        """Log on-chain weight status and detect a commit-reveal reveal.
+
+        Mirrors bm's ``blocks_since_last_update`` visibility. ``last_update``
+        advancing means weights were *applied* on-chain — on a commit-reveal
+        subnet that is a reveal landing, the strongest signal the commit
+        pipeline is healthy end-to-end. A None status (mock mode or a
+        transient read failure) is silently ignored.
+        """
+        if status is None:
+            return
+        if not status.registered:
+            LOGGER.info("validator hotkey not registered on subnet yet — cannot set weights")
+            return
+        LOGGER.info(
+            "validator on-chain weights: %s blocks since last update (rate limit %d)",
+            status.blocks_since_last_update,
+            status.weights_rate_limit,
+        )
+        latest = status.last_update_block
+        if (
+            self._last_update_block is not None
+            and latest is not None
+            and latest > self._last_update_block
+        ):
+            LOGGER.info(
+                "validator weights applied on-chain: last_update advanced %d -> %d "
+                "(commit-reveal reveal landed)",
+                self._last_update_block,
+                latest,
+            )
+        if latest is not None:
+            self._last_update_block = latest
 
     def _log_tick_summary(
         self,

@@ -21,11 +21,61 @@ from typing import Protocol
 LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ValidatorWeightStatus:
+    """The validator hotkey's own on-chain weight-setting status.
+
+    Read each tick to (a) log how long since this validator's weights last
+    *landed* on-chain, (b) skip a submit the chain's weight-set rate limit
+    would reject anyway, and (c) detect a commit-reveal *reveal* by watching
+    ``last_update_block`` advance.
+
+    ``last_update_block`` advances only when weights are actually applied
+    on-chain — on a commit-reveal subnet that is the *reveal*, not the
+    commit. ``registered`` is False when the validator hotkey has no uid on
+    the subnet yet (so weights can't be set at all). The chain's rate limit
+    gates the commit too, so a freshly-registered or just-revealed validator
+    must wait ``weights_rate_limit`` blocks before its next submit is
+    accepted — this mirrors bm's ``blocks_since_last_update`` visibility.
+    """
+
+    registered: bool
+    last_update_block: int | None
+    current_block: int
+    weights_rate_limit: int
+
+    @property
+    def blocks_since_last_update(self) -> int | None:
+        """Blocks since this validator's weights last landed, or None if unregistered."""
+        if self.last_update_block is None:
+            return None
+        return self.current_block - self.last_update_block
+
+    @property
+    def within_rate_limit_window(self) -> bool:
+        """True when a submit now would be rejected by the weight-set rate limit.
+
+        Conservative: a zero/unknown rate limit reports False so the submit
+        proceeds and the chain's own gate is the final authority.
+        """
+        bs = self.blocks_since_last_update
+        return bs is not None and self.weights_rate_limit > 0 and bs <= self.weights_rate_limit
+
+
 class Submitter(Protocol):
     """Minimal interface the validator uses for weight submission."""
 
     def submit(self, *, netuid: int, uids: list[int], weights: list[int], epoch_id: int) -> None:
         """Submit one epoch's weights to the subnet."""
+        ...
+
+    def weight_status(self) -> ValidatorWeightStatus | None:
+        """Return the validator hotkey's on-chain weight status, or None.
+
+        None means 'unknown' (mock mode, or a transient chain read failure) —
+        callers fall back to submitting and let the chain's own rate-limit
+        gate decide, so a status read failure never blocks a submit.
+        """
         ...
 
 
@@ -82,6 +132,10 @@ class MockSubmitter:
     """In-memory submitter for tests and Phase 1 build."""
 
     calls: list[dict] = field(default_factory=list)
+    status: ValidatorWeightStatus | None = None
+
+    def weight_status(self) -> ValidatorWeightStatus | None:
+        return self.status
 
     def submit(self, *, netuid: int, uids: list[int], weights: list[int], epoch_id: int) -> None:
         LOGGER.info(

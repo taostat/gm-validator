@@ -92,6 +92,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from gm_validator.bittensor_adapter import ValidatorWeightStatus
 from gm_validator.subtensor_connect import (
     DEFAULT_CONNECT_TIMEOUT_SECS,
     DEFAULT_RPC_TIMEOUT_SECS,
@@ -221,12 +222,40 @@ class RealSubmitter:
             raise WeightSubmissionError(
                 f"failed to connect to subtensor (endpoint={endpoint}): {exc}"
             ) from exc
+        # Cache the weight-set rate limit once at startup — it's a subnet
+        # hyperparameter that rarely changes, and reading it per tick would
+        # add an RPC just to pre-gate a submit. A failed read leaves it 0,
+        # which disables the local pre-gate so the chain's own gate decides
+        # (the SDK re-checks the live rate limit inside set_weights anyway).
+        self._weights_rate_limit = self._read_weights_rate_limit()
         LOGGER.info(
-            "RealSubmitter ready: netuid=%d hotkey=%s endpoint=%s (in-memory keypair)",
+            "RealSubmitter ready: netuid=%d hotkey=%s endpoint=%s "
+            "weights_rate_limit=%d (in-memory keypair)",
             netuid,
             hotkey_ss58,
             endpoint or "<default>",
+            self._weights_rate_limit,
         )
+
+    def _read_weights_rate_limit(self) -> int:
+        """Best-effort read of the subnet's weight-set rate limit (blocks).
+
+        Returns 0 when unreadable so the caller's local pre-gate is disabled
+        and the chain remains the sole rate-limit authority.
+        """
+        subtensor = self._subtensor
+        if subtensor is None:
+            return 0
+        try:
+            value = run_with_timeout(
+                "subtensor weights_rate_limit",
+                lambda: subtensor.weights_rate_limit(self._netuid),
+                self._rpc_timeout,
+            )
+            return int(value or 0)
+        except Exception as exc:  # noqa: BLE001 — observability-only; never block startup.
+            LOGGER.warning("could not read weights_rate_limit: %s (pre-gate disabled)", exc)
+            return 0
 
     def _open_subtensor(self) -> Any:
         """Open a fresh subtensor connection at the configured endpoint.
@@ -357,6 +386,59 @@ class RealSubmitter:
         except Exception as exc:
             raise WeightSubmissionError(f"metagraph read failed: {exc}") from exc
         return {hotkey: uid for uid, hotkey in enumerate(metagraph.hotkeys)}
+
+    def weight_status(self) -> ValidatorWeightStatus | None:
+        """Read the validator hotkey's own on-chain weight-setting status.
+
+        Returns the validator's uid registration, its ``LastUpdate`` block
+        (which advances only when weights are *applied* — the reveal, on a
+        commit-reveal subnet), the current head, and the cached rate limit.
+
+        Reads over the long-lived socket. Unlike a submit or head read, a
+        failure here is observability-only: it does NOT touch the
+        reconnect-failure counter and returns None ("unknown"), so the caller
+        falls back to submitting and lets the chain's gate decide rather than
+        skipping a tick over a transient read failure.
+        """
+        self._maybe_reconnect()
+        subtensor = self._subtensor
+        if subtensor is None:
+            return None
+        hotkey = self._wallet.hotkey.ss58_address
+        try:
+            uid = run_with_timeout(
+                "subtensor get_uid_for_hotkey",
+                lambda: subtensor.get_uid_for_hotkey_on_subnet(hotkey, self._netuid),
+                self._rpc_timeout,
+            )
+            head = run_with_timeout(
+                "subtensor get_current_block",
+                subtensor.get_current_block,
+                self._rpc_timeout,
+            )
+            if uid is None:
+                return ValidatorWeightStatus(
+                    registered=False,
+                    last_update_block=None,
+                    current_block=int(head),
+                    weights_rate_limit=self._weights_rate_limit,
+                )
+            last_update = run_with_timeout(
+                "subtensor LastUpdate",
+                lambda: subtensor.substrate.query(
+                    "SubtensorModule", "LastUpdate", [self._netuid]
+                ).value[uid],
+                self._rpc_timeout,
+            )
+            return ValidatorWeightStatus(
+                registered=True,
+                last_update_block=int(last_update),
+                current_block=int(head),
+                weights_rate_limit=self._weights_rate_limit,
+            )
+        except Exception as exc:  # noqa: BLE001 — observability-only; never disrupt the loop.
+            LOGGER.debug("weight status read failed: %s", exc)
+            return None
 
     def submit(
         self,
