@@ -352,6 +352,30 @@ class Validator:
             vector.epoch_result.total_consumed_usd,
         )
 
+        # Per-miner breakdown, mirroring the bm validator's per-UID submission
+        # log. Shows each scored miner's earnings and the u16 weight it
+        # actually received, so an all-burn epoch is explainable from the log
+        # alone: a miner whose earnings round below the 1/65535 weight quantum
+        # shows ``u16_weight=0`` here and its share falls to the burn uid.
+        if scores:
+            weight_by_uid = dict(zip(vector.uids, vector.weights, strict=True))
+            for hotkey, s in sorted(
+                scores.items(),
+                key=lambda kv: kv[1].earnings_ndollars + kv[1].surcharge_ndollars,
+                reverse=True,
+            ):
+                uid = self._miner_uid_lookup.get(hotkey)
+                u16 = weight_by_uid.get(uid, 0) if uid is not None else 0
+                LOGGER.info(
+                    "  miner %s.. uid=%s earned_ndollars=%d reqs=%d u16_weight=%d%s",
+                    hotkey[:12],
+                    uid if uid is not None else "?",
+                    s.earnings_ndollars + s.surcharge_ndollars,
+                    s.successful_requests,
+                    u16,
+                    "" if uid is not None else " (not in metagraph)",
+                )
+
         submitted = False
         if vector.uids:
             # A submit failure raises WeightSubmissionError out of this
