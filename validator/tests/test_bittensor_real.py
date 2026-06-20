@@ -291,20 +291,19 @@ def test_submit_passes_in_memory_wallet_to_set_weights(
     assert call["netuid"] == 42
     assert call["uids"] == [0, 3]
     assert call["weights"] == [400, 600]
-    # Fire-and-forget into the mempool: waiting for inclusion or
-    # finalization holds a per-submit block-event subscription on the
-    # long-lived socket that accumulates over multi-hour runs and stalls
-    # payouts. Both waits stay off; confirmation is the separate chain-head
-    # poll plus the per-epoch dedup guards.
-    assert call["wait_for_inclusion"] is False
-    assert call["wait_for_finalization"] is False
-    # Pin the plain author_submitExtrinsic path: under MEV mode the SDK
-    # rejects its default wait_for_revealed_execution combined with
-    # wait_for_inclusion=False, so the submit forces mev_protection off.
+    # Block for inclusion AND finalization, exactly like the bm validator,
+    # so the chain's real accept/reject receipt — not a bare mempool accept —
+    # drives the outcome. The wait is left unbounded (no run_with_timeout) so
+    # the SDK tears its own block-event subscription down on finalization
+    # instead of leaking it via an abandoned worker thread.
+    assert call["wait_for_inclusion"] is True
+    assert call["wait_for_finalization"] is True
+    # Pin the plain author_submitExtrinsic path regardless of a stray
+    # BT_MEV_PROTECTION env var (the SDK default reads it from the env).
     assert call["mev_protection"] is False
     # The submitter relies on the SDK default raise_error=False so substrate
-    # errors come back as a (success, message) tuple — a mempool-submission
-    # rejection (bad nonce, rate-limit, not registered) surfaces as
+    # errors come back as a (success, message) tuple — a chain rejection
+    # (rate-limit, not registered, stale version key) surfaces as
     # (False, message). It must not opt into the raising contract.
     assert "raise_error" not in call
     # The wallet handed to the chain is the in-memory shim, and its
@@ -349,6 +348,10 @@ def test_submit_wraps_set_weights_exception(monkeypatch: pytest.MonkeyPatch) -> 
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
     with pytest.raises(WeightSubmissionError, match="subtensor down"):
         submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
+    # A raised set_weights is a connection-level failure: it counts toward the
+    # three-strikes reconnect threshold (the only thing that drives reconnect
+    # now that the submit wait is unbounded).
+    assert submitter._consecutive_failures == 1
 
 
 def test_submit_raises_when_chain_rejects_with_no_message(
@@ -627,19 +630,34 @@ def test_head_block_times_out_when_socket_wedges(monkeypatch: pytest.MonkeyPatch
     assert submitter._consecutive_failures == 1
 
 
-def test_submit_times_out_when_socket_wedges(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A ``set_weights`` that hangs must raise and count toward reconnect."""
+def test_submit_wait_is_unbounded_by_rpc_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The submit wait is unbounded: ``set_weights`` is NOT wrapped in
+    ``run_with_timeout``, exactly like the bm validator.
+
+    Bounding the blocking wait is what leaked subscriptions — a fired timeout
+    abandons (does not cancel) the worker thread, leaving its block-event
+    subscription alive. Here ``set_weights`` takes longer than ``rpc_timeout``
+    yet still completes cleanly: no submit-path timeout fires, the call
+    succeeds, and the failure counter stays at zero. (A wedged socket instead
+    self-heals on the next head read, which IS timeout-bounded.)
+    """
     subtensor = _install_fake_bittensor(monkeypatch)
-    subtensor.hang_on_set = threading.Event()
+    gate = threading.Event()
+    subtensor.hang_on_set = gate
     submitter = RealSubmitter(
         netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX, rpc_timeout=0.05
     )
+    # Release the slow set_weights after a delay well past rpc_timeout; if a
+    # submit-path timeout still existed it would have fired at 0.05s.
+    timer = threading.Timer(0.2, gate.set)
+    timer.start()
     try:
-        with pytest.raises(WeightSubmissionError, match="set_weights call failed"):
-            submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
+        submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
     finally:
-        subtensor.hang_on_set.set()
-    assert submitter._consecutive_failures == 1
+        timer.cancel()
+        gate.set()
+    assert len(subtensor.calls) == 1
+    assert submitter._consecutive_failures == 0
 
 
 def test_head_block_reconnects_after_three_hung_reads(monkeypatch: pytest.MonkeyPatch) -> None:
