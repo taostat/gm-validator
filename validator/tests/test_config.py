@@ -60,3 +60,41 @@ def test_from_env_parses_metrics_bind(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SUBNET_OWNER_UID", "0")
     config = ValidatorConfig.from_env()
     assert config.metrics_bind == ("0.0.0.0", 9092)
+
+
+def test_from_env_defaults_wallet_fields_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No WALLET_* env → seed-based auth; wallet fields are None."""
+    for var in ("WALLET_NAME", "WALLET_HOTKEY", "WALLET_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("S3_BUCKET", "test-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
+    config = ValidatorConfig.from_env()
+    assert config.bittensor_wallet_name is None
+    assert config.bittensor_wallet_hotkey is None
+    assert config.bittensor_wallet_path is None
+
+
+def test_from_env_parses_wallet_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WALLET_NAME", "my-coldkey")
+    monkeypatch.setenv("WALLET_HOTKEY", "my-hotkey")
+    monkeypatch.setenv("WALLET_PATH", "/wallets")
+    monkeypatch.setenv("S3_BUCKET", "test-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
+    config = ValidatorConfig.from_env()
+    assert config.bittensor_wallet_name == "my-coldkey"
+    assert config.bittensor_wallet_hotkey == "my-hotkey"
+    assert config.bittensor_wallet_path == "/wallets"
+
+
+def test_from_env_blank_wallet_fields_are_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whitespace-only WALLET_* must not count as a configured wallet — it
+    would otherwise override a valid seed and crash on a bogus wallet path."""
+    monkeypatch.setenv("WALLET_NAME", "   ")
+    monkeypatch.setenv("WALLET_HOTKEY", "")
+    monkeypatch.setenv("WALLET_PATH", " ")
+    monkeypatch.setenv("S3_BUCKET", "test-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
+    config = ValidatorConfig.from_env()
+    assert config.bittensor_wallet_name is None
+    assert config.bittensor_wallet_hotkey is None
+    assert config.bittensor_wallet_path is None

@@ -20,7 +20,13 @@ from gm_validator.config import ValidatorConfig
 from gm_validator.main import HotkeyNotConfiguredError, _build_submitter, _use_mock_submitter
 
 
-def _config(*, mock: bool, seed: str | None) -> ValidatorConfig:
+def _config(
+    *,
+    mock: bool,
+    seed: str | None,
+    wallet_name: str | None = None,
+    wallet_hotkey: str | None = None,
+) -> ValidatorConfig:
     return ValidatorConfig(
         s3_bucket="b",
         s3_prefix="v1",
@@ -34,6 +40,9 @@ def _config(*, mock: bool, seed: str | None) -> ValidatorConfig:
         bittensor_netuid=42,
         bittensor_endpoint=None,
         bittensor_hotkey_seed=seed,
+        bittensor_wallet_name=wallet_name,
+        bittensor_wallet_hotkey=wallet_hotkey,
+        bittensor_wallet_path=None,
         bittensor_mock=mock,
         subtensor_connect_timeout_secs=30,
         subtensor_rpc_timeout_secs=30,
@@ -74,6 +83,20 @@ def test_real_mode_blank_seed_fails_fast() -> None:
 def test_real_mode_with_seed_does_not_use_mock() -> None:
     config = _config(mock=False, seed="0x" + "ab" * 32)
     assert _use_mock_submitter(config) is False
+
+
+def test_real_mode_with_wallet_and_no_seed_does_not_use_mock() -> None:
+    """A configured on-disk wallet is a valid hotkey source on its own —
+    no BITTENSOR_HOTKEY_SEED required."""
+    config = _config(mock=False, seed=None, wallet_name="cold", wallet_hotkey="hot")
+    assert _use_mock_submitter(config) is False
+
+
+def test_real_mode_partial_wallet_without_seed_fails_fast() -> None:
+    """A wallet name without a hotkey (and no seed) is not a usable source."""
+    config = _config(mock=False, seed=None, wallet_name="cold", wallet_hotkey=None)
+    with pytest.raises(HotkeyNotConfiguredError):
+        _use_mock_submitter(config)
 
 
 def test_default_config_without_mock_or_seed_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:

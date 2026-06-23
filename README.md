@@ -18,12 +18,15 @@ full env-var reference.
 
 ## Prerequisites
 
-- **Python 3.13**
-- [`uv`](https://docs.astral.sh/uv/) for dependency and environment
-  management
+- **Docker** with the `docker compose` v2 plugin — the validator runs as a
+  detached container, so it survives SSH disconnects and reboots
+- **git** (for the autoupdate loop)
 - A validator hotkey registered on the gm subnet (netuid 28 on mainnet)
 - **No S3 credentials** on mainnet — the finalized-artifacts bucket is
   public-read
+
+Python 3.13 + [`uv`](https://docs.astral.sh/uv/) are only needed for
+[development](#development).
 
 ## Run a validator (gm mainnet, netuid 28)
 
@@ -44,18 +47,61 @@ cp .env.mainnet .env
 # edit .env → set BITTENSOR_HOTKEY_SEED (your hotkey's BIP-39 mnemonic or 0x seed)
 ```
 
-**3. Run:**
+**3. Start it** — builds the image and runs the container detached:
 
 ```bash
-cd validator
-uv sync
-set -a && source ../.env && set +a
-uv run python -m gm_validator.main
+docker compose up -d --build
+docker compose logs -f validator   # Ctrl-C just stops watching; the validator keeps running
 ```
 
-That's it — no S3 credentials, no per-validator config. The signing keypair is
-built in memory from `BITTENSOR_HOTKEY_SEED`; no wallet keyfile is read from or
-written to disk. Keep the seed out of git and logs (`.env` is gitignored).
+That's it — no S3 credentials, no per-validator config. Running detached with
+`restart: unless-stopped` means it **survives SSH disconnects, crashes, and
+reboots** (a foreground process would be killed when your shell exits). The
+signing keypair is built in memory from `BITTENSOR_HOTKEY_SEED`; no keyfile is
+read or written. `.env` is gitignored, so your seed stays out of git.
+
+Manage it with the usual compose commands:
+
+```bash
+docker compose ps           # status
+docker compose logs -f      # follow logs
+docker compose down         # stop
+```
+
+### Already have a wallet? Import it instead of a seed
+
+If you already keep a btcli wallet on disk, skip the seed and point the
+validator at it:
+
+```bash
+cp docker-compose.override.yml.example docker-compose.override.yml
+# edit it → set your host wallets path (e.g. /home/you/.bittensor/wallets)
+```
+
+Then in `.env` leave `BITTENSOR_HOTKEY_SEED` empty and set:
+
+```bash
+WALLET_NAME=<your coldkey/wallet name>
+WALLET_HOTKEY=<your hotkey name>
+WALLET_PATH=/wallets
+```
+
+`docker compose up -d --build` auto-merges the override (which mounts the
+wallet read-only at `/wallets`). A configured wallet takes precedence over the
+seed.
+
+## Keep it updated (autoupdate)
+
+Run the autoupdate loop to stay on the latest code automatically — it polls
+`origin/main` every 5 minutes and rebuilds the container when new commits land:
+
+```bash
+./scripts/autoupdate.sh
+```
+
+See [scripts/README.md](scripts/README.md) for systemd / cron setup so the
+loop itself survives reboots, plus `AUTOUPDATE_INTERVAL` / `AUTOUPDATE_BRANCH`
+overrides.
 
 ## Development
 

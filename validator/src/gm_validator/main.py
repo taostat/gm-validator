@@ -33,22 +33,25 @@ def _use_mock_submitter(config: ValidatorConfig) -> bool:
     """Decide between the mock and the real (chain-signing) submitter.
 
     The mock submitter is selected only when ``BITTENSOR_MOCK`` is set
-    explicitly. With mock off, a real hotkey seed is mandatory: a
-    missing or blank ``BITTENSOR_HOTKEY_SEED`` raises here so a pod that
-    forgot to mount the secret crashes at startup instead of silently
-    running forever without ever submitting on-chain weights.
+    explicitly. With mock off, a hotkey source is mandatory — either an
+    on-disk wallet (``WALLET_NAME`` + ``WALLET_HOTKEY``) or an in-memory
+    ``BITTENSOR_HOTKEY_SEED``. Neither configured raises here so a pod
+    that forgot to mount the secret crashes at startup instead of
+    silently running forever without ever submitting on-chain weights.
 
     Raises:
-        HotkeyNotConfiguredError: Mock mode is off and the seed is
-            missing or blank.
+        HotkeyNotConfiguredError: Mock mode is off and no hotkey source
+            (wallet or seed) is configured.
     """
     if config.bittensor_mock:
         return True
-    if not (config.bittensor_hotkey_seed and config.bittensor_hotkey_seed.strip()):
+    has_seed = bool(config.bittensor_hotkey_seed and config.bittensor_hotkey_seed.strip())
+    has_wallet = bool(config.bittensor_wallet_name and config.bittensor_wallet_hotkey)
+    if not (has_seed or has_wallet):
         raise HotkeyNotConfiguredError(
-            "BITTENSOR_HOTKEY_SEED is not set; provide the validator hotkey "
-            "seed (BIP-39 mnemonic or 0x-prefixed hex), or set BITTENSOR_MOCK=1 "
-            "to run without on-chain submission"
+            "no validator hotkey configured: set WALLET_NAME and WALLET_HOTKEY to "
+            "import an on-disk wallet, or BITTENSOR_HOTKEY_SEED (BIP-39 mnemonic or "
+            "0x-prefixed hex), or set BITTENSOR_MOCK=1 to run without on-chain submission"
         )
     return False
 
@@ -58,9 +61,7 @@ def _build_submitter(config: ValidatorConfig) -> Submitter:
         # Mock mode forced: record submissions in memory. Useful for
         # build-phase smoke tests.
         return MockSubmitter()
-    # _use_mock_submitter guarantees a non-blank seed here; the config
-    # type is Optional, so assert to satisfy the type checker.
-    assert config.bittensor_hotkey_seed is not None
+    # _use_mock_submitter guarantees a wallet or seed is configured here.
     # Lazy import so the test path does not require bittensor-py.
     from gm_validator.bittensor_real import RealSubmitter
 
@@ -68,6 +69,9 @@ def _build_submitter(config: ValidatorConfig) -> Submitter:
         netuid=config.bittensor_netuid,
         endpoint=config.bittensor_endpoint,
         hotkey_seed=config.bittensor_hotkey_seed,
+        wallet_name=config.bittensor_wallet_name,
+        wallet_hotkey=config.bittensor_wallet_hotkey,
+        wallet_path=config.bittensor_wallet_path,
         connect_timeout=config.subtensor_connect_timeout_secs,
         rpc_timeout=config.subtensor_rpc_timeout_secs,
     )

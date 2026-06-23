@@ -1,0 +1,29 @@
+# Import an existing bittensor wallet into the validator (instead of pasting a
+# raw seed). For operators who already keep a btcli wallet on disk.
+#
+#   1. Copy this file:
+#        cp docker-compose.override.yml.example docker-compose.override.yml
+#   2. Edit the host wallets path below.
+#   3. In .env, leave BITTENSOR_HOTKEY_SEED empty and set:
+#        WALLET_NAME=<your coldkey/wallet name>
+#        WALLET_HOTKEY=<your hotkey name>
+#        WALLET_PATH=/wallets
+#      (a configured wallet takes precedence over the seed).
+#
+# docker compose automatically merges docker-compose.override.yml on top of
+# docker-compose.yml, so `docker compose up -d --build` picks this up. The
+# override is gitignored, so it (and your wallet path) survives the
+# `git reset --hard` in scripts/autoupdate.sh.
+services:
+  validator:
+    # Run as root so the container can read your wallet keyfile regardless of
+    # its host ownership (hotkey keyfiles are usually mode 0600). Without this,
+    # the default uid-1000 user may not be able to read a keyfile owned by your
+    # host account.
+    user: "0:0"
+    volumes:
+      # LEFT side = your host wallets dir (absolute path), e.g.
+      # /home/alice/.bittensor/wallets. It is mounted read-only at /wallets
+      # inside the container, which is exactly where WALLET_PATH=/wallets tells
+      # the validator to look: /wallets/<WALLET_NAME>/hotkeys/<WALLET_HOTKEY>.
+      - /home/CHANGE_ME/.bittensor/wallets:/wallets:ro
