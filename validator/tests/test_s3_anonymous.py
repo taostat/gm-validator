@@ -197,3 +197,27 @@ def test_client_pins_checksums_to_when_required(anonymous: bool, endpoint_url: s
     assert captured.config is not None, "expected a 'config' kwarg on boto3.client"
     assert _checksum_calculation(captured.config) == "when_required"
     assert _checksum_validation(captured.config) == "when_required"
+
+
+def _addressing_style(config: Config) -> object:
+    """Read Config.s3['addressing_style'] (the OVH virtual-hosted switch)."""
+    s3 = getattr(config, "s3", None) or {}
+    return s3.get("addressing_style")
+
+
+def test_anonymous_client_uses_virtual_addressing() -> None:
+    """Anonymous mode must use virtual-hosted addressing. OVH serves
+    public-read objects only at ``bucket.endpoint/key``; an unsigned
+    path-style request (``endpoint/bucket/key``) is rejected with HTTP 400
+    regardless of the object ACL."""
+    captured = _capture_client_call(_make_config(s3_anonymous=True))
+    assert captured.config is not None
+    assert _addressing_style(captured.config) == "virtual"
+
+
+def test_signed_client_keeps_default_addressing() -> None:
+    """Signed mode keeps default (path) addressing — the keyed gm-bucket
+    reads work path-style and must not be perturbed."""
+    captured = _capture_client_call(_make_config(s3_anonymous=False))
+    assert captured.config is not None
+    assert _addressing_style(captured.config) is None

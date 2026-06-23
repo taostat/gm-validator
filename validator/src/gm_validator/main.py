@@ -145,7 +145,12 @@ def _build_s3_client(config: ValidatorConfig) -> Any:
 
     When ``config.s3_anonymous`` is set the client also signs no requests
     (``botocore.UNSIGNED``) — required for OVH public-read buckets or any
-    bucket reachable without IAM credentials.
+    bucket reachable without IAM credentials — and switches to
+    ``virtual``-hosted addressing (``bucket.endpoint/key``). OVH serves
+    public-read objects only via the virtual-hosted host; an *unsigned*
+    path-style request (``endpoint/bucket/key``) is rejected with HTTP 400
+    regardless of the object ACL. Signed (keyed) reads work either way, so
+    only the anonymous path needs the switch.
 
     boto3-stubs types ``boto3.client()`` as an overload set keyed on the
     Literal service name; passing the remaining args via ``**kwargs``
@@ -157,6 +162,7 @@ def _build_s3_client(config: ValidatorConfig) -> Any:
         request_checksum_calculation="when_required",
         response_checksum_validation="when_required",
         signature_version=botocore.UNSIGNED if config.s3_anonymous else None,
+        s3={"addressing_style": "virtual"} if config.s3_anonymous else {},
     )
     if config.s3_endpoint_url:
         return boto3.client(
