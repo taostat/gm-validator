@@ -21,11 +21,43 @@ full env-var reference.
 - **Python 3.13**
 - [`uv`](https://docs.astral.sh/uv/) for dependency and environment
   management
-- Read access to the S3 bucket holding finalized epoch artifacts
-- For real (on-chain) submission: a validator hotkey seed and a reachable
-  subtensor endpoint
+- A validator hotkey registered on the gm subnet (netuid 28 on mainnet)
+- **No S3 credentials** on mainnet — the finalized-artifacts bucket is
+  public-read
 
-## Quickstart
+## Run a validator (gm mainnet, netuid 28)
+
+The only value you supply is your own hotkey seed — everything else is in the
+bundled [`.env.mainnet`](.env.mainnet) and is identical for every validator.
+
+**1. Register a hotkey on netuid 28** (one-time, burns TAO):
+
+```bash
+btcli subnet register --netuid 28 --network finney \
+  --wallet.name <coldkey> --wallet.hotkey <hotkey>
+```
+
+**2. Copy the mainnet config and add your seed:**
+
+```bash
+cp .env.mainnet .env
+# edit .env → set BITTENSOR_HOTKEY_SEED (your hotkey's BIP-39 mnemonic or 0x seed)
+```
+
+**3. Run:**
+
+```bash
+cd validator
+uv sync
+set -a && source ../.env && set +a
+uv run python -m gm_validator.main
+```
+
+That's it — no S3 credentials, no per-validator config. The signing keypair is
+built in memory from `BITTENSOR_HOTKEY_SEED`; no wallet keyfile is read from or
+written to disk. Keep the seed out of git and logs (`.env` is gitignored).
+
+## Development
 
 ```bash
 cd validator
@@ -38,43 +70,32 @@ uv tool run --from "ty==0.0.37" ty check src
 uv run pytest -q
 ```
 
-Run against a mock chain — the mock cursor reports no open epoch, so the loop
-only prunes local mirrors and never reaches S3 discovery, scoring, or
-submission (a build-phase smoke run):
+Smoke-run against a mock chain — the mock cursor reports no open epoch, so the
+loop only prunes local mirrors and never reaches S3 discovery, scoring, or
+submission:
 
 ```bash
-BITTENSOR_MOCK=1 \
-S3_BUCKET="your-bucket" \
-SUBNET_OWNER_UID="0" \
+BITTENSOR_MOCK=1 S3_BUCKET=gm-mainnet SUBNET_OWNER_UID=3 \
   uv run python -m gm_validator.main
 ```
-
-Run for real on-chain submission (substitute your own values):
-
-```bash
-S3_BUCKET="your-bucket" \
-SUBNET_OWNER_UID="0" \
-BITTENSOR_NETUID="0" \
-BITTENSOR_ENDPOINT="wss://your-subtensor-endpoint" \
-BITTENSOR_HOTKEY_SEED="your-bip39-mnemonic-or-0x-hex-seed" \
-  uv run python -m gm_validator.main
-```
-
-The signing keypair is built in memory from `BITTENSOR_HOTKEY_SEED`; no
-wallet keyfile is read from or written to disk. Never commit or log the seed.
 
 ## Configuration
 
+For gm mainnet you don't need to set these by hand — [`.env.mainnet`](.env.mainnet)
+has them filled in. The table is the full reference (defaults shown; the
+mainnet values are noted where they differ).
+
 | Variable | Default | Purpose |
 |---|---|---|
-| `S3_BUCKET` | required | Bucket containing finalized epoch artifacts |
-| `SUBNET_OWNER_UID` | required | Uid that absorbs the burn slot + floor-rounding dust |
+| `S3_BUCKET` | required | Bucket with finalized artifacts (mainnet: `gm-mainnet`) |
+| `SUBNET_OWNER_UID` | required | Uid that absorbs the burn slot + floor-rounding dust (mainnet: `3`) |
 | `S3_PREFIX` | `v1` | Key prefix |
-| `S3_ENDPOINT_URL` | — | Endpoint override (e.g. MinIO for local dev) |
-| `GM_VALIDATOR_S3_ANONYMOUS` | `0` | Skip request signing for public-read buckets |
+| `S3_ENDPOINT_URL` | — | S3 endpoint (mainnet: `https://s3.gra.io.cloud.ovh.net`) |
+| `AWS_REGION` | `us-east-1` | S3 region (mainnet: `gra`) |
+| `GM_VALIDATOR_S3_ANONYMOUS` | `0` | Skip request signing for public-read buckets (mainnet: `1`, no AWS keys) |
 | `BLOCKS_PER_EPOCH` | `361` | Epoch length (`tempo + 1`); must equal the finalizer's divisor |
-| `BITTENSOR_NETUID` | `0` | Subnet UID |
-| `BITTENSOR_ENDPOINT` | — | Subtensor `wss://` URL (SDK default network when unset) |
+| `BITTENSOR_NETUID` | `0` | Subnet UID (mainnet: `28`) |
+| `BITTENSOR_ENDPOINT` | — | Subtensor `wss://` URL (mainnet: `wss://entrypoint-finney.opentensor.ai:443`) |
 | `BITTENSOR_HOTKEY_SEED` | — | Validator hotkey seed; required unless `BITTENSOR_MOCK=1` |
 | `BITTENSOR_MOCK` | `0` | Run without on-chain submission |
 
