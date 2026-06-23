@@ -91,7 +91,7 @@ mainnet values are noted where they differ).
 | `SUBNET_OWNER_UID` | required | Uid that absorbs the burn slot + floor-rounding dust (mainnet: `3`) |
 | `S3_PREFIX` | `v1` | Key prefix |
 | `S3_ENDPOINT_URL` | — | S3 endpoint (mainnet: `https://s3.gra.io.cloud.ovh.net`) |
-| `AWS_REGION` | `us-east-1` | S3 region (mainnet: `gra`) |
+| `AWS_REGION` | `gra` | S3 region (mainnet: `gra`) |
 | `GM_VALIDATOR_S3_ANONYMOUS` | `0` | Skip request signing for public-read buckets (mainnet: `1`, no AWS keys) |
 | `BLOCKS_PER_EPOCH` | `361` | Epoch length (`tempo + 1`); must equal the finalizer's divisor |
 | `BITTENSOR_NETUID` | `0` | Subnet UID (mainnet: `28`) |
