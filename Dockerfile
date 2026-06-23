@@ -33,10 +33,18 @@ FROM python:3.13-slim-bookworm@sha256:386df64585134ba00b1d5e307acb1e72f33e9e87db
 ENV SOURCE_DATE_EPOCH=1700000000 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/.venv/bin:$PATH" \
+    HOME=/home/app
 
+# `import bittensor` creates ~/.bittensor at import time, so the app user
+# needs a writable HOME. Without this the container crashes on startup with
+# PermissionError on /home/app (the k8s deployment used to paper over it with
+# a HOME env + emptyDir mount; baking it into the image fixes every run path —
+# docker compose, bare docker, and k8s alike).
 RUN groupadd --gid 1000 app \
-    && useradd --uid 1000 --gid 1000 --no-create-home app
+    && useradd --uid 1000 --gid 1000 --create-home app \
+    && mkdir -p /home/app/.bittensor \
+    && chown -R 1000:1000 /home/app
 
 WORKDIR /app
 

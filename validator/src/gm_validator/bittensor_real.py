@@ -11,10 +11,13 @@ The ``bittensor`` import is deferred to the methods that need it so that
 merely importing this module is cheap; only constructing ``RealSubmitter``
 or calling ``submit`` requires the SDK to be installed.
 
-The hotkey is loaded entirely in memory — no wallet keyfile is ever read
-from or written to disk. ``BITTENSOR_HOTKEY_SEED`` carries only the
-secret seed material: either a BIP-39 mnemonic or a ``0x``-prefixed
-hex seed. No coldkey, no wallet directory, no keyfile JSON blob.
+The hotkey comes from one of two sources. By default it is loaded
+entirely in memory from ``BITTENSOR_HOTKEY_SEED`` (a BIP-39 mnemonic or
+a ``0x``-prefixed hex seed) — no keyfile touched. Alternatively, an
+operator who already keeps a btcli wallet on disk can set ``WALLET_NAME``
++ ``WALLET_HOTKEY`` (+ optional ``WALLET_PATH``) to import the hotkey
+keypair from ``{path}/{name}/hotkeys/{hotkey}``; the wallet takes
+precedence over the seed when both are set.
 
 Connection lifecycle:
 
@@ -150,6 +153,67 @@ def _keypair_from_seed(seed: str) -> Any:
         ) from exc
 
 
+def _keypair_from_wallet(name: str, hotkey: str, path: str | None) -> Any:
+    """Load a ``bittensor.Keypair`` from an on-disk wallet keyfile.
+
+    Reads the hotkey keypair from ``{path}/{name}/hotkeys/{hotkey}``; when
+    ``path`` is ``None`` bittensor's default (``~/.bittensor/wallets``) is
+    used. The hotkey keyfile is normally unencrypted, so this does not
+    prompt for a password.
+
+    Args:
+        name: Wallet (coldkey) name — ``WALLET_NAME``.
+        hotkey: Hotkey name within the wallet — ``WALLET_HOTKEY``.
+        path: Wallets directory — ``WALLET_PATH`` (``None`` → SDK default).
+
+    Returns:
+        A ``bittensor.Keypair`` carrying the signing key.
+
+    Raises:
+        HotkeyConfigError: The wallet/hotkey could not be loaded (missing
+            keyfile, encrypted hotkey, bad path, etc.).
+    """
+    import bittensor
+
+    try:
+        wallet = (
+            bittensor.Wallet(name=name, hotkey=hotkey, path=path)
+            if path
+            else bittensor.Wallet(name=name, hotkey=hotkey)
+        )
+        return wallet.hotkey
+    except Exception as exc:
+        raise HotkeyConfigError(
+            f"could not load validator hotkey from wallet name={name!r} "
+            f"hotkey={hotkey!r} path={path or '~/.bittensor/wallets'}: {exc}"
+        ) from exc
+
+
+def _load_keypair(
+    hotkey_seed: str | None,
+    wallet_name: str | None,
+    wallet_hotkey: str | None,
+    wallet_path: str | None,
+) -> Any:
+    """Resolve the validator signing keypair from a wallet or a raw seed.
+
+    A configured wallet (both ``wallet_name`` and ``wallet_hotkey`` set)
+    takes precedence over the seed.
+
+    Raises:
+        HotkeyConfigError: Neither a usable wallet nor a usable seed is
+            configured, or the chosen source fails to load.
+    """
+    if wallet_name and wallet_hotkey:
+        return _keypair_from_wallet(wallet_name, wallet_hotkey, wallet_path)
+    if hotkey_seed and hotkey_seed.strip():
+        return _keypair_from_seed(hotkey_seed)
+    raise HotkeyConfigError(
+        "no validator hotkey configured: set WALLET_NAME and WALLET_HOTKEY to "
+        "import an on-disk wallet, or BITTENSOR_HOTKEY_SEED for an in-memory seed"
+    )
+
+
 class _KeypairWallet:
     """Shim wrapping a bare ``bittensor.Keypair`` as a wallet.
 
@@ -181,11 +245,19 @@ class RealSubmitter:
         self,
         netuid: int,
         endpoint: str | None,
-        hotkey_seed: str,
+        hotkey_seed: str | None = None,
         connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECS,
         rpc_timeout: float = DEFAULT_RPC_TIMEOUT_SECS,
+        *,
+        wallet_name: str | None = None,
+        wallet_hotkey: str | None = None,
+        wallet_path: str | None = None,
     ) -> None:
-        """Build the in-memory hotkey and connect to subtensor.
+        """Build the signing keypair and connect to subtensor.
+
+        The keypair comes from one of two sources: a configured on-disk
+        wallet (``wallet_name`` + ``wallet_hotkey``) takes precedence,
+        otherwise the in-memory ``hotkey_seed``.
 
         Args:
             netuid: Subnet id the validator submits weights for.
@@ -193,7 +265,14 @@ class RealSubmitter:
                 default network.
             hotkey_seed: The validator hotkey seed — a BIP-39 mnemonic or
                 a ``0x``-prefixed hex seed. The signing keypair is built
-                in memory from it; no keyfile is read from disk.
+                in memory from it; no keyfile is read from disk. Optional
+                when a wallet is configured.
+            wallet_name: Wallet name to import the hotkey from instead of a
+                seed (``WALLET_NAME``); requires ``wallet_hotkey``.
+            wallet_hotkey: Hotkey name within ``wallet_name``
+                (``WALLET_HOTKEY``).
+            wallet_path: Wallets directory for the import (``WALLET_PATH``);
+                ``None`` uses bittensor's ``~/.bittensor/wallets``.
             connect_timeout: Per-attempt wall-clock budget for opening the
                 subtensor websocket; a hung connect becomes a retryable
                 timeout instead of freezing startup.
@@ -213,7 +292,7 @@ class RealSubmitter:
         self._rpc_timeout = rpc_timeout
         self._subtensor: Any | None = None
         self._consecutive_failures = 0
-        hotkey = _keypair_from_seed(hotkey_seed)
+        hotkey = _load_keypair(hotkey_seed, wallet_name, wallet_hotkey, wallet_path)
         self._wallet: Any = _KeypairWallet(hotkey)
         hotkey_ss58 = hotkey.ss58_address
         try:

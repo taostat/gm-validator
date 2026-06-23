@@ -1,5 +1,8 @@
 .env
 .env.local
+# Operator-local compose override (e.g. wallet mount); must survive autoupdate's
+# `git reset --hard`, so keep it untracked.
+docker-compose.override.yml
 *.log
 .DS_Store
 .venv/

@@ -14,6 +14,20 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _opt_env(name: str) -> str | None:
+    """Return a stripped optional env value, or None when unset or blank.
+
+    Treating whitespace-only values as unset keeps a stray `WALLET_NAME=" "`
+    from counting as a configured hotkey source (which would otherwise
+    override a valid BITTENSOR_HOTKEY_SEED and crash on a bogus wallet path).
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
 def _int_env(name: str, default: int) -> int:
     value = os.environ.get(name)
     if value is None:
@@ -98,6 +112,15 @@ class ValidatorConfig:
     # it; no wallet keyfile is read from or written to disk. Env:
     # BITTENSOR_HOTKEY_SEED.
     bittensor_hotkey_seed: str | None
+    # Alternative to the raw seed: import the signing hotkey from an on-disk
+    # bittensor wallet (the keyfile btcli writes). When both name and hotkey
+    # are set they take precedence over BITTENSOR_HOTKEY_SEED; the keypair is
+    # read from `{wallet_path}/{name}/hotkeys/{hotkey}`. Env: WALLET_NAME,
+    # WALLET_HOTKEY, WALLET_PATH (the wallets dir; unset → bittensor's default
+    # ~/.bittensor/wallets).
+    bittensor_wallet_name: str | None
+    bittensor_wallet_hotkey: str | None
+    bittensor_wallet_path: str | None
     bittensor_mock: bool
     # Wall-clock budget for a single subtensor connect attempt. The SDK
     # opens its websocket synchronously with no connect timeout, so a
@@ -159,6 +182,9 @@ class ValidatorConfig:
             bittensor_netuid=_int_env("BITTENSOR_NETUID", 0),
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
             bittensor_hotkey_seed=os.environ.get("BITTENSOR_HOTKEY_SEED"),
+            bittensor_wallet_name=_opt_env("WALLET_NAME"),
+            bittensor_wallet_hotkey=_opt_env("WALLET_HOTKEY"),
+            bittensor_wallet_path=_opt_env("WALLET_PATH"),
             bittensor_mock=os.environ.get("BITTENSOR_MOCK", "0") in {"1", "true", "True"},
             subtensor_connect_timeout_secs=_int_env("SUBTENSOR_CONNECT_TIMEOUT_SECS", 30),
             subtensor_rpc_timeout_secs=_int_env("SUBTENSOR_RPC_TIMEOUT_SECS", 30),

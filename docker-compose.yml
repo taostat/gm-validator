@@ -1,0 +1,35 @@
+# Run the gm-validator as a long-lived, auto-restarting container.
+#
+# Pairs with scripts/autoupdate.sh, which rebuilds this service whenever new
+# commits land on origin/main (see scripts/README.md).
+#
+# Setup:
+#   cp .env.mainnet .env        # then edit .env → set BITTENSOR_HOTKEY_SEED
+#   docker compose up -d --build
+#
+# The validator is stateless (it reads finalized artifacts from S3 and submits
+# weights to the chain), so there is no database — only an on-disk mirror cache
+# kept in a named volume so it survives rebuilds.
+services:
+  validator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # All config — netuid, bucket, anonymous S3, endpoint, and your hotkey seed
+    # — comes from .env (copy .env.mainnet → .env and set BITTENSOR_HOTKEY_SEED).
+    env_file:
+      - .env
+    # To import an existing btcli wallet instead of a seed, copy
+    # docker-compose.override.yml.example → docker-compose.override.yml (it
+    # mounts your wallet and is auto-merged on `up`).
+    volumes:
+      # On-disk S3 mirror (audit cache); persisted across restarts/rebuilds.
+      - gm_validator_mirror:/var/cache/gm-validator
+    # Uncomment to scrape Prometheus metrics (also set GM_VALIDATOR_METRICS_BIND
+    # in .env, e.g. 0.0.0.0:9092):
+    # ports:
+    #   - "9092:9092"
+
+volumes:
+  gm_validator_mirror:

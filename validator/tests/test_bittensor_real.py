@@ -31,6 +31,8 @@ from gm_validator.bittensor_real import (
     RealSubmitter,
     WeightSubmissionError,
     _keypair_from_seed,
+    _keypair_from_wallet,
+    _load_keypair,
 )
 
 # Throwaway test secrets — NOT used by any real validator. The expected
@@ -191,6 +193,55 @@ def test_mnemonic_ground_truth_ss58() -> None:
 def test_hex_seed_ground_truth_ss58() -> None:
     keypair = _keypair_from_seed(_TEST_SEED_HEX)
     assert keypair.ss58_address == _TEST_SEED_SS58
+
+
+# --- keypair source resolution (wallet vs seed) --------------------------
+
+
+def test_load_keypair_requires_a_source() -> None:
+    """Neither a wallet nor a seed → fail fast with a clear message.
+
+    The guard fires before any bittensor import, so it runs without the SDK.
+    """
+    with pytest.raises(HotkeyConfigError, match="no validator hotkey configured"):
+        _load_keypair(None, None, None, None)
+
+
+@_needs_sdk
+def test_load_keypair_uses_seed_when_no_wallet() -> None:
+    keypair = _load_keypair(_TEST_SEED_HEX, None, None, None)
+    assert keypair.ss58_address == _TEST_SEED_SS58
+
+
+@_needs_sdk
+def test_keypair_from_wallet_round_trips_on_disk_keyfile(tmp_path: Any) -> None:
+    """A wallet written by bittensor loads back to the same hotkey."""
+    import bittensor
+
+    wallet = bittensor.Wallet(name="cold", hotkey="hot", path=str(tmp_path))
+    wallet.create_new_hotkey(n_words=12, use_password=False, overwrite=True, suppress=True)
+
+    loaded = _keypair_from_wallet("cold", "hot", str(tmp_path))
+    assert loaded.ss58_address == wallet.hotkey.ss58_address
+
+
+@_needs_sdk
+def test_load_keypair_prefers_wallet_over_seed(tmp_path: Any) -> None:
+    """When both are set the on-disk wallet wins over the in-memory seed."""
+    import bittensor
+
+    wallet = bittensor.Wallet(name="cold", hotkey="hot", path=str(tmp_path))
+    wallet.create_new_hotkey(n_words=12, use_password=False, overwrite=True, suppress=True)
+
+    loaded = _load_keypair(_TEST_SEED_HEX, "cold", "hot", str(tmp_path))
+    assert loaded.ss58_address == wallet.hotkey.ss58_address
+    assert loaded.ss58_address != _TEST_SEED_SS58
+
+
+@_needs_sdk
+def test_keypair_from_wallet_missing_keyfile_fails_fast(tmp_path: Any) -> None:
+    with pytest.raises(HotkeyConfigError, match="could not load validator hotkey from wallet"):
+        _keypair_from_wallet("nope", "nope", str(tmp_path))
 
 
 # --- construction --------------------------------------------------------
