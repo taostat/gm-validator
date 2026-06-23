@@ -16,6 +16,11 @@ jobs:
   build:
     name: Build, push, and deploy gm-validator image
     runs-on: ubuntu-24.04
+    # Mainnet hard-stop. A plain tag (vX.Y.Z) targets the `mainnet`
+    # Environment; protect it with a required reviewer so the netuid-28
+    # build + overlay bump waits for human approval. A -dev tag targets
+    # `testnet` (unprotected) and flows through without a pause.
+    environment: ${{ endsWith(github.ref_name, '-dev') && 'testnet' || 'mainnet' }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -66,7 +71,6 @@ jobs:
           event-type: update-image
           client-payload: >-
             {
-              "shared-secret": "${{ secrets.GH_PAT }}",
               "project-name": "gm-validator",
               "paths": "${{ steps.env.outputs.overlay }}",
               "images": [
