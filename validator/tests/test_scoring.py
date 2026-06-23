@@ -128,20 +128,6 @@ def test_absent_count_defaults_to_zero() -> None:
     assert s["A"].failed_requests == 0
 
 
-def test_missing_miner_id_raises() -> None:
-    row = _row("A", 100)
-    del row["miner_id"]
-    with pytest.raises(MalformedArtifactError, match="miner_id"):
-        score([row])
-
-
-def test_null_miner_id_raises() -> None:
-    row = _row("A", 100)
-    row["miner_id"] = None
-    with pytest.raises(MalformedArtifactError, match="miner_id"):
-        score([row])
-
-
 def test_non_string_miner_id_raises() -> None:
     """A numeric miner_id would never match the hotkey lookup."""
     row = _row("A", 100)
@@ -150,8 +136,59 @@ def test_non_string_miner_id_raises() -> None:
         score([row])
 
 
-def test_empty_miner_id_raises() -> None:
-    row = _row("A", 100)
-    row["miner_id"] = ""
-    with pytest.raises(MalformedArtifactError, match="miner_id"):
+def _no_miner_row() -> dict:
+    """A gateway no-miner failure row: empty miner_id, zero earnings, failure."""
+    row = _row("", 0, surcharge=0)
+    row["successful_requests"] = 0
+    row["failed_requests"] = 1
+    return row
+
+
+def test_empty_miner_id_row_skipped_not_raised() -> None:
+    """A no-miner row (empty miner_id) is skipped, not fatal to the epoch."""
+    row = _no_miner_row()
+    s = score([row])
+    assert s == {}
+
+
+def test_missing_miner_id_row_skipped() -> None:
+    row = _no_miner_row()
+    del row["miner_id"]
+    s = score([row])
+    assert s == {}
+
+
+def test_null_miner_id_row_skipped() -> None:
+    row = _no_miner_row()
+    row["miner_id"] = None
+    s = score([row])
+    assert s == {}
+
+
+def test_empty_miner_row_does_not_stall_valid_rows() -> None:
+    """The benign empty-miner row is skipped while the valid rows still score."""
+    rows = [
+        _row("A", 100),
+        _no_miner_row(),
+        _row("B", 25),
+    ]
+    s = score(rows)
+    assert set(s) == {"A", "B"}
+    assert s["A"].earnings_ndollars == 100
+    assert s["B"].earnings_ndollars == 25
+
+
+def test_empty_miner_id_warns(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="gm_validator.scoring"):
+        score([_no_miner_row()])
+    assert any("no-miner row" in r.message for r in caplog.records)
+
+
+def test_empty_miner_row_with_nonzero_earnings_raises() -> None:
+    """A no-miner row carrying money is corruption, not a benign skip."""
+    row = _no_miner_row()
+    row["earnings_ndollars"] = "100"
+    with pytest.raises(MalformedArtifactError, match="non-zero"):
         score([row])

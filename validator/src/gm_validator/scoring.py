@@ -128,19 +128,45 @@ def _optional_int(row: dict, key: str, miner_id: str) -> int:
     return _coerce_int(row[key], key, miner_id)
 
 
+def _assert_zero_earning_no_miner_row(row: dict) -> None:
+    """Guard that a no-miner row carries no payout before it is skipped.
+
+    A legitimate no-miner failure row has zero earnings and zero surcharge.
+    Non-zero money on an unplaceable request means money is being attributed
+    to no miner at all — a genuine corruption that must not be silently
+    dropped, so it still fails loud.
+    """
+    for key in ("earnings_ndollars", "surcharge_ndollars"):
+        if key not in row:
+            continue
+        if _coerce_int(row[key], key, "") != 0:
+            raise MalformedArtifactError(
+                f"aggregated.jsonl no-miner row (empty miner_id) carries non-zero "
+                f"{key}={row[key]!r}; refusing to drop earnings with no miner"
+            )
+
+
 def score(rows: Iterable[dict]) -> dict[str, MinerScore]:
     """Aggregate `aggregated.jsonl` rows into per-miner scores."""
     scores: dict[str, MinerScore] = {}
     for row in rows:
-        if "miner_id" not in row:
-            raise MalformedArtifactError("aggregated.jsonl row missing required field 'miner_id'")
-        miner_id = row["miner_id"]
-        # Must be a non-empty hotkey string: a numeric or empty miner_id would
-        # never match the hotkey->uid lookup, so it would silently miss payout.
-        if not isinstance(miner_id, str) or not miner_id:
+        miner_id = row.get("miner_id")
+        # A missing/null/empty miner_id is the gateway's no-miner failure marker:
+        # the router could not place the request, so it logged success=False with
+        # zero earnings and no hotkey. Skip it — it carries no payout, and raising
+        # would abort the whole epoch on a benign row that will not self-heal.
+        if miner_id is None or miner_id == "":
+            _assert_zero_earning_no_miner_row(row)
+            LOGGER.warning(
+                "aggregated.jsonl: skipping no-miner row (empty miner_id); "
+                "router placed no miner, zero earnings"
+            )
+            continue
+        # A present-but-non-string miner_id (e.g. a number) is genuinely corrupt:
+        # it would never match the hotkey->uid lookup and silently miss payout.
+        if not isinstance(miner_id, str):
             raise MalformedArtifactError(
-                f"aggregated.jsonl row field 'miner_id' must be a non-empty string; "
-                f"got {miner_id!r}"
+                f"aggregated.jsonl row field 'miner_id' must be a string; got {miner_id!r}"
             )
         earn = _require_int(row, "earnings_ndollars", miner_id)
         surch = _require_int(row, "surcharge_ndollars", miner_id)
