@@ -51,6 +51,7 @@ class _FakeKeypair:
 
     def __init__(self, ss58_address: str = "5HotKeyAddress") -> None:
         self.ss58_address = ss58_address
+        self.public_key = bytes([1]) * 32
 
     @classmethod
     def create_from_seed(cls, seed: str) -> _FakeKeypair:
@@ -77,6 +78,12 @@ class _FakeSubtensor:
         self.hotkeys: list[str] = ["5HotkeyA", "5HotkeyB", "5HotkeyC"]
         self.requested_metagraph_netuid: int | None = None
         self.raise_on_metagraph: Exception | None = None
+        self.weights_rate_limit_value = 100
+        self.tempo_value = 360
+        self.uid: int | None = 0
+        self.last_update: list[int] = [0, 0, 0]
+        self.timelocked_commits: dict[int, list[Any]] = {}
+        self.substrate = _FakeSubstrate(self)
         # When set, the named chain RPC blocks on this event until the test
         # releases it (or the worker thread's wall-clock budget elapses),
         # simulating a wedged websocket that hangs rather than raises.
@@ -104,8 +111,32 @@ class _FakeSubtensor:
             raise self.raise_on_block
         return self.block
 
+    def weights_rate_limit(self, netuid: int) -> int:
+        return self.weights_rate_limit_value
+
+    def tempo(self, netuid: int) -> int:
+        return self.tempo_value
+
+    def get_uid_for_hotkey_on_subnet(self, hotkey: str, netuid: int) -> int | None:
+        return self.uid
+
     def close(self) -> None:
         self.closes += 1
+
+
+class _FakeSubstrate:
+    def __init__(self, subtensor: _FakeSubtensor) -> None:
+        self._subtensor = subtensor
+
+    def query(self, module: str, storage_function: str, params: list[Any]) -> Any:
+        if storage_function == "LastUpdate":
+            return types.SimpleNamespace(value=self._subtensor.last_update)
+        if storage_function == "TimelockedWeightCommits":
+            epoch = int(params[1])
+            return types.SimpleNamespace(
+                value=list(self._subtensor.timelocked_commits.get(epoch, []))
+            )
+        raise KeyError((module, storage_function, tuple(params)))
 
 
 def _install_fake_bittensor(monkeypatch: pytest.MonkeyPatch) -> _FakeSubtensor:
@@ -352,6 +383,9 @@ def test_submit_passes_in_memory_wallet_to_set_weights(
     # Pin the plain author_submitExtrinsic path regardless of a stray
     # BT_MEV_PROTECTION env var (the SDK default reads it from the env).
     assert call["mev_protection"] is False
+    # A rejected timed commit should not be retried several times inside one
+    # set_weights call; the validator loop owns retry/backoff policy.
+    assert call["max_attempts"] == 1
     # The submitter relies on the SDK default raise_error=False so substrate
     # errors come back as a (success, message) tuple — a chain rejection
     # (rate-limit, not registered, stale version key) surfaces as
@@ -417,6 +451,44 @@ def test_submit_raises_when_chain_rejects_with_no_message(
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
     with pytest.raises(WeightSubmissionError):
         submitter.submit(netuid=42, uids=[0], weights=[1], epoch_id=5)
+
+
+def _timed_commit_entry(account: bytes, block: int = 100) -> tuple[Any, int, tuple, int]:
+    return ((tuple(account),), block, (), 12345)
+
+
+def test_pending_timelocked_commit_count_reads_active_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.block = 725
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    current_epoch, next_epoch = submitter._timelocked_commit_bucket_epochs(subtensor.block)
+
+    validator_account = bytes([1]) * 32
+    other_account = bytes([2]) * 32
+    subtensor.timelocked_commits[current_epoch] = [
+        _timed_commit_entry(validator_account),
+        _timed_commit_entry(other_account),
+    ]
+    subtensor.timelocked_commits[next_epoch] = []
+
+    assert submitter._pending_timelocked_commit_count(subtensor.block) == 1
+
+
+def test_pending_timelocked_commit_count_checks_next_boundary_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subtensor = _install_fake_bittensor(monkeypatch)
+    subtensor.block = 725
+    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    _, next_epoch = submitter._timelocked_commit_bucket_epochs(subtensor.block)
+
+    subtensor.timelocked_commits[next_epoch] = [
+        _timed_commit_entry(bytes([1]) * 32),
+    ]
+
+    assert submitter._pending_timelocked_commit_count(subtensor.block) == 1
 
 
 def _install_reconnecting_fake_bittensor(

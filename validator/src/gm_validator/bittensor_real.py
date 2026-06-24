@@ -109,6 +109,7 @@ LOGGER = logging.getLogger(__name__)
 # A single failure never reconnects; only sustained failure does, which
 # avoids the per-error reconnect churn that leaked subscriptions.
 _RECONNECT_AFTER_FAILURES = 3
+_PENDING_TIMELOCKED_COMMIT_LIMIT = 1
 
 
 class WeightSubmissionError(RuntimeError):
@@ -117,6 +118,71 @@ class WeightSubmissionError(RuntimeError):
 
 class HotkeyConfigError(RuntimeError):
     """The hotkey seed was missing or could not be parsed into a keypair."""
+
+
+def _account_id_bytes_from_keypair(keypair: Any) -> bytes | None:
+    """Return a 32-byte account id for a bittensor keypair-like object."""
+    public_key = getattr(keypair, "public_key", None)
+    if isinstance(public_key, bytes | bytearray) and len(public_key) == 32:
+        return bytes(public_key)
+    if isinstance(public_key, str):
+        candidate = public_key[2:] if public_key.startswith("0x") else public_key
+        try:
+            raw = bytes.fromhex(candidate)
+        except ValueError:
+            raw = b""
+        if len(raw) == 32:
+            return raw
+
+    address = getattr(keypair, "ss58_address", None)
+    if not isinstance(address, str):
+        return None
+    try:
+        from bittensor.utils import ss58_address_to_bytes
+
+        raw = ss58_address_to_bytes(address)
+    except Exception:  # noqa: BLE001 — fake bittensor modules in tests are not packages.
+        return None
+    return bytes(raw) if len(raw) == 32 else None
+
+
+def _entry_account_id_bytes(entry: Any) -> bytes | None:
+    """Extract the account id from one TimelockedWeightCommits storage row."""
+    row = getattr(entry, "value", entry)
+    if not isinstance(row, list | tuple) or not row:
+        return None
+    return _storage_account_id_bytes(row[0])
+
+
+def _storage_account_id_bytes(value: Any) -> bytes | None:
+    """Decode substrate's AccountId shape into raw bytes.
+
+    async-substrate-interface currently returns account ids as ``((b0, ...,
+    b31),)`` for this storage item, but keep the decoder tolerant of bytes,
+    flat int lists, and ss58 strings so SDK representation changes are
+    observability-only rather than submit-blocking.
+    """
+    raw = getattr(value, "value", value)
+    if isinstance(raw, bytes | bytearray):
+        account = bytes(raw)
+        return account if len(account) == 32 else None
+    if isinstance(raw, str):
+        try:
+            from bittensor.utils import ss58_address_to_bytes
+
+            account = bytes(ss58_address_to_bytes(raw))
+        except Exception:  # noqa: BLE001 — storage should not contain arbitrary strings.
+            return None
+        return account if len(account) == 32 else None
+    if isinstance(raw, list | tuple):
+        if len(raw) == 1:
+            return _storage_account_id_bytes(raw[0])
+        if len(raw) == 32 and all(isinstance(part, int) for part in raw):
+            try:
+                return bytes(raw)
+            except ValueError:
+                return None
+    return None
 
 
 def _keypair_from_seed(seed: str) -> Any:
@@ -307,13 +373,15 @@ class RealSubmitter:
         # which disables the local pre-gate so the chain's own gate decides
         # (the SDK re-checks the live rate limit inside set_weights anyway).
         self._weights_rate_limit = self._read_weights_rate_limit()
+        self._tempo = self._read_tempo()
         LOGGER.info(
             "RealSubmitter ready: netuid=%d hotkey=%s endpoint=%s "
-            "weights_rate_limit=%d (in-memory keypair)",
+            "weights_rate_limit=%d tempo=%d (in-memory keypair)",
             netuid,
             hotkey_ss58,
             endpoint or "<default>",
             self._weights_rate_limit,
+            self._tempo,
         )
 
     def _read_weights_rate_limit(self) -> int:
@@ -335,6 +403,69 @@ class RealSubmitter:
         except Exception as exc:  # noqa: BLE001 — observability-only; never block startup.
             LOGGER.warning("could not read weights_rate_limit: %s (pre-gate disabled)", exc)
             return 0
+
+    def _read_tempo(self) -> int:
+        """Best-effort read of the subnet tempo for timed-commit queue lookup."""
+        subtensor = self._subtensor
+        if subtensor is None:
+            return 0
+        try:
+            value = run_with_timeout(
+                "subtensor tempo",
+                lambda: subtensor.tempo(self._netuid),
+                self._rpc_timeout,
+            )
+            return int(value or 0)
+        except Exception as exc:  # noqa: BLE001 — observability-only; never block startup.
+            LOGGER.warning("could not read tempo: %s (timed-commit pre-gate disabled)", exc)
+            return 0
+
+    def _timelocked_commit_bucket_epochs(self, current_block: int) -> tuple[int, int]:
+        """Return candidate timed-commit storage epochs for the current block.
+
+        Subtensor stores timed commits under ``TimelockedWeightCommits[netuid][epoch]``.
+        The common case uses the current subnet epoch. At the epoch boundary the
+        runtime may place a fresh commit in the next epoch bucket, so check both
+        current and next and use the larger count as the conservative pre-gate.
+        """
+        epoch = (current_block + self._netuid + 1) // (self._tempo + 1)
+        return epoch, epoch + 1
+
+    def _pending_timelocked_commit_count(self, current_block: int) -> int | None:
+        """Return this hotkey's pending timed commits, or None when unreadable.
+
+        ``TooManyUnrevealedCommits`` is enforced against timed commits already
+        stored for this hotkey in the active epoch bucket. Reading the queue
+        lets us defer before firing a doomed extrinsic. A failure is treated as
+        unknown, not fatal: the chain remains the final authority.
+        """
+        subtensor = self._subtensor
+        if subtensor is None or self._tempo <= 0:
+            return None
+        hotkey_account_id = _account_id_bytes_from_keypair(self._wallet.hotkey)
+        if hotkey_account_id is None:
+            return None
+
+        counts: list[int] = []
+        for epoch in self._timelocked_commit_bucket_epochs(current_block):
+            try:
+                result = run_with_timeout(
+                    "subtensor TimelockedWeightCommits",
+                    lambda epoch=epoch: subtensor.substrate.query(
+                        "SubtensorModule",
+                        "TimelockedWeightCommits",
+                        [self._netuid, epoch],
+                    ),
+                    self._rpc_timeout,
+                )
+            except Exception as exc:  # noqa: BLE001 — observability-only; never block a submit.
+                LOGGER.debug("timed-commit queue read failed: %s", exc)
+                return None
+            entries = getattr(result, "value", result) or []
+            counts.append(
+                sum(1 for entry in entries if _entry_account_id_bytes(entry) == hotkey_account_id)
+            )
+        return max(counts, default=0)
 
     def _open_subtensor(self) -> Any:
         """Open a fresh subtensor connection at the configured endpoint.
@@ -495,12 +626,15 @@ class RealSubmitter:
                 subtensor.get_current_block,
                 self._rpc_timeout,
             )
+            pending_commits = self._pending_timelocked_commit_count(int(head))
             if uid is None:
                 return ValidatorWeightStatus(
                     registered=False,
                     last_update_block=None,
                     current_block=int(head),
                     weights_rate_limit=self._weights_rate_limit,
+                    pending_timelocked_commits=pending_commits,
+                    pending_timelocked_commit_limit=_PENDING_TIMELOCKED_COMMIT_LIMIT,
                 )
             last_update = run_with_timeout(
                 "subtensor LastUpdate",
@@ -514,6 +648,8 @@ class RealSubmitter:
                 last_update_block=int(last_update),
                 current_block=int(head),
                 weights_rate_limit=self._weights_rate_limit,
+                pending_timelocked_commits=pending_commits,
+                pending_timelocked_commit_limit=_PENDING_TIMELOCKED_COMMIT_LIMIT,
             )
         except Exception as exc:  # noqa: BLE001 — observability-only; never disrupt the loop.
             LOGGER.debug("weight status read failed: %s", exc)
@@ -585,6 +721,7 @@ class RealSubmitter:
                 netuid=netuid,
                 uids=uids,
                 weights=weights,
+                max_attempts=1,
                 mev_protection=False,
                 wait_for_inclusion=True,
                 wait_for_finalization=True,
