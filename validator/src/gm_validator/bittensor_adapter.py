@@ -25,28 +25,31 @@ LOGGER = logging.getLogger(__name__)
 class ValidatorWeightStatus:
     """The validator hotkey's own on-chain weight-setting status.
 
-    Read each tick to (a) log how long since this validator's weights last
-    *landed* on-chain, (b) skip a submit the chain's weight-set rate limit
-    would reject anyway, and (c) detect a commit-reveal *reveal* by watching
-    ``last_update_block`` advance.
+    Read each tick to (a) log how long since this validator's last accepted
+    weight update, (b) skip a submit the chain's weight-set rate limit would
+    reject anyway, and (c) skip a submit when the timed commit/reveal queue is
+    already full.
 
-    ``last_update_block`` advances only when weights are actually applied
-    on-chain — on a commit-reveal subnet that is the *reveal*, not the
-    commit. ``registered`` is False when the validator hotkey has no uid on
-    the subnet yet (so weights can't be set at all). The chain's rate limit
-    gates the commit too, so a freshly-registered or just-revealed validator
-    must wait ``weights_rate_limit`` blocks before its next submit is
-    accepted — this mirrors bm's ``blocks_since_last_update`` visibility.
+    On timed commit/reveal subnets, ``last_update_block`` advances when the
+    commit is accepted, not when the encrypted payload is later revealed.
+    ``pending_timelocked_commits`` is therefore the safer signal for duplicate
+    commit suppression. ``registered`` is False when the validator hotkey has
+    no uid on the subnet yet (so weights can't be set at all). The chain's
+    rate limit gates the commit too, so a freshly-registered or just-updated
+    validator must wait ``weights_rate_limit`` blocks before its next submit
+    is accepted.
     """
 
     registered: bool
     last_update_block: int | None
     current_block: int
     weights_rate_limit: int
+    pending_timelocked_commits: int | None = None
+    pending_timelocked_commit_limit: int = 1
 
     @property
     def blocks_since_last_update(self) -> int | None:
-        """Blocks since this validator's weights last landed, or None if unregistered."""
+        """Blocks since this validator's last accepted update, or None if unregistered."""
         if self.last_update_block is None:
             return None
         return self.current_block - self.last_update_block
@@ -60,6 +63,14 @@ class ValidatorWeightStatus:
         """
         bs = self.blocks_since_last_update
         return bs is not None and self.weights_rate_limit > 0 and bs <= self.weights_rate_limit
+
+    @property
+    def timelocked_commit_queue_full(self) -> bool:
+        """True when the active timed-commit bucket already has our commit."""
+        return (
+            self.pending_timelocked_commits is not None
+            and self.pending_timelocked_commits >= self.pending_timelocked_commit_limit
+        )
 
 
 class Submitter(Protocol):
