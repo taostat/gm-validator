@@ -145,7 +145,10 @@ def _keypair_from_seed(seed: str) -> Any:
         )
     try:
         if candidate.startswith("0x"):
-            return bittensor.Keypair.create_from_seed(candidate)
+            # bittensor-wallet 4.x's stub declares `seed: bytes`, but the Rust
+            # implementation requires a str and raises on bytes — the stub is
+            # inverted. The hex-string call is the working path (verified live).
+            return bittensor.Keypair.create_from_seed(candidate)  # ty: ignore[invalid-argument-type]
         return bittensor.Keypair.create_from_mnemonic(candidate)
     except Exception as exc:
         raise HotkeyConfigError(
