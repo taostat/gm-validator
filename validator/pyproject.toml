@@ -13,13 +13,15 @@ dependencies = [
     # lazily (inside functions) so the test path, which uses
     # MockSubmitter, never loads it; declared here because production
     # and `ty` resolution both need it installed.
-    "bittensor==10.2.0",
-    # bittensor 10.2.0 pins scalecodec==1.2.12 but leaves
-    # async-substrate-interface unbounded (>=1.6.2). Its 2.x line swapped
-    # scalecodec for cyscale and raises on import if scalecodec is present,
-    # so an unbounded resolve to 2.x breaks every real-submitter import.
-    # Hold it on the 1.6.x line bittensor 10.2.0 was built against.
-    "async-substrate-interface>=1.6.2,<2",
+    # 10.5.0 is the first release that encodes netuid as the runtime's
+    # post-upgrade Composite NetUid newtype; 10.2.0 sends a bare int, which
+    # the July 2026 runtime upgrade rejects on every set_weights and
+    # metagraph read ("Invalid type for data: 28 ... type_name: u16").
+    "bittensor==10.5.0",
+    # bittensor 10.5.0 is built on the async-substrate-interface 2.x line
+    # (cyscale; scalecodec removed). Hold 2.x so a future 3.x cannot resolve
+    # in silently — the 1.x→2.x swap broke imports once already.
+    "async-substrate-interface>=2.2,<3",
 ]
 
 [dependency-groups]
