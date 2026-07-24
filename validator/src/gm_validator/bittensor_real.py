@@ -547,9 +547,15 @@ class RealSubmitter:
             uids: Miner uids to set weights for.
             weights: Per-uid u16 weights summing to ``MAX_WEIGHT``.
             epoch_id: Finalized epoch id, for logging only.
-            mechid: Target mechanism id (0 = mech-0). Threaded into the
-                chain ``set_weights`` call so the mech-1 credit lane can set a
-                constant vector on its own mechanism.
+            mechid: Target mechanism id (0 = mech-0). mech-0 rides the public
+                ``subtensor.set_weights`` wrapper unchanged. A non-zero mechid
+                (the Daily gm credit lane) bypasses that wrapper and submits
+                through the mechanism-aware ``set_weights_extrinsic``: on the
+                pinned 10.5.0 the wrapper's rate-limit precheck keys on the
+                bare netuid, which the same-epoch mech-0 submit has just
+                bumped, so it would silently drop this extrinsic. Our own
+                per-mechanism gate (``weight_status(mechid)``) already did the
+                correct rate-limiting.
 
         Raises:
             WeightSubmissionError: ``netuid`` mismatch, malformed input, a
@@ -597,12 +603,35 @@ class RealSubmitter:
             # path regardless of a stray BT_MEV_PROTECTION env var (the SDK
             # default reads it from the env) — the bm validator's effective
             # default.
-            return subtensor.set_weights(
-                wallet=self._wallet,
-                netuid=netuid,
-                uids=uids,
-                weights=weights,
-                mechid=mechid,
+            if mechid == 0:
+                return subtensor.set_weights(
+                    wallet=self._wallet,
+                    netuid=netuid,
+                    uids=uids,
+                    weights=weights,
+                    mechid=mechid,
+                    mev_protection=False,
+                    wait_for_inclusion=True,
+                    wait_for_finalization=True,
+                )
+            # mech-1+: go straight to the mechanism-aware extrinsic, skipping
+            # the wrapper's bare-netuid precheck (see the mechid arg doc). The
+            # weights submodule is imported here (not at module load) to keep
+            # importing this module cheap and free of the bittensor dependency.
+            from bittensor.core.extrinsics import weights as bt_weights
+
+            # ExtrinsicResponse unpacks as (success, message) exactly like the
+            # wrapper's return — the whole SDK surface is treated as Any in this
+            # module (deferred imports, no static bittensor types).
+            set_mechanism_weights: Any = bt_weights.set_weights_extrinsic
+            return set_mechanism_weights(
+                subtensor,
+                self._wallet,
+                netuid,
+                mechid,
+                uids,
+                weights,
+                getattr(bt_weights, "version_as_int", 0),
                 mev_protection=False,
                 wait_for_inclusion=True,
                 wait_for_finalization=True,
