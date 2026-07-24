@@ -469,7 +469,7 @@ class RealSubmitter:
             raise WeightSubmissionError(f"metagraph read failed: {exc}") from exc
         return {hotkey: uid for uid, hotkey in enumerate(metagraph.hotkeys)}
 
-    def weight_status(self) -> ValidatorWeightStatus | None:
+    def weight_status(self, mechid: int = 0) -> ValidatorWeightStatus | None:
         """Read the validator hotkey's own on-chain weight-setting status.
 
         Returns the validator's uid registration, its ``LastUpdate`` block
@@ -529,6 +529,7 @@ class RealSubmitter:
         uids: list[int],
         weights: list[int],
         epoch_id: int,
+        mechid: int = 0,
     ) -> None:
         """Submit one epoch's weight vector to the subnet.
 
@@ -537,6 +538,9 @@ class RealSubmitter:
             uids: Miner uids to set weights for.
             weights: Per-uid u16 weights summing to ``MAX_WEIGHT``.
             epoch_id: Finalized epoch id, for logging only.
+            mechid: Target mechanism id (0 = mech-0). Threaded into the
+                chain ``set_weights`` call so the mech-1 credit lane can set a
+                constant vector on its own mechanism.
 
         Raises:
             WeightSubmissionError: ``netuid`` mismatch, malformed input, a
