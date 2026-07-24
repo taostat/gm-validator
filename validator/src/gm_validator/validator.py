@@ -423,10 +423,19 @@ class Validator:
                 mechid=MECH1_MECHID,
             )
         except Exception:
+            # LOUD, not swallowed: counts in gm_validator_submit_failures_total
+            # and logs at ERROR. mech-1 uses the direct (non-CR) mechanism
+            # extrinsic, so the most likely cause is a commit-reveal-enabled
+            # subnet rejecting it — mech-1 requires commit-reveal OFF (spike-1
+            # netuid-28 prerequisite). mech-0 is unaffected; the epoch stands.
             record_submit_failure()
             LOGGER.exception(
-                "epoch %d: mech-1 constant submit failed — mech-0 stands, epoch counts submitted",
+                "epoch %d: mech-1 constant submit FAILED (netuid=%d) — mech-0 stands, "
+                "epoch counts submitted. Likely cause: commit-reveal is ENABLED for "
+                "mech-1, which rejects the direct set_weights_extrinsic; mech-1 "
+                "requires commit-reveal OFF (spike-1 netuid-28 prerequisite)",
                 epoch_id,
+                self._config.bittensor_netuid,
             )
             return
         LOGGER.info("epoch %d: mech-1 constant vector submitted (uid=%d)", epoch_id, uid)
