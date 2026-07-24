@@ -476,12 +476,20 @@ class RealSubmitter:
         (which advances only when weights are *applied* — the reveal, on a
         commit-reveal subnet), the current head, and the cached rate limit.
 
+        ``LastUpdate`` is per mechanism: it is read at the mechanism's storage
+        index ``mechid * 4096 + netuid`` (``get_mechid_storage_index``), so
+        ``mechid=1`` reports the mech-1 credit lane's own update history
+        independently of mech-0. ``mechid=0`` is byte-identical to the bare
+        ``netuid`` index.
+
         Reads over the long-lived socket. Unlike a submit or head read, a
         failure here is observability-only: it does NOT touch the
         reconnect-failure counter and returns None ("unknown"), so the caller
         falls back to submitting and lets the chain's gate decide rather than
         skipping a tick over a transient read failure.
         """
+        from bittensor.utils import get_mechid_storage_index
+
         self._maybe_reconnect()
         subtensor = self._subtensor
         if subtensor is None:
@@ -505,10 +513,11 @@ class RealSubmitter:
                     current_block=int(head),
                     weights_rate_limit=self._weights_rate_limit,
                 )
+            storage_index = get_mechid_storage_index(self._netuid, mechid)
             last_update = run_with_timeout(
                 "subtensor LastUpdate",
                 lambda: subtensor.substrate.query(
-                    "SubtensorModule", "LastUpdate", [self._netuid]
+                    "SubtensorModule", "LastUpdate", [storage_index]
                 ).value[uid],
                 self._rpc_timeout,
             )
@@ -567,11 +576,12 @@ class RealSubmitter:
             raise WeightSubmissionError(f"epoch {epoch_id}: no subtensor connection available")
 
         LOGGER.info(
-            "submitting weights: netuid=%d epoch=%d n_uids=%d sum=%d",
+            "submitting weights: netuid=%d epoch=%d n_uids=%d sum=%d mechid=%d",
             netuid,
             epoch_id,
             len(uids),
             sum(weights),
+            mechid,
         )
 
         def _set_weights() -> tuple[bool, str | None]:
@@ -592,6 +602,7 @@ class RealSubmitter:
                 netuid=netuid,
                 uids=uids,
                 weights=weights,
+                mechid=mechid,
                 mev_protection=False,
                 wait_for_inclusion=True,
                 wait_for_finalization=True,

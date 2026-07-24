@@ -199,6 +199,7 @@ class ValidatorConfig:
             metrics_bind=_metrics_bind_env("GM_VALIDATOR_METRICS_BIND"),
             subnet_owner_uid=int(_require_env("SUBNET_OWNER_UID")),
             weight_earnings_multiplier=_decimal_env("GM_WEIGHT_EARNINGS_MULTIPLIER", "1"),
+            mech1_contract_uid=_int_env("MECH1_CONTRACT_UID", -1),
         )
 
     def finalized_prefix(self, epoch_id: int) -> str:

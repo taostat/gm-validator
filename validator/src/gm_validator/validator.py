@@ -75,6 +75,10 @@ from gm_validator.scoring import (
 
 LOGGER = logging.getLogger(__name__)
 
+# Mechanism id of the Daily gm credit lane. The 2-mechanism topology fixes
+# this at 1 (mech-0 is the incentive lane); it is a constant, not an env knob.
+MECH1_MECHID = 1
+
 
 @dataclass
 class EpochOutcome:
@@ -376,9 +380,56 @@ class Validator:
         except Exception:
             LOGGER.exception("epoch %d processing failed", epoch_id)
             return None
+        # mech-0 landed. The Daily gm mech-1 leg rides after it and is fully
+        # isolated: its own rate-limit gate, and any failure is swallowed so
+        # the mech-0 outcome stands and the epoch guards still advance.
+        self._submit_mech1(epoch_id)
         self._last_submitted_open_epoch = open_epoch
         self._last_submitted_epoch = epoch_id
         return outcome
+
+    def _submit_mech1(self, epoch_id: int) -> None:
+        """Submit the constant Daily gm credit-lane vector on mechid 1.
+
+        A second submit after mech-0 each epoch: ``[mech1_contract_uid] ->
+        MAX_WEIGHT`` on the mech-1 mechanism. It reads no artifact — the
+        vector is identical every epoch, even an all-burn one. Disabled when
+        ``mech1_contract_uid`` is negative (mech-0 behaviour byte-identical).
+
+        Gated by the mech-1 mechanism's own weight-set rate-limit window
+        (``weight_status(mechid=1)``), independent of the mech-0 gate. Any
+        submit failure is caught here so it never defers the epoch or breaks
+        the mech-0 leg.
+        """
+        uid = self._config.mech1_contract_uid
+        if uid < 0:
+            return
+        status = self._submitter.weight_status(mechid=MECH1_MECHID)
+        if status is not None and status.within_rate_limit_window:
+            LOGGER.info(
+                "epoch %d: mech-1 submit deferred — %d/%d blocks since last mech-1 "
+                "update, inside its rate-limit window",
+                epoch_id,
+                status.blocks_since_last_update,
+                status.weights_rate_limit,
+            )
+            return
+        try:
+            self._submitter.submit(
+                netuid=self._config.bittensor_netuid,
+                uids=[uid],
+                weights=[MAX_WEIGHT],
+                epoch_id=epoch_id,
+                mechid=MECH1_MECHID,
+            )
+        except Exception:
+            record_submit_failure()
+            LOGGER.exception(
+                "epoch %d: mech-1 constant submit failed — mech-0 stands, epoch counts submitted",
+                epoch_id,
+            )
+            return
+        LOGGER.info("epoch %d: mech-1 constant vector submitted (uid=%d)", epoch_id, uid)
 
     def _process_epoch(self, epoch_id: int) -> EpochOutcome:
         mirror_dir = self._mirror.mirror_epoch(epoch_id)
