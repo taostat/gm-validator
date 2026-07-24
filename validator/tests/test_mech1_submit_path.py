@@ -4,18 +4,22 @@ The mech-1 constant-weight submit must NOT ride the public
 ``subtensor.set_weights`` wrapper. On the repo-pinned bittensor 10.5.0 that
 wrapper's rate-limit precheck keys on the BARE netuid (ignores mechid); since
 mech-0 submits first each epoch it reports "just submitted" and silently
-drops the mech-1 extrinsic. So mech-1 goes through
-``bittensor.core.extrinsics.weights.set_weights_extrinsic(subtensor, wallet,
-netuid, mechid=1, uids, weights, version_key, …)``, which builds
-``SubtensorModule.set_mechanism_weights(netuid, mecid=1, …)`` and
-sign-and-sends with NO bare-netuid precheck. It returns the same
-``(success, message)`` shape, preserving the failure/reconnect contract. mech-0
-stays on the public ``subtensor.set_weights`` wrapper, unchanged (dgm-00 §7).
+drops the mech-1 extrinsic. So mech-1 goes through the module-level function
+``set_weights_extrinsic(subtensor, wallet, netuid, mechid=1, uids, weights,
+version_key, …)`` (``bittensor.core.extrinsics.weights``), which composes the
+``SubtensorModule.set_mechanism_weights(netuid, mecid=1, …)`` chain extrinsic
+and sign-and-sends it with NO bare-netuid precheck — returning the same
+``(success, message)`` shape so the failure/reconnect contract is preserved.
+mech-0 stays on the public ``subtensor.set_weights`` wrapper, unchanged
+(dgm-00 §7).
 
-``bittensor`` is faked at the module boundary like ``test_bittensor_real.py``:
-``RealSubmitter`` imports it inside its methods, so a fake module (plus a fake
-``bittensor.core.extrinsics.weights`` submodule) in ``sys.modules`` exercises
-the full path without a chain.
+There is NO ``set_mechanism_weights`` *method* on 10.5.0's ``Subtensor`` — the
+seam is the module function. This suite patches it where ``RealSubmitter``
+imports it (a module-level patch on ``gm_validator.bittensor_real``) AND fakes
+the ``bittensor.core.extrinsics.weights`` submodule, so the spy is hit whether
+the builder binds the symbol at module top level or imports it lazily inside
+``submit``. ``bittensor`` itself is faked at the module boundary for
+construction, like ``test_bittensor_real.py``.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ import types
 
 import pytest
 
+import gm_validator.bittensor_real as bittensor_real
 from gm_validator.alpha_economics import MAX_WEIGHT
 from gm_validator.bittensor_adapter import MockSubmitter
 
@@ -74,10 +79,13 @@ class _FakeSubtensor:
 def _install_fake_bittensor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[_FakeSubtensor, list[dict]]:
-    """Fake ``bittensor`` + the ``core.extrinsics.weights`` submodule.
+    """Fake ``bittensor`` for construction and intercept ``set_weights_extrinsic``.
 
     Returns the fake subtensor (records wrapper ``set_weights`` calls) and a
-    list capturing every ``set_weights_extrinsic`` call (the mech-1 path).
+    list capturing every ``set_weights_extrinsic`` call (the mech-1 path). The
+    spy is bound both as a module-level symbol on ``gm_validator.bittensor_real``
+    and on a faked ``bittensor.core.extrinsics.weights`` submodule, so it is hit
+    regardless of the import style the builder uses.
     """
     subtensor = _FakeSubtensor()
     extrinsic_calls: list[dict] = []
@@ -101,6 +109,11 @@ def _install_fake_bittensor(
         ("bittensor.core.extrinsics.weights", weights_mod),
     ):
         monkeypatch.setitem(sys.modules, name, module)
+
+    # Module-level patch on the seam where RealSubmitter references the symbol.
+    monkeypatch.setattr(
+        bittensor_real, "set_weights_extrinsic", _set_weights_extrinsic, raising=False
+    )
     return subtensor, extrinsic_calls
 
 
@@ -124,13 +137,12 @@ def test_mock_submitter_records_mechid() -> None:
 
 
 def test_mech1_submit_uses_set_weights_extrinsic(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A ``mechid=1`` submit goes through ``set_weights_extrinsic`` (mechid=1),
-    bypassing the bare-netuid ``subtensor.set_weights`` wrapper that would
-    silently drop it after the mech-0 submit."""
+    """A ``mechid=1`` submit goes through the ``set_weights_extrinsic`` module
+    function (mechid=1), bypassing the bare-netuid ``subtensor.set_weights``
+    wrapper that would silently drop it after the mech-0 submit."""
     subtensor, extrinsic_calls = _install_fake_bittensor(monkeypatch)
-    from gm_validator.bittensor_real import RealSubmitter
 
-    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    submitter = bittensor_real.RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
     submitter.submit(netuid=42, uids=[250], weights=[MAX_WEIGHT], epoch_id=9, mechid=1)
 
     # The public wrapper is bypassed entirely for mech-1.
@@ -148,9 +160,8 @@ def test_mech0_submit_uses_set_weights_wrapper(monkeypatch: pytest.MonkeyPatch) 
     """A default (mech-0) submit stays on the public ``subtensor.set_weights``
     wrapper unchanged and never touches ``set_weights_extrinsic``."""
     subtensor, extrinsic_calls = _install_fake_bittensor(monkeypatch)
-    from gm_validator.bittensor_real import RealSubmitter
 
-    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
+    submitter = bittensor_real.RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
     submitter.submit(netuid=42, uids=[0, 1], weights=[100, MAX_WEIGHT - 100], epoch_id=9)
 
     assert len(subtensor.calls) == 1
