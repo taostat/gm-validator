@@ -623,8 +623,8 @@ class RealSubmitter:
             # ExtrinsicResponse unpacks as (success, message) exactly like the
             # wrapper's return — the whole SDK surface is treated as Any in this
             # module (deferred imports, no static bittensor types).
-            set_mechanism_weights: Any = bt_weights.set_weights_extrinsic
-            return set_mechanism_weights(
+            submit_extrinsic: Any = bt_weights.set_weights_extrinsic
+            return submit_extrinsic(
                 subtensor,
                 self._wallet,
                 netuid,
