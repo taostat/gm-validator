@@ -65,11 +65,13 @@ class ValidatorWeightStatus:
 class Submitter(Protocol):
     """Minimal interface the validator uses for weight submission."""
 
-    def submit(self, *, netuid: int, uids: list[int], weights: list[int], epoch_id: int) -> None:
-        """Submit one epoch's weights to the subnet."""
+    def submit(
+        self, *, netuid: int, uids: list[int], weights: list[int], epoch_id: int, mechid: int = 0
+    ) -> None:
+        """Submit one epoch's weights to a mechanism (``mechid`` 0 = mech-0)."""
         ...
 
-    def weight_status(self) -> ValidatorWeightStatus | None:
+    def weight_status(self, mechid: int = 0) -> ValidatorWeightStatus | None:
         """Return the validator hotkey's on-chain weight status, or None.
 
         None means 'unknown' (mock mode, or a transient chain read failure) —
@@ -133,17 +135,21 @@ class MockSubmitter:
 
     calls: list[dict] = field(default_factory=list)
     status: ValidatorWeightStatus | None = None
+    mech1_status: ValidatorWeightStatus | None = None
 
-    def weight_status(self) -> ValidatorWeightStatus | None:
-        return self.status
+    def weight_status(self, mechid: int = 0) -> ValidatorWeightStatus | None:
+        return self.mech1_status if mechid else self.status
 
-    def submit(self, *, netuid: int, uids: list[int], weights: list[int], epoch_id: int) -> None:
+    def submit(
+        self, *, netuid: int, uids: list[int], weights: list[int], epoch_id: int, mechid: int = 0
+    ) -> None:
         LOGGER.info(
-            "mock submit: netuid=%d epoch=%d n_uids=%d sum=%d",
+            "mock submit: netuid=%d epoch=%d n_uids=%d sum=%d mechid=%d",
             netuid,
             epoch_id,
             len(uids),
             sum(weights),
+            mechid,
         )
         self.calls.append(
             {
@@ -151,5 +157,6 @@ class MockSubmitter:
                 "uids": list(uids),
                 "weights": list(weights),
                 "epoch_id": epoch_id,
+                "mechid": mechid,
             }
         )

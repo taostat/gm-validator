@@ -469,12 +469,18 @@ class RealSubmitter:
             raise WeightSubmissionError(f"metagraph read failed: {exc}") from exc
         return {hotkey: uid for uid, hotkey in enumerate(metagraph.hotkeys)}
 
-    def weight_status(self) -> ValidatorWeightStatus | None:
+    def weight_status(self, mechid: int = 0) -> ValidatorWeightStatus | None:
         """Read the validator hotkey's own on-chain weight-setting status.
 
         Returns the validator's uid registration, its ``LastUpdate`` block
         (which advances only when weights are *applied* — the reveal, on a
         commit-reveal subnet), the current head, and the cached rate limit.
+
+        ``LastUpdate`` is per mechanism: it is read at the mechanism's storage
+        index ``mechid * 4096 + netuid`` (``get_mechid_storage_index``), so
+        ``mechid=1`` reports the mech-1 credit lane's own update history
+        independently of mech-0. ``mechid=0`` is byte-identical to the bare
+        ``netuid`` index.
 
         Reads over the long-lived socket. Unlike a submit or head read, a
         failure here is observability-only: it does NOT touch the
@@ -482,6 +488,8 @@ class RealSubmitter:
         falls back to submitting and lets the chain's gate decide rather than
         skipping a tick over a transient read failure.
         """
+        from bittensor.utils import get_mechid_storage_index
+
         self._maybe_reconnect()
         subtensor = self._subtensor
         if subtensor is None:
@@ -505,10 +513,11 @@ class RealSubmitter:
                     current_block=int(head),
                     weights_rate_limit=self._weights_rate_limit,
                 )
+            storage_index = get_mechid_storage_index(self._netuid, mechid)
             last_update = run_with_timeout(
                 "subtensor LastUpdate",
                 lambda: subtensor.substrate.query(
-                    "SubtensorModule", "LastUpdate", [self._netuid]
+                    "SubtensorModule", "LastUpdate", [storage_index]
                 ).value[uid],
                 self._rpc_timeout,
             )
@@ -529,6 +538,7 @@ class RealSubmitter:
         uids: list[int],
         weights: list[int],
         epoch_id: int,
+        mechid: int = 0,
     ) -> None:
         """Submit one epoch's weight vector to the subnet.
 
@@ -537,6 +547,15 @@ class RealSubmitter:
             uids: Miner uids to set weights for.
             weights: Per-uid u16 weights summing to ``MAX_WEIGHT``.
             epoch_id: Finalized epoch id, for logging only.
+            mechid: Target mechanism id (0 = mech-0). mech-0 rides the public
+                ``subtensor.set_weights`` wrapper unchanged. A non-zero mechid
+                (the Daily gm credit lane) bypasses that wrapper and submits
+                through the mechanism-aware ``set_weights_extrinsic``: on the
+                pinned 10.5.0 the wrapper's rate-limit precheck keys on the
+                bare netuid, which the same-epoch mech-0 submit has just
+                bumped, so it would silently drop this extrinsic. Our own
+                per-mechanism gate (``weight_status(mechid)``) already did the
+                correct rate-limiting.
 
         Raises:
             WeightSubmissionError: ``netuid`` mismatch, malformed input, a
@@ -563,11 +582,12 @@ class RealSubmitter:
             raise WeightSubmissionError(f"epoch {epoch_id}: no subtensor connection available")
 
         LOGGER.info(
-            "submitting weights: netuid=%d epoch=%d n_uids=%d sum=%d",
+            "submitting weights: netuid=%d epoch=%d n_uids=%d sum=%d mechid=%d",
             netuid,
             epoch_id,
             len(uids),
             sum(weights),
+            mechid,
         )
 
         def _set_weights() -> tuple[bool, str | None]:
@@ -583,11 +603,35 @@ class RealSubmitter:
             # path regardless of a stray BT_MEV_PROTECTION env var (the SDK
             # default reads it from the env) — the bm validator's effective
             # default.
-            return subtensor.set_weights(
-                wallet=self._wallet,
-                netuid=netuid,
-                uids=uids,
-                weights=weights,
+            if mechid == 0:
+                return subtensor.set_weights(
+                    wallet=self._wallet,
+                    netuid=netuid,
+                    uids=uids,
+                    weights=weights,
+                    mechid=mechid,
+                    mev_protection=False,
+                    wait_for_inclusion=True,
+                    wait_for_finalization=True,
+                )
+            # mech-1+: go straight to the mechanism-aware extrinsic, skipping
+            # the wrapper's bare-netuid precheck (see the mechid arg doc). The
+            # weights submodule is imported here (not at module load) to keep
+            # importing this module cheap and free of the bittensor dependency.
+            from bittensor.core.extrinsics import weights as bt_weights
+
+            # ExtrinsicResponse unpacks as (success, message) exactly like the
+            # wrapper's return — the whole SDK surface is treated as Any in this
+            # module (deferred imports, no static bittensor types).
+            submit_extrinsic: Any = bt_weights.set_weights_extrinsic
+            return submit_extrinsic(
+                subtensor,
+                self._wallet,
+                netuid,
+                mechid,
+                uids,
+                weights,
+                getattr(bt_weights, "version_as_int", 0),
                 mev_protection=False,
                 wait_for_inclusion=True,
                 wait_for_finalization=True,

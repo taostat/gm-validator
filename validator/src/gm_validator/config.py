@@ -162,6 +162,13 @@ class ValidatorConfig:
     # no-op). See scoring.compute_weights.
     weight_earnings_multiplier: Decimal
 
+    # UID of the Mech1Escrow contract's neuron on the subnet. Each epoch the
+    # validator sets a constant 100% weight to this UID on the mech-1
+    # mechanism (Daily gm credit lane). A negative value — the default —
+    # disables the mech-1 leg entirely, leaving mech-0 behaviour
+    # byte-identical. Env: MECH1_CONTRACT_UID.
+    mech1_contract_uid: int = -1
+
     @classmethod
     def from_env(cls) -> ValidatorConfig:
         """Build from environment variables.
@@ -192,6 +199,7 @@ class ValidatorConfig:
             metrics_bind=_metrics_bind_env("GM_VALIDATOR_METRICS_BIND"),
             subnet_owner_uid=int(_require_env("SUBNET_OWNER_UID")),
             weight_earnings_multiplier=_decimal_env("GM_WEIGHT_EARNINGS_MULTIPLIER", "1"),
+            mech1_contract_uid=_int_env("MECH1_CONTRACT_UID", -1),
         )
 
     def finalized_prefix(self, epoch_id: int) -> str:
