@@ -191,6 +191,19 @@ class Validator:
                     status.blocks_since_last_update,
                     status.weights_rate_limit,
                 )
+            elif status is not None and status.timelocked_commit_queue_full:
+                # One pending timed commit in the active epoch bucket is enough
+                # for this validator. More are duplicate submissions caused by
+                # restarts or duplicate runners and can fill the chain's hard
+                # unrevealed-commit limit, so defer until the bucket advances or
+                # the commit clears.
+                LOGGER.info(
+                    "epoch %d ready but validator already has %d pending timed "
+                    "weight commit(s) in the active bucket (limit %d) — deferring submit",
+                    target,
+                    status.pending_timelocked_commits,
+                    status.pending_timelocked_commit_limit,
+                )
             else:
                 outcome = self._process_target_epoch(open_epoch, target)
                 if outcome is not None:
@@ -200,13 +213,13 @@ class Validator:
         return outcomes
 
     def _observe_weight_status(self, status: ValidatorWeightStatus | None) -> None:
-        """Log on-chain weight status and detect a commit-reveal reveal.
+        """Log on-chain weight status and detect last-update advances.
 
-        Mirrors bm's ``blocks_since_last_update`` visibility. ``last_update``
-        advancing means weights were *applied* on-chain — on a commit-reveal
-        subnet that is a reveal landing, the strongest signal the commit
-        pipeline is healthy end-to-end. A None status (mock mode or a
-        transient read failure) is silently ignored.
+        Mirrors bm's ``blocks_since_last_update`` visibility. On timed
+        commit/reveal subnets, ``last_update`` can advance when the commit is
+        accepted, so reveal health is tracked through the pending timed-commit
+        queue instead. A None status (mock mode or a transient read failure) is
+        silently ignored.
         """
         if status is None:
             return
@@ -218,6 +231,12 @@ class Validator:
             status.blocks_since_last_update,
             status.weights_rate_limit,
         )
+        if status.pending_timelocked_commits is not None:
+            LOGGER.info(
+                "validator timed weight commits: %d pending (local submit limit %d)",
+                status.pending_timelocked_commits,
+                status.pending_timelocked_commit_limit,
+            )
         latest = status.last_update_block
         if (
             self._last_update_block is not None
@@ -225,8 +244,7 @@ class Validator:
             and latest > self._last_update_block
         ):
             LOGGER.info(
-                "validator weights applied on-chain: last_update advanced %d -> %d "
-                "(commit-reveal reveal landed)",
+                "validator weight status advanced on-chain: last_update advanced %d -> %d",
                 self._last_update_block,
                 latest,
             )
