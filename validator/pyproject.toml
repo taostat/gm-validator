@@ -8,7 +8,7 @@ authors = [{ name = "gm contributors" }]
 dependencies = [
     "boto3>=1.35,<2",
     "pydantic>=2.10,<3",
-    "prometheus-client>=0.21,<0.23",
+    "prometheus-client>=0.21,<0.26",
     # Real on-chain weight submission + metagraph uid lookup. Imported
     # lazily (inside functions) so the test path, which uses
     # MockSubmitter, never loads it; declared here because production
@@ -17,7 +17,7 @@ dependencies = [
     # post-upgrade Composite NetUid newtype; 10.2.0 sends a bare int, which
     # the July 2026 runtime upgrade rejects on every set_weights and
     # metagraph read ("Invalid type for data: 28 ... type_name: u16").
-    "bittensor==10.5.0",
+    "bittensor==11.0.0",
     # bittensor 10.5.0 is built on the async-substrate-interface 2.x line
     # (cyscale; scalecodec removed). Hold 2.x so a future 3.x cannot resolve
     # in silently — the 1.x→2.x swap broke imports once already.
@@ -33,7 +33,7 @@ dev = [
     "boto3-stubs[s3]>=1.35",
     "moto[s3]>=5.0",
     # Test-only: the integration test compresses a raw.jsonl fixture.
-    "zstandard>=0.23,<0.24",
+    "zstandard>=0.23,<0.26",
 ]
 
 [build-system]
