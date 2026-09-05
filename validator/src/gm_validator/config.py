@@ -98,10 +98,9 @@ class ValidatorConfig:
     # finalizer/registry divisor or the `finalized/epoch=<N>/` S3 paths
     # this validator probes desync. Env: BLOCKS_PER_EPOCH.
     blocks_per_epoch: int
-    # How many epochs back from the newest closed epoch to probe for a
-    # `_FINALIZED` marker before giving up for this tick. Tolerates the
-    # finalizer lagging the chain by a few epochs without a full S3 scan.
-    # Env: FINALIZED_LOOKBACK_EPOCHS.
+    # Deprecated compatibility setting. Submission now waits for the exact
+    # newest closed epoch; using an older artifact shifts reveal attribution.
+    # Env: FINALIZED_LOOKBACK_EPOCHS (ignored by the submit path).
     finalized_lookback_epochs: int
 
     # Bittensor.
