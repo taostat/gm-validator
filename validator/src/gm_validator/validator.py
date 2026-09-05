@@ -8,10 +8,9 @@ Loop (one ``process_once`` tick):
    ``E = head_block // blocks_per_epoch`` — the same derivation the
    epoch-finalizer uses. The chain head IS the discovery cursor.
 3. Target the newest *closed* epoch ``E-1``. If its ``_FINALIZED`` marker
-   is absent (the finalizer is lagging), walk back a small bounded
-   window to find the newest finalized epoch. Each probe is a single
-   targeted ``head_object`` — never a list+scan of the epoch history.
-   If none in the window is finalized yet, do nothing this tick.
+   is absent, do nothing and retry this exact epoch later in the same open
+   epoch. Submitting an older artifact consumes the one allowed submission
+   window and shifts later chain payouts away from their artifact epochs.
 4. Epoch-window guard: skip if the target is ``<= _last_submitted_epoch``
    (already handled this epoch). Submitting at most once per epoch
    respects the chain's ~100-block weight-set rate limit, which is well
@@ -148,10 +147,7 @@ class Validator:
         #   the chain head stays in one open epoch; submitting each would
         #   trip the chain's ~100-block weight-set rate limit.
         # - Target dedup guard: never re-submit a finalized epoch already
-        #   submitted. When the finalizer stalls but the chain advances,
-        #   the bounded walk-back keeps resolving the same older target
-        #   across successive open epochs; the rate guard alone would let
-        #   each new open epoch re-submit that stale vector.
+        #   submitted after a restart or unusual chain-head regression.
         #
         # A submit needs BOTH a fresh open epoch and a newer target.
         self._last_submitted_open_epoch: int | None = None
@@ -162,12 +158,12 @@ class Validator:
         self._last_update_block: int | None = None
 
     def process_once(self) -> list[EpochOutcome]:
-        """One tick: target the newest finalized epoch and submit its weights.
+        """One tick: submit the exact newest closed epoch once it is finalized.
 
         Refreshes the metagraph lookup when configured, then uses the
         chain head block as the discovery cursor — there is no S3 scan.
-        Targets the newest closed epoch ``E-1``, walking back a bounded
-        window if the finalizer lags, then submits at most once per open
+        Targets the newest closed epoch ``E-1``, waiting when the finalizer
+        lags, then submits at most once per open
         chain epoch (the ``_last_submitted_open_epoch`` guard). Returns
         the processed epoch's outcome, or an empty list when nothing was
         ready or this open epoch was already handled.
@@ -277,11 +273,11 @@ class Validator:
         """Resolve ``(open_epoch, target)`` to score this tick, or None.
 
         Reads the chain head, derives the newest closed epoch ``E-1``,
-        finds the newest finalized epoch within the bounded walk-back
-        window, and applies both submit guards (one submit per open epoch,
-        never re-submit a target already submitted). Returns None when the
+        requires that exact epoch's finalized marker, and applies both submit
+        guards (one submit per open epoch, never re-submit a target already
+        submitted). Returns None when the
         chain head is unreadable, the chain is too early to have a closed
-        epoch, no probed epoch is finalized yet, this open epoch already
+        epoch, that epoch is not finalized yet, this open epoch already
         submitted, or the target was already submitted.
         """
         open_epoch = self._cursor.current_epoch()
@@ -300,13 +296,11 @@ class Validator:
             )
             return None
 
-        target = self._mirror.latest_finalized_epoch(
-            newest_closed, self._config.finalized_lookback_epochs
-        )
+        target = self._mirror.latest_finalized_epoch(newest_closed, lookback=0)
         if target is None:
             LOGGER.info(
-                "no finalized epoch in [%d, %d]: finalizer still lagging, retry next tick",
-                max(newest_closed - self._config.finalized_lookback_epochs, 0),
+                "newest closed epoch %d is not finalized: waiting rather than submitting "
+                "a stale artifact, retry next tick",
                 newest_closed,
             )
             return None

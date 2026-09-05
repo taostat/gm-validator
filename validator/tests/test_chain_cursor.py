@@ -197,8 +197,8 @@ def test_no_submit_when_nothing_finalized(tmp_path: pathlib.Path) -> None:
         assert submitter.calls == []
 
 
-def test_walk_back_finds_finalized_when_finalizer_lags(tmp_path: pathlib.Path) -> None:
-    """Newest closed epoch unfinalized, but an earlier one is -> submit that."""
+def test_validator_waits_for_exact_epoch_when_finalizer_lags(tmp_path: pathlib.Path) -> None:
+    """An older marker must not consume the current epoch's submission window."""
     with mock_aws():
         s3 = _bucket()
         # Open epoch 53 -> newest closed 52; only 50 is finalized (within
@@ -209,8 +209,8 @@ def test_walk_back_finds_finalized_when_finalizer_lags(tmp_path: pathlib.Path) -
         submitter = MockSubmitter()
         validator = _validator(tmp_path, s3, MockChainCursor(epoch=53), submitter)
 
-        outcomes = validator.process_once()
-        assert [o.epoch_id for o in outcomes] == [50]
+        assert validator.process_once() == []
+        assert submitter.calls == []
 
 
 def test_epoch_window_guard_blocks_resubmit(tmp_path: pathlib.Path) -> None:
@@ -230,11 +230,8 @@ def test_epoch_window_guard_blocks_resubmit(tmp_path: pathlib.Path) -> None:
         assert len(submitter.calls) == 1
 
 
-def test_finalizer_catchup_within_one_open_epoch_submits_once(tmp_path: pathlib.Path) -> None:
-    """The finalizer catching up from lag while the chain head stays in one
-    open epoch must NOT trigger a fresh submit per newly-finalized epoch —
-    the per-open-epoch guard caps it at one submit, respecting the chain's
-    ~100-block weight-set rate limit."""
+def test_finalizer_catchup_waits_then_submits_exact_epoch(tmp_path: pathlib.Path) -> None:
+    """Waiting preserves the window for the exact newest closed artifact."""
     with mock_aws():
         s3 = _bucket()
         # Open epoch stays at 54 across ticks; newest closed is 53.
@@ -242,15 +239,14 @@ def test_finalizer_catchup_within_one_open_epoch_submits_once(tmp_path: pathlib.
         submitter = MockSubmitter()
         validator = _validator(tmp_path, s3, cursor, submitter)
 
-        # Tick 1: only epoch 51 finalized so far -> submit 51.
+        # Tick 1: only epoch 51 finalized so far -> wait for exact epoch 53.
         _populate_epoch(
             s3, epoch_id=51, records=[_record("01A" + "A" * 23, _MINER_A)], emissions_alpha="0.0001"
         )
-        assert [o.epoch_id for o in validator.process_once()] == [51]
+        assert validator.process_once() == []
 
-        # Tick 2: the finalizer catches up and publishes 52 and 53, but the
-        # chain head has NOT advanced (still open epoch 54). The guard must
-        # block a second submit this window.
+        # Tick 2: catch-up publishes 52 and 53 while the chain remains open 54;
+        # the still-unused window submits 53, never the stale intermediate.
         for epoch_id in (52, 53):
             _populate_epoch(
                 s3,
@@ -258,14 +254,12 @@ def test_finalizer_catchup_within_one_open_epoch_submits_once(tmp_path: pathlib.
                 records=[_record("01A" + "A" * 23, _MINER_A)],
                 emissions_alpha="0.0001",
             )
-        assert validator.process_once() == []
+        assert [o.epoch_id for o in validator.process_once()] == [53]
         assert len(submitter.calls) == 1
 
 
-def test_stalled_finalizer_does_not_resubmit_same_target(tmp_path: pathlib.Path) -> None:
-    """When the finalizer stalls but the chain advances, the bounded
-    walk-back keeps resolving the same older target. The target-dedup guard
-    must block re-submitting that stale weight vector each new open epoch."""
+def test_stalled_finalizer_never_submits_an_older_target(tmp_path: pathlib.Path) -> None:
+    """A stale finalized marker remains ineligible as chain epochs advance."""
     with mock_aws():
         s3 = _bucket()
         # Only epoch 50 is ever finalized; the finalizer is stalled.
@@ -273,16 +267,15 @@ def test_stalled_finalizer_does_not_resubmit_same_target(tmp_path: pathlib.Path)
             s3, epoch_id=50, records=[_record("01A" + "A" * 23, _MINER_A)], emissions_alpha="0.0001"
         )
         submitter = MockSubmitter()
-        cursor = MockChainCursor(epoch=52)  # newest closed 51; walk back finds 50
+        cursor = MockChainCursor(epoch=52)
         validator = _validator(tmp_path, s3, cursor, submitter)
 
-        assert [o.epoch_id for o in validator.process_once()] == [50]
+        assert validator.process_once() == []
 
-        # Chain advances to open epoch 53 (newest closed 52); the walk-back
-        # still only finds 50. A fresh open epoch alone must NOT re-submit.
+        # Chain advances, but exact epoch 52 is also absent.
         cursor.epoch = 53
         assert validator.process_once() == []
-        assert len(submitter.calls) == 1
+        assert submitter.calls == []
 
 
 def test_advancing_epoch_triggers_next_submit(tmp_path: pathlib.Path) -> None:

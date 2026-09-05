@@ -3,7 +3,7 @@
 The on-chain weight-setter for the gm Bittensor subnet.
 
 Each tick the validator derives the open epoch from the chain head, targets
-the newest finalized epoch, mirrors its artifact set
+the exact newest closed epoch when its finalized marker is available, mirrors its artifact set
 (`aggregated.jsonl` + `epoch_summary.json`) from S3, scores each miner from
 the cost-derived rows, and submits a u16 weight vector via
 `subtensor.set_weights()`.
