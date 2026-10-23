@@ -42,13 +42,17 @@ def fingerprints(pem: str) -> list[str]:
     blocks = _PEM_BLOCK.findall(pem)
     if len(blocks) != pem.count("-----BEGIN CERTIFICATE-----"):
         raise BundleError("unterminated or nested certificate block")
-    try:
-        return [
-            hashlib.sha256(ssl.PEM_cert_to_DER_cert(block)).hexdigest().upper()
-            for block in blocks
-        ]
-    except ValueError as exc:
-        raise BundleError(f"unparseable certificate: {exc}") from exc
+    found = []
+    for block in blocks:
+        try:
+            der = ssl.PEM_cert_to_DER_cert(block)
+            # PEM_cert_to_DER_cert only decodes base64; loading the DER makes
+            # OpenSSL parse it as X.509, so non-certificate bytes are rejected.
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=der)
+        except (ValueError, ssl.SSLError) as exc:
+            raise BundleError(f"unparseable certificate: {exc}") from exc
+        found.append(hashlib.sha256(der).hexdigest().upper())
+    return found
 
 
 def check_bundle(path: Path) -> int:
