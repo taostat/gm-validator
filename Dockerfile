@@ -12,7 +12,7 @@ ENV SOURCE_DATE_EPOCH=1700000000 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.9 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.4@sha256:9f130421e930bfbdc563c00740466603f8723158e90297d07957c2294640262b /uv /usr/local/bin/uv
 
 WORKDIR /app
 
@@ -41,7 +41,18 @@ ENV SOURCE_DATE_EPOCH=1700000000 \
 # PermissionError on /home/app (the k8s deployment used to paper over it with
 # a HOME env + emptyDir mount; baking it into the image fixes every run path —
 # docker compose, bare docker, and k8s alike).
-RUN groupadd --gid 1000 app \
+# The base image ships ca-certificates 20230311+deb12u1; this upgrades it to
+# the current bookworm-security release, and the check after the venv copy
+# fails the build if a removed root is still in the OS bundle or in the venv's
+# certifi (scripts/check_ca_bundle.py). Unpinned on purpose: operators rebuild
+# this image themselves from main (scripts/autoupdate.sh), and the security
+# mirror drops superseded versions, so a pin would eventually fail their
+# rebuilds where nobody sees it. taostat/gm pins the version because it builds
+# in CI, where a failed build is visible.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 app \
     && useradd --uid 1000 --gid 1000 --create-home app \
     && mkdir -p /home/app/.bittensor \
     && chown -R 1000:1000 /home/app
@@ -50,6 +61,8 @@ WORKDIR /app
 
 # Python venv (carries the editable gm-validator install) + source.
 COPY --from=py-build /app/.venv /app/.venv
+RUN --mount=type=bind,source=scripts/check_ca_bundle.py,target=/tmp/check_ca_bundle.py \
+    python -I /tmp/check_ca_bundle.py /etc/ssl/certs/ca-certificates.crt "$(python -m certifi)"
 COPY validator/src/ validator/src/
 
 # Local S3 mirror — the validator copies finalized artifacts here as
