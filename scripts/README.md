@@ -107,3 +107,10 @@ This won't survive reboots — combine with `@reboot` cron if needed.
   checkout rather than refusing to run.)
 - If a build fails, the previous container keeps running and the script
   retries on the next cycle.
+
+## `check_ca_bundle.py`
+
+Stdlib-only build step run by the `Dockerfile`. It fails the image build if
+the OS CA bundle or the venv's certifi bundle is empty or malformed, or still
+carries a root Mozilla has removed (matched by SHA-256 fingerprint). It is a
+copy of taostat/gm `scripts/check_ca_bundle.py`; keep the two in step.
