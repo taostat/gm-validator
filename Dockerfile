@@ -41,13 +41,16 @@ ENV SOURCE_DATE_EPOCH=1700000000 \
 # PermissionError on /home/app (the k8s deployment used to paper over it with
 # a HOME env + emptyDir mount; baking it into the image fixes every run path —
 # docker compose, bare docker, and k8s alike).
-# The base image ships ca-certificates 20230311+deb12u1. Pin the
-# bookworm-security release that carries Mozilla's current root store; the
-# check after the venv copy fails the build if a removed root is still in the
-# OS bundle or in the venv's certifi (scripts/check_ca_bundle.py).
-# Update the pin via: apt-cache policy ca-certificates (in this base image)
+# The base image ships ca-certificates 20230311+deb12u1; this upgrades it to
+# the current bookworm-security release, and the check after the venv copy
+# fails the build if a removed root is still in the OS bundle or in the venv's
+# certifi (scripts/check_ca_bundle.py). Unpinned on purpose: operators rebuild
+# this image themselves from main (scripts/autoupdate.sh), and the security
+# mirror drops superseded versions, so a pin would eventually fail their
+# rebuilds where nobody sees it. taostat/gm pins the version because it builds
+# in CI, where a failed build is visible.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates=20250419~deb12u2 \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 app \
     && useradd --uid 1000 --gid 1000 --create-home app \
