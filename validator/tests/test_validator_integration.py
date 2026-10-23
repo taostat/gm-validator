@@ -603,11 +603,58 @@ def test_validator_skips_submit_inside_rate_limit_window(
         assert validator._last_submitted_epoch == 7
 
 
-def test_validator_logs_reveal_when_last_update_advances(
+def test_validator_skips_submit_when_timed_commit_bucket_already_has_commit(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """An advance in the on-chain ``last_update`` block — weights applied,
-    i.e. a commit-reveal reveal landing — is detected and logged."""
+    """A pending timed commit in the active bucket means this validator has
+    already submitted for that bucket. Defer instead of stacking duplicate
+    commits toward the chain's unrevealed-commit hard limit."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        miner_a = "5Ehm" + "A" * 44
+        _populate_epoch(
+            s3,
+            epoch_id=7,
+            records=[_record("01AAAAAAAAAAAAAAAAAAAAAAAA", miner_a)],
+            emissions_alpha="0.0001",
+        )
+
+        submitter = MockSubmitter(
+            status=ValidatorWeightStatus(
+                registered=True,
+                last_update_block=1000,
+                current_block=1200,
+                weights_rate_limit=1,
+                pending_timelocked_commits=1,
+                pending_timelocked_commit_limit=1,
+            )
+        )
+        validator = Validator(
+            _config(tmp_path),
+            S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
+            submitter,
+            _cursor_targeting(7),
+            miner_uid_lookup={miner_a: 0},
+        )
+
+        with caplog.at_level(logging.INFO, logger="gm_validator.validator"):
+            outcomes = validator.process_once()
+
+        assert outcomes == []
+        assert submitter.calls == []
+        assert validator._last_submitted_epoch is None
+        assert "already has 1 pending timed weight commit" in caplog.text
+
+
+def test_validator_logs_status_advance_when_last_update_advances(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An advance in the on-chain ``last_update`` block is detected and logged.
+
+    On timed commit/reveal subnets this can be a commit acceptance rather than
+    a reveal, so the log deliberately avoids claiming reveal success.
+    """
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -632,7 +679,7 @@ def test_validator_logs_reveal_when_last_update_advances(
 
         submitter.status = ValidatorWeightStatus(
             registered=True,
-            last_update_block=1450,  # advanced -> a reveal landed
+            last_update_block=1450,
             current_block=1500,
             weights_rate_limit=100,
         )
@@ -640,7 +687,6 @@ def test_validator_logs_reveal_when_last_update_advances(
             validator.process_once()
 
         assert "last_update advanced 1000 -> 1450" in caplog.text
-        assert "reveal landed" in caplog.text
 
 
 class _FailingSubmitter:

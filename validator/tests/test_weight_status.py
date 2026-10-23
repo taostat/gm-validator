@@ -43,3 +43,19 @@ def test_boundary_is_inclusive() -> None:
 def test_zero_rate_limit_disables_pre_gate() -> None:
     # rate_limit 0 (unknown/unreadable) -> never pre-gate; chain decides.
     assert _status(last_update=100, head=101, rate_limit=0).within_rate_limit_window is False
+
+
+def test_timelocked_queue_full_at_local_limit() -> None:
+    status = ValidatorWeightStatus(
+        registered=True,
+        last_update_block=100,
+        current_block=150,
+        weights_rate_limit=1,
+        pending_timelocked_commits=1,
+        pending_timelocked_commit_limit=1,
+    )
+    assert status.timelocked_commit_queue_full is True
+
+
+def test_unknown_timelocked_queue_does_not_pre_gate() -> None:
+    assert _status(last_update=100, head=150, rate_limit=1).timelocked_commit_queue_full is False
