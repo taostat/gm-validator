@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from decimal import Decimal
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _require_env(name: str) -> str:
@@ -91,18 +94,6 @@ class ValidatorConfig:
     # How many of the most-recent epoch mirrors to keep on disk; older
     # ones are pruned each tick. Env: MIRROR_RETENTION_EPOCHS.
     mirror_retention_epochs: int
-    # Chain epoch length (`tempo + 1` = 361). A Bittensor subnet runs
-    # consensus/emission every `tempo + 1` blocks, so the chain head block
-    # divided by 361 gives the current epoch id — the same derivation the
-    # finalizer uses (`block // blocks_per_epoch`). Must equal the gm
-    # finalizer/registry divisor or the `finalized/epoch=<N>/` S3 paths
-    # this validator probes desync. Env: BLOCKS_PER_EPOCH.
-    blocks_per_epoch: int
-    # Deprecated compatibility setting. Submission now waits for the exact
-    # newest closed epoch; using an older artifact shifts reveal attribution.
-    # Env: FINALIZED_LOOKBACK_EPOCHS (ignored by the submit path).
-    finalized_lookback_epochs: int
-
     # Bittensor.
     bittensor_netuid: int
     bittensor_endpoint: str | None
@@ -168,6 +159,9 @@ class ValidatorConfig:
         Raises:
             ValueError: A required environment variable is missing.
         """
+        for name in ("BLOCKS_PER_EPOCH", "FINALIZED_LOOKBACK_EPOCHS"):
+            if name in os.environ:
+                LOGGER.warning("%s is ignored; epoch targets come from finalized/latest.json", name)
         return cls(
             s3_bucket=_require_env("S3_BUCKET"),
             s3_prefix=os.environ.get("S3_PREFIX", "v1").strip("/"),
@@ -176,8 +170,6 @@ class ValidatorConfig:
             s3_anonymous=os.environ.get("GM_VALIDATOR_S3_ANONYMOUS", "0") in {"1", "true", "True"},
             local_mirror_dir=os.environ.get("LOCAL_MIRROR_DIR", "/var/cache/gm-validator"),
             mirror_retention_epochs=_int_env("MIRROR_RETENTION_EPOCHS", 10),
-            blocks_per_epoch=_int_env("BLOCKS_PER_EPOCH", 361),
-            finalized_lookback_epochs=_int_env("FINALIZED_LOOKBACK_EPOCHS", 3),
             bittensor_netuid=_int_env("BITTENSOR_NETUID", 0),
             bittensor_endpoint=os.environ.get("BITTENSOR_ENDPOINT"),
             bittensor_hotkey_seed=os.environ.get("BITTENSOR_HOTKEY_SEED"),

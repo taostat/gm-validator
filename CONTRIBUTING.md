@@ -43,8 +43,8 @@ uv run pytest -q
 Fix every warning before committing — a clean output is the baseline.
 
 To run the validator locally without on-chain submission (a mock-chain smoke
-run — the mock cursor reports no open epoch, so the loop only prunes local
-mirrors and never reaches S3 discovery, scoring, or submission):
+run — the mock cursor reports no chain head, so the loop prunes local mirrors
+without reading the S3 pointer, scoring, or submitting):
 
 ```bash
 BITTENSOR_MOCK=1 S3_BUCKET="your-bucket" SUBNET_OWNER_UID="0" \

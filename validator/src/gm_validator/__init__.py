@@ -2,10 +2,8 @@
 
 One ``Validator.process_once`` tick (see :mod:`gm_validator.validator`):
 
-1. Derive the open epoch from the chain head
-   (``head_block // blocks_per_epoch``) and target the newest closed
-   epoch, walking back a bounded window if the finalizer is lagging.
-   The chain head is the discovery cursor — there is no S3 scan.
+1. Read the chain head and, when available, fetch ``finalized/latest.json``
+   for the newest finalized epoch. Compare its block geometry with the head.
 2. Mirror that epoch's finalized artifact set
    (``aggregated.jsonl``, ``epoch_summary.json``, ``_FINALIZED``) to a
    local directory. The gm-operated finalizer has already cost-derived

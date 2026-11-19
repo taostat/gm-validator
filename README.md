@@ -2,11 +2,11 @@
 
 The on-chain weight-setter for the gm Bittensor subnet.
 
-Each tick the validator derives the open epoch from the chain head, targets
-the exact newest closed epoch when its finalized marker is available, mirrors its artifact set
-(`aggregated.jsonl` + `epoch_summary.json`) from S3, scores each miner from
-the cost-derived rows, and submits a u16 weight vector via
-`subtensor.set_weights()`.
+Each tick the validator reads the chain head, then fetches `finalized/latest.json`
+for the newest finalized epoch and checks its block geometry against that head. It
+mirrors that epoch's artifact set (`aggregated.jsonl` + `epoch_summary.json`)
+from S3, verifies the summary geometry and artifact epoch IDs, scores each miner from the
+cost-derived rows, and submits a u16 weight vector via `subtensor.set_weights()`.
 
 The gm-operated epoch-finalizer is the single source of truth for per-record
 cost derivation; the validator treats the published artifact set as
@@ -116,9 +116,8 @@ uv tool run --from "ty==0.0.37" ty check src
 uv run pytest -q
 ```
 
-Smoke-run against a mock chain — the mock cursor reports no open epoch, so the
-loop only prunes local mirrors and never reaches S3 discovery, scoring, or
-submission:
+Smoke-run against a mock chain — the mock cursor reports no chain head. The
+loop prunes local mirrors without reading the S3 pointer, scoring, or submitting:
 
 ```bash
 BITTENSOR_MOCK=1 S3_BUCKET=gm-mainnet SUBNET_OWNER_UID=3 \
@@ -139,7 +138,8 @@ mainnet values are noted where they differ).
 | `S3_ENDPOINT_URL` | — | S3 endpoint (mainnet: `https://s3.gra.io.cloud.ovh.net`) |
 | `AWS_REGION` | `gra` | S3 region (mainnet: `gra`) |
 | `GM_VALIDATOR_S3_ANONYMOUS` | `0` | Skip request signing for public-read buckets (mainnet: `1`, no AWS keys) |
-| `BLOCKS_PER_EPOCH` | `361` | Epoch length (`tempo + 1`); must equal the finalizer's divisor |
+| `BLOCKS_PER_EPOCH` | ignored | Legacy setting; if present, it is ignored with a warning. Epoch targets come from `finalized/latest.json` |
+| `FINALIZED_LOOKBACK_EPOCHS` | ignored | Legacy setting; if present, it is ignored with a warning. The validator only targets `finalized/latest.json` |
 | `BITTENSOR_NETUID` | `0` | Subnet UID (mainnet: `28`) |
 | `BITTENSOR_ENDPOINT` | — | Subtensor `wss://` URL (mainnet: `wss://entrypoint-finney.opentensor.ai:443`) |
 | `BITTENSOR_HOTKEY_SEED` | — | Validator hotkey seed; required unless `BITTENSOR_MOCK=1` |
@@ -147,6 +147,13 @@ mainnet values are noted where they differ).
 
 `CLAUDE.md` documents the full set, including the local mirror, retention,
 timeout, polling, and metrics knobs.
+
+The metrics endpoint includes `gm_validator_latest_pointer_errors_total`
+(labeled `missing`, `unreadable`, or `malformed`) and
+`gm_validator_epoch_geometry_mismatch_total` for pointer and artifact health.
+
+The submission guard is in memory. A restart may re-submit the same epoch's
+identical weight vector; the chain rate-limit pre-gate defers it while needed.
 
 ## Contributing
 

@@ -148,7 +148,9 @@ def _keypair_from_seed(seed: str) -> Any:
             # bittensor-wallet 4.x's stub declares `seed: bytes`, but the Rust
             # implementation requires a str and raises on bytes — the stub is
             # inverted. The hex-string call is the working path (verified live).
-            return bittensor.Keypair.create_from_seed(candidate)  # ty: ignore[invalid-argument-type]
+            return bittensor.Keypair.create_from_seed(
+                candidate  # ty: ignore[invalid-argument-type]
+            )
         return bittensor.Keypair.create_from_mnemonic(candidate)
     except Exception as exc:
         raise HotkeyConfigError(
@@ -372,7 +374,7 @@ class RealSubmitter:
         )
         try:
             fresh = self._open_subtensor()
-        except Exception as exc:  # noqa: BLE001 — keep the last connection on a failed reconnect; the counter stays tripped so the next submit retries.
+        except Exception as exc:  # noqa: BLE001 — keep the last connection and retry next tick.
             LOGGER.error("subtensor reconnect failed: %s", exc)
             return
         self._close_subtensor(self._subtensor)
@@ -395,7 +397,7 @@ class RealSubmitter:
             return
         try:
             close()
-        except Exception as exc:  # noqa: BLE001 — best-effort cleanup; the retired connection is discarded regardless.
+        except Exception as exc:  # noqa: BLE001 — the retired connection is discarded regardless.
             LOGGER.debug("retired subtensor close failed: %s", exc)
 
     def head_block(self) -> int:
@@ -473,8 +475,8 @@ class RealSubmitter:
         """Read the validator hotkey's own on-chain weight-setting status.
 
         Returns the validator's uid registration, its ``LastUpdate`` block
-        (which advances only when weights are *applied* — the reveal, on a
-        commit-reveal subnet), the current head, and the cached rate limit.
+        (which advances when weights are committed/applied on-chain), the
+        current head, and the cached rate limit.
 
         Reads over the long-lived socket. Unlike a submit or head read, a
         failure here is observability-only: it does NOT touch the
@@ -571,18 +573,8 @@ class RealSubmitter:
         )
 
         def _set_weights() -> tuple[bool, str | None]:
-            # Block for inclusion + finalization, exactly like the bm
-            # validator. Waiting returns the chain's real accept/reject
-            # receipt instead of a bare mempool accept, so a rejected or
-            # pool-dropped vector surfaces here as (False, message) instead
-            # of being silently recorded as a success. Under commit-reveal
-            # this waits for the timelocked commit to land; the chain
-            # reveals it automatically when the drand round elapses.
-            #
-            # mev_protection=False forces the plain author_submitExtrinsic
-            # path regardless of a stray BT_MEV_PROTECTION env var (the SDK
-            # default reads it from the env) — the bm validator's effective
-            # default.
+            # Wait for the commit receipt; the chain reveals after the drand round.
+            # Disable MEV protection regardless of the SDK's environment default.
             return subtensor.set_weights(
                 wallet=self._wallet,
                 netuid=netuid,
@@ -594,15 +586,8 @@ class RealSubmitter:
             )
 
         try:
-            # No run_with_timeout: bounding the blocking wait is precisely
-            # what leaked subscriptions — a fired timeout abandons (does not
-            # cancel) the worker thread, leaving its block-event
-            # subscription alive on the shared socket. The bm validator
-            # never bounds the wait; the SDK tears its own subscription down
-            # when the extrinsic finalizes, and the socket self-heals via
-            # _maybe_reconnect after three consecutive raised failures. The
-            # cost is that a wedged websocket blocks the loop until the
-            # kubelet liveness probe restarts the pod — the bm trade-off.
+            # A timeout abandons the worker and leaks its block subscription.
+            # Keep the wait unbounded; a wedged socket relies on a process restart.
             success, message = _set_weights()
         except Exception as exc:
             # A raised exception is a connection-level failure (dead
@@ -635,29 +620,17 @@ class RealSubmitter:
 
 
 class RealChainCursor:
-    """Derives the open epoch id from the chain head over the submitter's socket.
+    """Reads chain head blocks over the submitter's long-lived socket."""
 
-    Reads the head block through the ``RealSubmitter``'s long-lived
-    connection so the validator holds exactly one websocket for both the
-    head poll and weight submission. ``current_epoch`` returns the open
-    epoch ``head_block // blocks_per_epoch`` — the same derivation the
-    epoch-finalizer uses — or ``None`` when the head read fails, so a
-    transient chain hiccup skips the tick instead of crashing the loop.
-    """
-
-    def __init__(self, submitter: RealSubmitter, blocks_per_epoch: int) -> None:
-        if blocks_per_epoch <= 0:
-            raise ValueError(f"blocks_per_epoch must be positive, got {blocks_per_epoch}")
+    def __init__(self, submitter: RealSubmitter) -> None:
         self._submitter = submitter
-        self._blocks_per_epoch = blocks_per_epoch
 
-    def current_epoch(self) -> int | None:
+    def head_block(self) -> int | None:
         try:
-            block = self._submitter.head_block()
+            return self._submitter.head_block()
         except WeightSubmissionError as exc:
             LOGGER.warning("chain head read failed: %s — skipping this tick", exc)
             return None
-        return block // self._blocks_per_epoch
 
 
 class RealMetagraphSource:
