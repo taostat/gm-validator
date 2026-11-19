@@ -80,6 +80,40 @@ def _record(rid: str, miner: str, success: bool = True) -> dict[str, Any]:
     }
 
 
+def _pointer_payload(epoch_id: int) -> dict[str, object]:
+    """Return the finalized pointer geometry for a 361-block test epoch."""
+    return {
+        "schema": 1,
+        "epoch_id": epoch_id,
+        "start_block": epoch_id * 361,
+        "close_block": (epoch_id + 1) * 361 - 1,
+        "next_close_block": (epoch_id + 2) * 361 - 1,
+        "finalized_at": "2026-05-27T12:00:00Z",
+    }
+
+
+def _latest_pointer_key() -> str:
+    return f"{PREFIX}/finalized/latest.json"
+
+
+def _write_latest_pointer(s3: Any, payload: object | bytes) -> None:
+    body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=_latest_pointer_key(),
+        Body=body,
+        ContentType="application/json",
+    )
+
+
+def _summary_key(epoch_id: int) -> str:
+    return f"{PREFIX}/finalized/epoch={epoch_id}/epoch_summary.json"
+
+
+def _head_after(epoch_id: int) -> int:
+    return (epoch_id + 1) * 361
+
+
 def _aggregate(records: list[dict], epoch_id: int) -> list[dict]:
     """Tiny aggregator for tests.
 
@@ -167,9 +201,13 @@ def _populate_epoch(
         Body=json.dumps(manifest).encode("utf-8"),
     )
 
+    pointer = _pointer_payload(epoch_id)
     summary: dict[str, object] = {
-        "epoch_id": epoch_id,
+        "epoch_id": pointer["epoch_id"],
         "finalized_at": "2026-05-27T12:00:00Z",
+        "start_block": pointer["start_block"],
+        "close_block": pointer["close_block"],
+        "next_close_block": pointer["next_close_block"],
         "alpha_price_in_tao": "0.05",
         "tao_price_usd": "10",
         "alpha_price_usd": alpha_price_usd,
@@ -183,21 +221,18 @@ def _populate_epoch(
         summary["emissions_alpha_source"] = "chain"
     s3.put_object(
         Bucket=BUCKET,
-        Key=f"{finalized_prefix}epoch_summary.json",
+        Key=_summary_key(epoch_id),
         Body=json.dumps(summary).encode("utf-8"),
     )
 
     # _FINALIZED (last)
     s3.put_object(Bucket=BUCKET, Key=f"{finalized_prefix}_FINALIZED", Body=b"")
+    _write_latest_pointer(s3, pointer)
 
 
 def _cursor_targeting(epoch_id: int) -> MockChainCursor:
-    """Chain cursor whose newest *closed* epoch is *epoch_id*.
-
-    ``current_epoch`` reports the open epoch; the validator targets
-    ``open - 1``, so the open epoch is ``epoch_id + 1``.
-    """
-    return MockChainCursor(epoch=epoch_id + 1)
+    """Chain cursor just past the close block for *epoch_id*."""
+    return MockChainCursor(head=_head_after(epoch_id))
 
 
 def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
@@ -209,8 +244,6 @@ def _config(tmp_path: pathlib.Path) -> ValidatorConfig:
         s3_anonymous=False,
         local_mirror_dir=str(tmp_path),
         mirror_retention_epochs=10,
-        blocks_per_epoch=360,
-        finalized_lookback_epochs=3,
         bittensor_netuid=42,
         bittensor_endpoint=None,
         bittensor_hotkey_seed=None,
@@ -377,7 +410,7 @@ def test_validator_self_heals_post_startup_registration_across_ticks(
 
         assert validator.process_once() == []
         assert submitter.calls == []
-        assert validator._last_submitted_open_epoch is None
+        assert validator._last_submitted_epoch is None
 
         outcomes = validator.process_once()
 
@@ -551,7 +584,7 @@ def test_validator_skips_submit_inside_rate_limit_window(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """When the validator is still inside the chain's weight-set rate-limit
-    window (e.g. just registered or just revealed), the submit is skipped
+    window (e.g. just registered or just committed), the submit is skipped
     rather than fired and rejected. The guards stay unset so the next tick
     retries once the window clears."""
     with mock_aws():
@@ -603,11 +636,10 @@ def test_validator_skips_submit_inside_rate_limit_window(
         assert validator._last_submitted_epoch == 7
 
 
-def test_validator_logs_reveal_when_last_update_advances(
+def test_validator_logs_commit_applied_when_last_update_advances(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """An advance in the on-chain ``last_update`` block — weights applied,
-    i.e. a commit-reveal reveal landing — is detected and logged."""
+    """An advance in ``last_update`` is logged as committed/applied weights."""
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket=BUCKET)
@@ -624,7 +656,7 @@ def test_validator_logs_reveal_when_last_update_advances(
             _config(tmp_path),
             S3Mirror(s3, BUCKET, PREFIX, str(tmp_path)),
             submitter,
-            MockChainCursor(epoch=None),
+            MockChainCursor(),
             miner_uid_lookup={},
         )
 
@@ -632,7 +664,7 @@ def test_validator_logs_reveal_when_last_update_advances(
 
         submitter.status = ValidatorWeightStatus(
             registered=True,
-            last_update_block=1450,  # advanced -> a reveal landed
+            last_update_block=1450,  # advanced -> weights were committed/applied on-chain
             current_block=1500,
             weights_rate_limit=100,
         )
@@ -640,7 +672,7 @@ def test_validator_logs_reveal_when_last_update_advances(
             validator.process_once()
 
         assert "last_update advanced 1000 -> 1450" in caplog.text
-        assert "reveal landed" in caplog.text
+        assert "weights committed/applied on-chain" in caplog.text
 
 
 class _FailingSubmitter:
@@ -695,13 +727,13 @@ def test_validator_defers_epoch_on_submit_failure(tmp_path: pathlib.Path) -> Non
 
         # Deferred: no outcome recorded, cursor not advanced.
         assert outcomes == []
-        assert validator._last_submitted_open_epoch is None
+        assert validator._last_submitted_epoch is None
         assert len(submitter.calls) == 1
 
         # The next tick retries the same epoch.
         again = validator.process_once()
         assert again == []
-        assert validator._last_submitted_open_epoch is None
+        assert validator._last_submitted_epoch is None
         assert len(submitter.calls) == 2
 
     # Both failed submits bumped the submit-failure counter.
@@ -792,7 +824,7 @@ def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
         outcomes = validator.process_once()
         assert outcomes == []
         assert submitter.calls == []
-        assert validator._last_submitted_open_epoch is None
+        assert validator._last_submitted_epoch is None
 
         # Metagraph refreshes; next tick must process the same epoch.
         validator._miner_uid_lookup = {miner_a: 0, miner_b: 1}
@@ -802,7 +834,7 @@ def test_validator_defers_stale_metagraph_epoch(tmp_path: pathlib.Path) -> None:
         assert outcomes[0].weights_submitted is True
         assert len(submitter.calls) == 1
         assert submitter.calls[0]["epoch_id"] == 23
-        assert validator._last_submitted_open_epoch == 24
+        assert validator._last_submitted_epoch == 23
 
 
 def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
@@ -838,7 +870,7 @@ def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
         outcomes = validator.process_once()
         assert outcomes == []
         assert submitter.calls == []
-        assert validator._last_submitted_open_epoch is None
+        assert validator._last_submitted_epoch is None
 
         # Operator republishes epoch_summary.json with the chain-read field.
         # The stale cached copy must have been invalidated so the next
@@ -849,7 +881,7 @@ def test_validator_defers_when_epoch_summary_missing_emissions_alpha(
         assert len(outcomes) == 1
         assert outcomes[0].epoch_id == 31
         assert outcomes[0].weights_submitted is True
-        assert validator._last_submitted_open_epoch == 32
+        assert validator._last_submitted_epoch == 31
 
 
 def test_validator_submits_cap_burn_weights(tmp_path: pathlib.Path) -> None:
@@ -894,7 +926,7 @@ def _populate_epoch_with_malformed_summary(s3: Any, epoch_id: int, records: list
     _populate_epoch(s3, epoch_id, records)
     s3.put_object(
         Bucket=BUCKET,
-        Key=f"{PREFIX}/finalized/epoch={epoch_id}/epoch_summary.json",
+        Key=_summary_key(epoch_id),
         Body=b'{"epoch_id": "not-an-int", "finalized_at": null}',
     )
 
@@ -981,4 +1013,4 @@ def test_validator_defers_malformed_aggregated_row(tmp_path: pathlib.Path) -> No
         assert submitter.calls == []
         # Cursor unadvanced — a malformed artifact is not silently marked
         # processed.
-        assert validator._last_submitted_open_epoch is None
+        assert validator._last_submitted_epoch is None

@@ -1,5 +1,5 @@
-"""``ValidatorWeightStatus`` — derived properties used by the rate-limit
-pre-gate and the reveal detector."""
+"""``ValidatorWeightStatus`` properties for the rate-limit pre-gate and
+committed/applied on-chain update detection."""
 
 from __future__ import annotations
 
