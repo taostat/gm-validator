@@ -4,18 +4,13 @@ Loop (one ``process_once`` tick):
 
 1. Refresh the metagraph hotkey -> uid lookup when a metagraph source is
    configured, keeping the last-good lookup on transient read failures.
-2. Read the chain head block and derive the open epoch
-   ``E = head_block // blocks_per_epoch`` — the same derivation the
-   epoch-finalizer uses. The chain head IS the discovery cursor.
-3. Target the newest *closed* epoch ``E-1``. If its ``_FINALIZED`` marker
-   is absent, do nothing and retry this exact epoch later in the same open
-   epoch. Submitting an older artifact consumes the one allowed submission
-   window and shifts later chain payouts away from their artifact epochs.
-4. Epoch-window guard: skip if the target is ``<= _last_submitted_epoch``
-   (already handled this epoch). Submitting at most once per epoch
-   respects the chain's ~100-block weight-set rate limit, which is well
-   inside one epoch.
-5. Mirror the target's artifacts, score, and submit:
+2. Read the chain head and, when available, the ``finalized/latest.json`` pointer.
+   The pointer supplies the epoch id and block geometry; the head determines
+   whether that epoch has closed and whether the pointer is stale.
+3. Skip an epoch that is not closed by this chain view or whose next epoch
+   has closed without finalization. The target guard prevents duplicate
+   submissions while the pointer remains on the same epoch.
+4. Mirror the target's artifacts, score, and submit:
    a. Mirror artifacts locally (`aggregated.jsonl`,
       `epoch_summary.json`, `_FINALIZED`).
    b. Compute per-miner scores from `aggregated.jsonl`.
@@ -24,14 +19,13 @@ Loop (one ``process_once`` tick):
       uid as burn weight.
    d. Submit via the configured `Submitter`.
    e. On success, advance ``_last_submitted_epoch`` to the target.
-6. Prune local mirrors older than the retention window.
+5. Prune local mirrors older than the retention window.
 
 On-chain weights are a current snapshot, not a per-epoch ledger: only
 the latest finalized epoch is ever scored, and older un-targeted epochs
-are simply never enumerated. The cursor is recomputed from the chain
-every tick, so no persisted processed-state is needed — a restart at
-worst re-scores the current epoch once, which is idempotent (the same
-weight vector).
+are simply never enumerated. Each tick with a head fetches the pointer fresh. The
+submit guard is in memory only, so a restart can re-submit the same epoch
+with the identical vector; the rate-limit pre-gate defers it while needed.
 
 The validator does not re-derive cost or re-verify `raw_hash` /
 signatures. The gm-operated epoch-finalizer is the single source of
@@ -46,6 +40,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from pydantic import ValidationError
+
 from gm_validator.alpha_economics import MAX_WEIGHT
 from gm_validator.bittensor_adapter import (
     ChainCursor,
@@ -56,11 +52,18 @@ from gm_validator.bittensor_adapter import (
 from gm_validator.config import ValidatorConfig
 from gm_validator.epoch_summary import (
     EPOCH_SUMMARY_FILENAME,
+    EpochSummary,
     epoch_summary_path,
     load_epoch_summary,
 )
-from gm_validator.metrics import record_submit_failure, record_weight_submission
-from gm_validator.s3_mirror import S3Mirror
+from gm_validator.latest_pointer import LatestFinalizedPointer
+from gm_validator.metrics import (
+    record_epoch_geometry_mismatch,
+    record_latest_pointer_error,
+    record_submit_failure,
+    record_weight_submission,
+)
+from gm_validator.s3_mirror import LatestPointerUnavailable, S3Mirror
 from gm_validator.scoring import (
     MalformedArtifactError,
     StaleEpochSummaryError,
@@ -73,6 +76,7 @@ from gm_validator.scoring import (
 )
 
 LOGGER = logging.getLogger(__name__)
+_EPOCH_GEOMETRY_FIELDS = ("epoch_id", "start_block", "close_block", "next_close_block")
 
 
 @dataclass
@@ -91,6 +95,14 @@ class _UidRefresh:
 
     entries: int
     status: str
+
+
+class EpochGeometryMismatch(Exception):
+    """Mirrored summary identity or geometry does not match the latest pointer."""
+
+
+class InvalidEpochSummary(Exception):
+    """The mirrored epoch summary cannot be parsed or validated."""
 
 
 def _format_weight_vector(vector: WeightVector) -> str:
@@ -121,6 +133,7 @@ class Validator:
         submitter: Submitter,
         cursor: ChainCursor,
         miner_uid_lookup: dict[str, int] | None = None,
+        *,
         metagraph_source: MetagraphSource | None = None,
     ) -> None:
         self._config = config
@@ -129,81 +142,30 @@ class Validator:
         self._cursor = cursor
         self._miner_uid_lookup = miner_uid_lookup or {}
         self._metagraph_source = metagraph_source
-        # Two complementary guards on the submit, both recomputed from the
-        # chain each tick. They are deliberately in-memory only: the
-        # chain-cursor design drops the persisted processed.json, so a
-        # restart resets both to None and re-scores the current target. The
-        # re-submit is the identical weight vector — idempotent, exactly the
-        # bm validator's no-persisted-dedup contract. If the restart lands
-        # inside the chain's weight-set rate-limit window the duplicate is
-        # rejected and retried each poll until the window clears (bounded by
-        # one epoch), then succeeds and the guards latch; a clean accept on
-        # the first try latches immediately. Either way the on-chain weight
-        # vector never changes.
-        #
-        # - Open-epoch rate guard: at most one submit per open chain epoch
-        #   (mirroring bm's `block // tempo` guard). When the finalizer
-        #   catches up from lag it can publish several closed epochs while
-        #   the chain head stays in one open epoch; submitting each would
-        #   trip the chain's ~100-block weight-set rate limit.
-        # - Target dedup guard: never re-submit a finalized epoch already
-        #   submitted after a restart or unusual chain-head regression.
-        #
-        # A submit needs BOTH a fresh open epoch and a newer target.
-        self._last_submitted_open_epoch: int | None = None
+        # In-memory only: a restart can re-submit the identical vector for
+        # this epoch, with the rate-limit pre-gate deferring it when needed.
         self._last_submitted_epoch: int | None = None
         # Last on-chain ``last_update`` block we observed for this validator.
-        # Tracked across ticks so an advance — weights actually applied, i.e.
-        # a commit-reveal *reveal* landing — is detectable and logged.
+        # Tracked across ticks to detect committed/applied weights updates.
         self._last_update_block: int | None = None
 
     def process_once(self) -> list[EpochOutcome]:
-        """One tick: submit the exact newest closed epoch once it is finalized.
-
-        Refreshes the metagraph lookup when configured, then uses the
-        chain head block as the discovery cursor — there is no S3 scan.
-        Targets the newest closed epoch ``E-1``, waiting when the finalizer
-        lags, then submits at most once per open
-        chain epoch (the ``_last_submitted_open_epoch`` guard). Returns
-        the processed epoch's outcome, or an empty list when nothing was
-        ready or this open epoch was already handled.
-        """
+        """Process one pointer-driven epoch tick, then prune local mirrors."""
         refresh = self._refresh_miner_uid_lookup()
         status = self._submitter.weight_status()
         self._observe_weight_status(status)
         outcomes: list[EpochOutcome] = []
         selection = self._select_target_epoch()
-        if selection is not None:
-            open_epoch, target = selection
-            if status is not None and status.within_rate_limit_window:
-                # The chain's weight-set rate limit gates the commit too, so a
-                # submit now would be rejected. Skip it (rather than fire a
-                # doomed commit that bumps submit_failures); the guards stay
-                # unadvanced so the next tick retries once the window clears.
-                LOGGER.info(
-                    "epoch %d ready but only %d/%d blocks since last on-chain "
-                    "update — inside weight-set rate-limit window, deferring submit",
-                    target,
-                    status.blocks_since_last_update,
-                    status.weights_rate_limit,
-                )
-            else:
-                outcome = self._process_target_epoch(open_epoch, target)
-                if outcome is not None:
-                    outcomes.append(outcome)
+        if selection is not None and not self._rate_limit_defers(selection, status):
+            outcome = self._process_target_epoch(selection)
+            if outcome is not None:
+                outcomes.append(outcome)
         self._mirror.prune(self._config.mirror_retention_epochs)
         self._log_tick_summary(selection, outcomes, refresh)
         return outcomes
 
     def _observe_weight_status(self, status: ValidatorWeightStatus | None) -> None:
-        """Log on-chain weight status and detect a commit-reveal reveal.
-
-        Mirrors bm's ``blocks_since_last_update`` visibility. ``last_update``
-        advancing means weights were *applied* on-chain — on a commit-reveal
-        subnet that is a reveal landing, the strongest signal the commit
-        pipeline is healthy end-to-end. A None status (mock mode or a
-        transient read failure) is silently ignored.
-        """
+        """Log weight status and detect a committed/applied on-chain update."""
         if status is None:
             return
         if not status.registered:
@@ -221,8 +183,7 @@ class Validator:
             and latest > self._last_update_block
         ):
             LOGGER.info(
-                "validator weights applied on-chain: last_update advanced %d -> %d "
-                "(commit-reveal reveal landed)",
+                "validator weights committed/applied on-chain (last_update advanced %d -> %d)",
                 self._last_update_block,
                 latest,
             )
@@ -231,12 +192,12 @@ class Validator:
 
     def _log_tick_summary(
         self,
-        selection: tuple[int, int] | None,
+        selection: LatestFinalizedPointer | None,
         outcomes: list[EpochOutcome],
         refresh: _UidRefresh,
     ) -> None:
         """Emit one INFO line per tick so the loop is observable in logs."""
-        target = selection[1] if selection is not None else None
+        target = selection.epoch_id if selection is not None else None
         if outcomes:
             outcome = outcomes[0]
             disposition = "submitted" if outcome.weights_submitted else "scored-no-submit"
@@ -263,73 +224,86 @@ class Validator:
             return _UidRefresh(entries=len(self._miner_uid_lookup), status="static")
         try:
             lookup = self._metagraph_source.hotkeys()
-        except Exception as exc:  # noqa: BLE001 — last-good keeps a transient read from zeroing all weights.
+        except Exception as exc:  # noqa: BLE001 — keep last-good weights on read failures.
             LOGGER.warning("metagraph refresh failed: %s; keeping last-good miner uid lookup", exc)
             return _UidRefresh(entries=len(self._miner_uid_lookup), status="failed")
         self._miner_uid_lookup = lookup
         return _UidRefresh(entries=len(lookup), status="refreshed")
 
-    def _select_target_epoch(self) -> tuple[int, int] | None:
-        """Resolve ``(open_epoch, target)`` to score this tick, or None.
-
-        Reads the chain head, derives the newest closed epoch ``E-1``,
-        requires that exact epoch's finalized marker, and applies both submit
-        guards (one submit per open epoch, never re-submit a target already
-        submitted). Returns None when the
-        chain head is unreadable, the chain is too early to have a closed
-        epoch, that epoch is not finalized yet, this open epoch already
-        submitted, or the target was already submitted.
-        """
-        open_epoch = self._cursor.current_epoch()
-        if open_epoch is None:
+    def _select_target_epoch(self) -> LatestFinalizedPointer | None:
+        """Read latest.json and select its epoch only when chain geometry permits."""
+        head = self._cursor.head_block()
+        if head is None:
             return None
-        newest_closed = open_epoch - 1
-        if newest_closed < 0:
-            LOGGER.info("chain at epoch %d: no closed epoch yet, nothing to do", open_epoch)
+        try:
+            pointer = self._mirror.read_latest_pointer()
+        except LatestPointerUnavailable as exc:
+            LOGGER.warning("latest.json %s: %s", exc.reason, exc.detail)
+            record_latest_pointer_error(exc.reason)
             return None
-
-        last_open = self._last_submitted_open_epoch
-        if last_open is not None and open_epoch <= last_open:
+        if head > pointer.next_close_block:
             LOGGER.info(
-                "open epoch %d already submitted this window — deferring until it advances",
-                open_epoch,
+                "latest pointer is stale at epoch %d; waiting for epoch %d to finalize",
+                pointer.epoch_id,
+                pointer.epoch_id + 1,
             )
             return None
-
-        target = self._mirror.latest_finalized_epoch(newest_closed, lookback=0)
-        if target is None:
+        if head <= pointer.close_block:
             LOGGER.info(
-                "newest closed epoch %d is not finalized: waiting rather than submitting "
-                "a stale artifact, retry next tick",
-                newest_closed,
+                "chain head %d has not passed epoch %d close block %d",
+                head,
+                pointer.epoch_id,
+                pointer.close_block,
             )
             return None
-
-        last_target = self._last_submitted_epoch
-        if last_target is not None and target <= last_target:
+        if (
+            self._last_submitted_epoch is not None
+            and pointer.epoch_id <= self._last_submitted_epoch
+        ):
             LOGGER.info(
-                "epoch %d already submitted — deferring (finalizer stalled at this epoch)",
-                target,
+                "epoch %d already submitted — waiting for the finalized pointer to advance",
+                pointer.epoch_id,
             )
             return None
         LOGGER.info(
-            "weight window: open_epoch=%d target_epoch=%d last_submitted=%s",
-            open_epoch,
-            target,
-            last_target if last_target is not None else "none",
+            "weight window: target_epoch=%d head_block=%d last_submitted=%s",
+            pointer.epoch_id,
+            head,
+            self._last_submitted_epoch if self._last_submitted_epoch is not None else "none",
         )
-        return open_epoch, target
+        return pointer
 
-    def _process_target_epoch(self, open_epoch: int, epoch_id: int) -> EpochOutcome | None:
-        """Process the targeted epoch; return its outcome, or None if deferred.
+    @staticmethod
+    def _rate_limit_defers(
+        pointer: LatestFinalizedPointer,
+        status: ValidatorWeightStatus | None,
+    ) -> bool:
+        """Return whether the chain status says this epoch must wait before submit."""
+        if status is None or not status.within_rate_limit_window:
+            return False
+        LOGGER.info(
+            "epoch %d ready but only %d/%d blocks since last on-chain update — "
+            "inside weight-set rate-limit window, deferring submit",
+            pointer.epoch_id,
+            status.blocks_since_last_update,
+            status.weights_rate_limit,
+        )
+        return True
 
-        On success both guards advance (open-epoch to *open_epoch*, target
-        to *epoch_id*). Deferrals (stale metagraph / stale epoch_summary /
-        submit failure / unexpected error) leave the guards unchanged so
-        the next tick retries the same epoch.
-        """
+    def _process_target_epoch(self, pointer: LatestFinalizedPointer) -> EpochOutcome | None:
+        """Process the targeted epoch; return its outcome, or None if deferred."""
+        epoch_id = pointer.epoch_id
         try:
-            outcome = self._process_epoch(epoch_id)
+            outcome = self._process_epoch(pointer)
+        except EpochGeometryMismatch as exc:
+            self._mirror.invalidate_artifact(epoch_id, EPOCH_SUMMARY_FILENAME)
+            record_epoch_geometry_mismatch()
+            LOGGER.error("epoch %d summary disagrees with latest.json: %s", epoch_id, exc)
+            return None
+        except InvalidEpochSummary:
+            self._mirror.invalidate_artifact(epoch_id, EPOCH_SUMMARY_FILENAME)
+            LOGGER.exception("epoch %d has an invalid epoch_summary.json", epoch_id)
+            return None
         except StaleMetagraphError as exc:
             # Transient — metagraph hotkey->uid lookup is stale. Leave the
             # cursor unadvanced so the next tick retries once the lookup
@@ -370,14 +344,43 @@ class Validator:
         except Exception:
             LOGGER.exception("epoch %d processing failed", epoch_id)
             return None
-        self._last_submitted_open_epoch = open_epoch
         self._last_submitted_epoch = epoch_id
         return outcome
 
-    def _process_epoch(self, epoch_id: int) -> EpochOutcome:
-        mirror_dir = self._mirror.mirror_epoch(epoch_id)
+    def _verified_summary(self, pointer: LatestFinalizedPointer, mirror_dir: str) -> EpochSummary:
+        try:
+            epoch_summary = load_epoch_summary(epoch_summary_path(mirror_dir))
+        except ValidationError as exc:
+            if any(
+                error["loc"] and error["loc"][0] in _EPOCH_GEOMETRY_FIELDS for error in exc.errors()
+            ):
+                raise EpochGeometryMismatch(f"invalid summary geometry: {exc}") from exc
+            raise InvalidEpochSummary(str(exc)) from exc
+        except ValueError as exc:
+            raise InvalidEpochSummary(str(exc)) from exc
+        summary_geometry = tuple(getattr(epoch_summary, field) for field in _EPOCH_GEOMETRY_FIELDS)
+        pointer_geometry = tuple(getattr(pointer, field) for field in _EPOCH_GEOMETRY_FIELDS)
+        if summary_geometry != pointer_geometry:
+            raise EpochGeometryMismatch(f"summary={summary_geometry}, pointer={pointer_geometry}")
+        return epoch_summary
 
+    @staticmethod
+    def _verified_rows(epoch_id: int, mirror_dir: str) -> list[dict]:
         rows = load_aggregated(aggregated_path(mirror_dir))
+        for row in rows:
+            row_epoch = row.get("epoch_id")
+            if type(row_epoch) is not int or row_epoch != epoch_id:
+                raise MalformedArtifactError(
+                    f"aggregated.jsonl row epoch_id={row_epoch!r} does not match epoch {epoch_id}"
+                )
+        return rows
+
+    def _process_epoch(self, pointer: LatestFinalizedPointer) -> EpochOutcome:
+        epoch_id = pointer.epoch_id
+        mirror_dir = self._mirror.mirror_epoch(epoch_id)
+        epoch_summary = self._verified_summary(pointer, mirror_dir)
+
+        rows = self._verified_rows(epoch_id, mirror_dir)
         scores = score(rows)
         total = sum(s.earnings_ndollars + s.surcharge_ndollars for s in scores.values())
 
@@ -385,8 +388,6 @@ class Validator:
             LOGGER.info("processing epoch %d: %d miners with usage", epoch_id, len(scores))
         else:
             LOGGER.info("processing epoch %d: no miner usage — all-burn", epoch_id)
-
-        epoch_summary = load_epoch_summary(epoch_summary_path(mirror_dir))
 
         vector = compute_weights(
             scores,

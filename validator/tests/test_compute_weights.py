@@ -24,6 +24,9 @@ def _summary(
     payload: dict[str, object] = {
         "epoch_id": 1,
         "finalized_at": "2026-05-27T12:00:00Z",
+        "start_block": 361,
+        "close_block": 721,
+        "next_close_block": 1082,
         "alpha_price_in_tao": "0.05",
         "tao_price_usd": "10",
         "alpha_price_usd": alpha_price_usd,

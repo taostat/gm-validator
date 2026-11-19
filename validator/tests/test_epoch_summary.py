@@ -16,6 +16,9 @@ def _sample_summary(epoch_id: int = 7) -> dict[str, object]:
     return {
         "epoch_id": epoch_id,
         "finalized_at": "2026-05-27T12:00:00Z",
+        "start_block": epoch_id * 361,
+        "close_block": (epoch_id + 1) * 361 - 1,
+        "next_close_block": (epoch_id + 2) * 361 - 1,
         "alpha_price_in_tao": "0.0500000000",
         "tao_price_usd": "450.123456",
         "alpha_price_usd": "22.5061728000",

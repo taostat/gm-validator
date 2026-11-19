@@ -64,17 +64,39 @@ def test_subnet_owner_uid_parsed_from_env(monkeypatch: pytest.MonkeyPatch) -> No
     assert config.subnet_owner_uid == 103
 
 
-def test_blocks_per_epoch_defaults_to_chain_epoch_length(
+@pytest.mark.parametrize("value", ["", "not-an-integer"])
+@pytest.mark.parametrize("name", ["BLOCKS_PER_EPOCH", "FINALIZED_LOOKBACK_EPOCHS"])
+def test_legacy_epoch_setting_is_ignored_with_one_warning(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    value: str,
+    name: str,
 ) -> None:
-    """Unset `BLOCKS_PER_EPOCH` defaults to 361 (`tempo + 1`), not 360 —
-    must match the gm finalizer/registry divisor or the
-    `finalized/epoch=<N>/` S3 paths this validator probes desync."""
     monkeypatch.setenv("S3_BUCKET", "my-bucket")
     monkeypatch.setenv("SUBNET_OWNER_UID", "0")
     monkeypatch.delenv("BLOCKS_PER_EPOCH", raising=False)
+    monkeypatch.delenv("FINALIZED_LOOKBACK_EPOCHS", raising=False)
+    monkeypatch.setenv(name, value)
     config = ValidatorConfig.from_env()
-    assert config.blocks_per_epoch == 361
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert name in warnings[0].message
+    assert "ignored" in warnings[0].message
+    assert "blocks_per_epoch" not in config.__dict__
+    assert "finalized_lookback_epochs" not in config.__dict__
+
+
+def test_unset_legacy_epoch_settings_have_no_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("S3_BUCKET", "my-bucket")
+    monkeypatch.setenv("SUBNET_OWNER_UID", "0")
+    monkeypatch.delenv("BLOCKS_PER_EPOCH", raising=False)
+    monkeypatch.delenv("FINALIZED_LOOKBACK_EPOCHS", raising=False)
+    config = ValidatorConfig.from_env()
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert "blocks_per_epoch" not in config.__dict__
+    assert "finalized_lookback_epochs" not in config.__dict__
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +114,6 @@ def _make_config(**overrides: object) -> ValidatorConfig:
         "s3_anonymous": False,
         "local_mirror_dir": "/var/cache/gm-test",
         "mirror_retention_epochs": 10,
-        "blocks_per_epoch": 360,
-        "finalized_lookback_epochs": 3,
         "bittensor_netuid": 0,
         "bittensor_endpoint": None,
         "bittensor_hotkey_seed": None,

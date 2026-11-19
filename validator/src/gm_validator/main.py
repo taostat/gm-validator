@@ -77,25 +77,25 @@ def _build_submitter(config: ValidatorConfig) -> Submitter:
     )
 
 
-def _build_cursor(config: ValidatorConfig, submitter: Submitter) -> ChainCursor:
-    """Build the chain-head epoch cursor.
+def _build_cursor(submitter: Submitter) -> ChainCursor:
+    """Build the chain-head reader.
 
     Real mode wraps the ``RealSubmitter``'s long-lived connection so the
     head poll and weight submission share one websocket. Mock mode has no
-    chain to read, so the cursor reports no open epoch and the validator
+    chain to read, so the cursor reports no head and the validator
     targets nothing each tick — a deliberate idle loop for a build-phase
     smoke run, logged loudly so it is never mistaken for a stuck chain.
     """
     from gm_validator.bittensor_real import RealChainCursor, RealSubmitter
 
     if isinstance(submitter, RealSubmitter):
-        return RealChainCursor(submitter, config.blocks_per_epoch)
+        return RealChainCursor(submitter)
     logging.getLogger(__name__).warning(
-        "BITTENSOR_MOCK set: chain cursor is idle — the validator will mirror and "
-        "prune but never target an epoch or submit weights. Set BITTENSOR_MOCK=0 to "
-        "enable chain-driven epoch discovery."
+        "BITTENSOR_MOCK set: chain cursor is idle — the validator will prune but never "
+        "read the latest pointer, target an epoch, or submit weights. Set "
+        "BITTENSOR_MOCK=0 to enable chain-head checks and weight submission."
     )
-    return MockChainCursor(epoch=None)
+    return MockChainCursor()
 
 
 def _build_miner_uid_lookup(config: ValidatorConfig, submitter: Submitter) -> dict[str, int]:
@@ -188,7 +188,7 @@ def _run(config: ValidatorConfig) -> None:
         anonymous=config.s3_anonymous,
     )
     submitter = _build_submitter(config)
-    cursor = _build_cursor(config, submitter)
+    cursor = _build_cursor(submitter)
     miner_uid_lookup = _build_miner_uid_lookup(config, submitter)
     metagraph_source = _build_metagraph_source(config, submitter)
 

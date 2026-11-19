@@ -25,16 +25,14 @@ LOGGER = logging.getLogger(__name__)
 class ValidatorWeightStatus:
     """The validator hotkey's own on-chain weight-setting status.
 
-    Read each tick to (a) log how long since this validator's weights last
-    *landed* on-chain, (b) skip a submit the chain's weight-set rate limit
-    would reject anyway, and (c) detect a commit-reveal *reveal* by watching
-    ``last_update_block`` advance.
+    Read each tick to log how long since this validator's weights were
+    committed/applied on-chain and to skip a submit inside the chain's
+    weight-set rate limit. ``last_update_block`` advances at commit time;
+    the chain reveals a commit automatically after the drand round.
 
-    ``last_update_block`` advances only when weights are actually applied
-    on-chain — on a commit-reveal subnet that is the *reveal*, not the
-    commit. ``registered`` is False when the validator hotkey has no uid on
-    the subnet yet (so weights can't be set at all). The chain's rate limit
-    gates the commit too, so a freshly-registered or just-revealed validator
+    ``registered`` is False when the validator hotkey has no uid on the
+    subnet yet (so weights can't be set at all). The chain's rate limit
+    gates the commit, so a freshly-registered or just-committed validator
     must wait ``weights_rate_limit`` blocks before its next submit is
     accepted — this mirrors bm's ``blocks_since_last_update`` visibility.
     """
@@ -80,17 +78,10 @@ class Submitter(Protocol):
 
 
 class ChainCursor(Protocol):
-    """Reads the chain head block and derives the current epoch id.
+    """Reads the current chain head block used to check pointer freshness."""
 
-    The validator targets the newest *closed* epoch each tick by reading
-    the chain head — `head_block // blocks_per_epoch` is the open epoch,
-    so the newest closed one is that minus one. This is the same
-    derivation the epoch-finalizer uses, and it replaces scanning S3 for
-    finalized markers: the chain head is the discovery cursor.
-    """
-
-    def current_epoch(self) -> int | None:
-        """Return the open epoch id from the chain head, or None if unreadable.
+    def head_block(self) -> int | None:
+        """Return the chain head block, or None if the read failed.
 
         A None return is transient (the chain read failed); the validator
         skips the tick and retries on the next one rather than crashing.
@@ -114,17 +105,12 @@ class MetagraphSource(Protocol):
 
 @dataclass
 class MockChainCursor:
-    """In-memory chain cursor for tests and the mock-submitter build.
+    """Head-block reader for tests and the idle mock-submitter build."""
 
-    ``epoch`` is the *open* epoch reported by the (fake) chain head; the
-    validator targets ``epoch - 1`` as the newest closed epoch. Set it to
-    ``None`` to simulate an unreadable chain head.
-    """
+    head: int | None = None
 
-    epoch: int | None = 0
-
-    def current_epoch(self) -> int | None:
-        return self.epoch
+    def head_block(self) -> int | None:
+        return self.head
 
 
 @dataclass

@@ -11,6 +11,9 @@ faithfully the u16 quantization reproduces each miner's intended pool share.
 They are derived from the intended-vs-submitted weights inside
 :func:`gm_validator.alpha_economics.normalize_weights` and never feed back
 into the submitted vector.
+
+Pointer health counters track missing, unreadable, and malformed
+``finalized/latest.json`` responses plus summary geometry mismatches.
 """
 
 from __future__ import annotations
@@ -47,6 +50,15 @@ SUBMIT_FAILURES = Counter(
     "gm_validator_submit_failures_total",
     "Count of set_weights submission attempts that raised an error.",
 )
+LATEST_POINTER_ERRORS = Counter(
+    "gm_validator_latest_pointer_errors_total",
+    "Count of latest finalized pointer read or validation failures.",
+    ["reason"],
+)
+EPOCH_GEOMETRY_MISMATCHES = Counter(
+    "gm_validator_epoch_geometry_mismatch_total",
+    "Count of epoch summaries whose identity or block geometry disagrees with latest.json.",
+)
 LOOP_ERRORS = Counter(
     "gm_validator_loop_errors_total",
     "Count of validator loop ticks that aborted on an unhandled exception.",
@@ -72,6 +84,16 @@ def record_weight_submission(epoch_id: int) -> None:
 def record_submit_failure() -> None:
     """Increment the counter for a failed ``set_weights`` submission."""
     SUBMIT_FAILURES.inc()
+
+
+def record_latest_pointer_error(reason: str) -> None:
+    """Increment latest-pointer errors for the given failure category."""
+    LATEST_POINTER_ERRORS.labels(reason=reason).inc()
+
+
+def record_epoch_geometry_mismatch() -> None:
+    """Increment the epoch-summary geometry mismatch counter."""
+    EPOCH_GEOMETRY_MISMATCHES.inc()
 
 
 def record_loop_error() -> None:

@@ -17,15 +17,16 @@ artifact set is treated as authoritative.
 ### validator/ (Python)
 
 - `src/gm_validator/main.py` — entry point; wires S3 mirror, submitter, miner-uid lookup
-- `src/gm_validator/validator.py` — `Validator.process_once()`: discover finalized epochs, mirror artifacts locally, score, submit
-- `src/gm_validator/s3_mirror.py` — `S3Mirror`: syncs S3 epoch artifacts to a local directory; prunes old epochs
+- `src/gm_validator/validator.py` — `Validator.process_once()`: read the head and latest pointer, check geometry, mirror artifacts locally, score, submit
+- `src/gm_validator/s3_mirror.py` — `S3Mirror`: reads `finalized/latest.json`, syncs S3 epoch artifacts to a local directory, and prunes old epochs
 - `src/gm_validator/scoring.py` — `score()` + `compute_weights()`: per-miner totals → u16 vector summing to `MAX_WEIGHT`; cap+burn pipeline only
 - `src/gm_validator/alpha_economics.py` — `compute_epoch_weights()` (per-miner `consumed_usd / pool_usd`) + `normalize_weights()` (float→u16, renorms when sum > 1, burn slot absorbs the residue when sum < 1); ported from bm-validator
-- `src/gm_validator/epoch_summary.py` — Pydantic model + local reader for the mirrored per-epoch `epoch_summary.json` (alpha USD price + emission snapshot)
+- `src/gm_validator/latest_pointer.py` — strict, frozen model for the finalizer's `finalized/latest.json` shape
+- `src/gm_validator/epoch_summary.py` — Pydantic model + local reader for the mirrored per-epoch `epoch_summary.json` (block geometry, alpha USD price + emission snapshot)
 - `src/gm_validator/bittensor_adapter.py` — `Submitter` + `ChainCursor` protocols; `MockSubmitter`/`MockChainCursor` for testing
 - `src/gm_validator/bittensor_real.py` — `RealSubmitter`: lazily-imported to avoid loading bittensor-py in tests; holds the one long-lived socket and serves the startup hotkey→uid lookup over it
 - `src/gm_validator/subtensor_connect.py` — `connect_subtensor`: retrying, timeout-bounded subtensor construction (a hung connect becomes a retryable `TimeoutError`)
-- `src/gm_validator/metrics.py` — Prometheus gauges tracking the last successful weight submission (epoch id + timestamp)
+- `src/gm_validator/metrics.py` — Prometheus gauges and counters for submissions, pointer errors, and geometry mismatches, including `gm_validator_latest_pointer_errors_total` (reason: missing, unreadable, malformed) and `gm_validator_epoch_geometry_mismatch_total`
 - `src/gm_validator/config.py` — `ValidatorConfig.from_env()`
 
 ## Build / lint / test
@@ -55,8 +56,8 @@ uv run python -m gm_validator.main
 | `GM_VALIDATOR_S3_ANONYMOUS` | `0` | Skip request signing (public-read buckets) |
 | `LOCAL_MIRROR_DIR` | `/var/cache/gm-validator` | Local audit cache of finalized artifacts |
 | `MIRROR_RETENTION_EPOCHS` | `10` | How many recent epoch mirrors to keep on disk |
-| `BLOCKS_PER_EPOCH` | `361` | Epoch length (`tempo + 1`); the chain head divided by this gives the open epoch id. **Must equal the finalizer/registry divisor** or the `finalized/epoch=<N>/` S3 paths desync silently |
-| `FINALIZED_LOOKBACK_EPOCHS` | `3` | How many epochs back to probe for a `_FINALIZED` marker before giving up for the tick (tolerates finalizer lag) |
+| `BLOCKS_PER_EPOCH` | ignored | Legacy setting; ignored with a warning when present. Epoch targets come from `finalized/latest.json` |
+| `FINALIZED_LOOKBACK_EPOCHS` | ignored | Legacy setting; ignored with a warning when present. The validator only targets `finalized/latest.json` |
 | `BITTENSOR_NETUID` | `0` | Subnet UID |
 | `BITTENSOR_ENDPOINT` | — | Subtensor `wss://` URL (SDK default network when unset) |
 | `BITTENSOR_HOTKEY_SEED` | — | Validator hotkey seed — a BIP-39 mnemonic or `0x`-prefixed hex seed. The signing keypair is built in memory; no keyfile on disk. Required for real weight submission |
@@ -73,5 +74,10 @@ The pool denominator's `emissions_alpha` is read from `epoch_summary.json` (chai
 ## Key conventions
 
 - `bittensor` is lazily imported to keep the test path independent of the bittensor-py wheel.
-- Epoch discovery is driven by the chain head, not persisted state. The submit guards are in-memory only; a restart re-scores the current target and re-submits the identical (idempotent) weight vector. A duplicate landing inside the chain's weight-set rate-limit window is rejected, which leaves the guards unset so the validator re-scores each poll until the window clears and the submit is accepted.
+- Epoch discovery reads the chain head first and, when available, fetches a fresh
+  `finalized/latest.json` each tick. The validator waits if its head has not passed
+  the pointer epoch's close block or if the next epoch has closed without finalization.
+  Its target guard is in-memory only, so a restart may re-submit the same epoch's
+  identical weight vector; the rate-limit pre-gate defers submission while it is
+  inside the chain window.
 - Scoring uses nano-dollar-precision integer arithmetic throughout. Weights are the only floating-point values, derived only after all integer sums are complete.

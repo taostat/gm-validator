@@ -13,7 +13,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from typing import Any
+from typing import Any, Literal
+
+from gm_validator.latest_pointer import LatestFinalizedPointer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +24,17 @@ _ARTIFACTS = (
     "epoch_summary.json",
     "_FINALIZED",
 )
+
+LatestPointerErrorReason = Literal["missing", "unreadable", "malformed"]
+
+
+class LatestPointerUnavailable(Exception):
+    """A typed failure while reading or validating the latest pointer."""
+
+    def __init__(self, reason: LatestPointerErrorReason, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
 
 
 class S3Mirror:
@@ -41,28 +54,30 @@ class S3Mirror:
         self._local_root = local_root
         self._anonymous = anonymous
 
+    _NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+    _FORBIDDEN_CODES = frozenset({"403", "AccessDenied", "Forbidden"})
+
     # ---- discovery ----
 
-    def latest_finalized_epoch(self, target: int, lookback: int) -> int | None:
-        """Find the newest finalized epoch at or below *target*.
-
-        Probes ``finalized/epoch={target}/_FINALIZED`` and walks back up
-        to *lookback* further epochs (``target``, ``target-1``, …) until a
-        ``_FINALIZED`` marker is found, returning that epoch id. Each probe
-        is a single targeted ``head_object`` — there is no list+scan of
-        the full epoch history. Returns ``None`` if none of the probed
-        epochs is finalized yet (the finalizer is still lagging), so the
-        caller does nothing this tick and retries on the next one.
-
-        The walk-back tolerates the finalizer trailing the chain by a few
-        epochs; *lookback* bounds it so a persistently un-finalized window
-        does not turn into an unbounded scan.
-        """
-        floor = max(target - lookback, 0)
-        for epoch_id in range(target, floor - 1, -1):
-            if self._marker_exists(epoch_id):
-                return epoch_id
-        return None
+    def read_latest_pointer(self) -> LatestFinalizedPointer:
+        """Fetch and validate ``finalized/latest.json`` without using the local cache."""
+        key = f"{self._prefix}/finalized/latest.json"
+        try:
+            response = self._s3.get_object(Bucket=self._bucket, Key=key)
+            body = response["Body"].read()
+        except self._s3.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in self._NOT_FOUND_CODES or (self._anonymous and code in self._FORBIDDEN_CODES):
+                raise LatestPointerUnavailable("missing", f"object unavailable ({code})") from exc
+            raise LatestPointerUnavailable(
+                "unreadable", f"S3 request failed ({code or 'unknown'})"
+            ) from exc
+        except Exception as exc:
+            raise LatestPointerUnavailable("unreadable", f"read failed: {exc}") from exc
+        try:
+            return LatestFinalizedPointer.model_validate_json(body)
+        except Exception as exc:
+            raise LatestPointerUnavailable("malformed", f"validation failed: {exc}") from exc
 
     # ---- mirror ----
 
@@ -103,30 +118,6 @@ class S3Mirror:
         tmp = local_path + ".part"
         self._s3.download_file(self._bucket, key, tmp)
         os.replace(tmp, local_path)
-
-    _NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
-    # 403 means "absent" ONLY on anonymous/public-read buckets: without
-    # ListBucket, S3 returns 403 Forbidden for a HEAD on a missing key (with
-    # ListBucket it would be 404). The targeted walk-back HEADs
-    # not-yet-finalized epochs as a normal path, so on those buckets a 403
-    # is just "no marker, keep walking back". On a signed/private bucket the
-    # same 403 is a real credential/permission misconfiguration on an
-    # existing key, so it must propagate loudly rather than silently idle.
-    _FORBIDDEN_CODES = frozenset({"403", "AccessDenied", "Forbidden"})
-
-    def _marker_exists(self, epoch_id: int) -> bool:
-        key = f"{self._prefix}/finalized/epoch={epoch_id}/_FINALIZED"
-        try:
-            self._s3.head_object(Bucket=self._bucket, Key=key)
-        except self._s3.exceptions.ClientError as e:
-            err = e.response.get("Error", {}).get("Code", "")
-            if err in self._NOT_FOUND_CODES:
-                return False
-            if self._anonymous and err in self._FORBIDDEN_CODES:
-                return False
-            raise
-        else:
-            return True
 
     # ---- cleanup ----
 

@@ -745,14 +745,13 @@ def test_head_block_reconnects_after_three_hung_reads(monkeypatch: pytest.Monkey
     assert subtensors[0].closes == 1
 
 
-def test_chain_cursor_derives_open_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``current_epoch`` is ``head_block // blocks_per_epoch`` — the same
-    derivation the finalizer uses."""
+def test_chain_cursor_returns_head_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cursor exposes the chain head without deriving an epoch."""
     subtensor = _install_fake_bittensor(monkeypatch)
-    subtensor.block = 725  # 725 // 360 == 2
+    subtensor.block = 725
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    cursor = RealChainCursor(submitter, blocks_per_epoch=360)
-    assert cursor.current_epoch() == 2
+    cursor = RealChainCursor(submitter)
+    assert cursor.head_block() == 725
 
 
 def test_chain_cursor_returns_none_on_read_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -760,8 +759,8 @@ def test_chain_cursor_returns_none_on_read_failure(monkeypatch: pytest.MonkeyPat
     subtensor = _install_fake_bittensor(monkeypatch)
     subtensor.raise_on_block = ConnectionError("ws closed")
     submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    cursor = RealChainCursor(submitter, blocks_per_epoch=360)
-    assert cursor.current_epoch() is None
+    cursor = RealChainCursor(submitter)
+    assert cursor.head_block() is None
 
 
 def test_chain_cursor_survives_hung_tick_then_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -769,35 +768,26 @@ def test_chain_cursor_survives_hung_tick_then_recovers(monkeypatch: pytest.Monke
     recovers once the wedged socket is reconnected.
 
     This is the loop-survival contract for the post-submit hang: a wedged
-    ``get_current_block`` times out, ``current_epoch`` returns None so the
+    ``get_current_block`` times out, ``head_block`` returns None so the
     validator loop's tick is a clean no-op (not an infinite freeze), and
-    after the reconnect threshold trips the cursor resolves a real epoch
+    after the reconnect threshold trips the cursor reads a real head block
     again over the fresh socket.
     """
     subtensors = _install_reconnecting_fake_bittensor(monkeypatch)
     submitter = RealSubmitter(
         netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX, rpc_timeout=0.05
     )
-    cursor = RealChainCursor(submitter, blocks_per_epoch=360)
+    cursor = RealChainCursor(submitter)
     hang = threading.Event()
     subtensors[0].hang_on_block = hang
 
     try:
         for _ in range(3):
-            assert cursor.current_epoch() is None
+            assert cursor.head_block() is None
     finally:
         hang.set()
 
     subtensors_before = len(subtensors)
-    epoch = cursor.current_epoch()
+    block = cursor.head_block()
     assert len(subtensors) == subtensors_before + 1
-    assert epoch == subtensors[-1].block // 360
-
-
-def test_chain_cursor_rejects_nonpositive_blocks_per_epoch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_fake_bittensor(monkeypatch)
-    submitter = RealSubmitter(netuid=42, endpoint=None, hotkey_seed=_TEST_SEED_HEX)
-    with pytest.raises(ValueError, match="blocks_per_epoch must be positive"):
-        RealChainCursor(submitter, blocks_per_epoch=0)
+    assert block == subtensors[-1].block

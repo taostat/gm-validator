@@ -35,8 +35,6 @@ def _config(
         s3_anonymous=False,
         local_mirror_dir="unused-mirror-dir",
         mirror_retention_epochs=10,
-        blocks_per_epoch=360,
-        finalized_lookback_epochs=3,
         bittensor_netuid=42,
         bittensor_endpoint=None,
         bittensor_hotkey_seed=seed,

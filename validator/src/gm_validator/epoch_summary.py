@@ -16,7 +16,7 @@ import os
 from decimal import Decimal
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, PlainSerializer
+from pydantic import BaseModel, ConfigDict, PlainSerializer, StrictInt
 
 EPOCH_SUMMARY_FILENAME = "epoch_summary.json"
 
@@ -41,8 +41,11 @@ class EpochSummary(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    epoch_id: int
+    epoch_id: StrictInt
     finalized_at: str
+    start_block: StrictInt
+    close_block: StrictInt
+    next_close_block: StrictInt
     alpha_price_in_tao: DecimalString
     tao_price_usd: DecimalString
     alpha_price_usd: DecimalString
